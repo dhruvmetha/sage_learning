@@ -1,0 +1,6 @@
+_target_: src.data.mask_vae_data.MaskVAEDataModule
+data_dir: /common/users/dm1487/namo_data/images/jun6/random_start_random_goal_many_env
+batch_size: ${batch_size}
+num_workers: ${num_workers}
+pin_memory: true
+image_size: 64

@@ -1,0 +1,36 @@
+_target_: src.model.vae_module.VAEModule
+vae:
+  _target_: diffusers.AutoencoderKL
+  act_fn: silu
+  block_out_channels: [128, 256, 256]
+  down_block_types: ["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"]
+  in_channels: 1
+  latent_channels: 4
+  layers_per_block: 2
+  norm_num_groups: 32
+  out_channels: 1
+  sample_size: 84
+  scaling_factor: 0.18215
+  up_block_types: ["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"]
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: ${base_lr}
+  weight_decay: 0.0
+scheduler:
+  _target_: src.schedulers.warmup_cosine.WarmupCosineScheduler
+  _partial_: true
+  schedulers_cfg:
+    - _target_: torch.optim.lr_scheduler.LinearLR
+      _partial_: true
+      start_factor: 0.01
+      end_factor: 1.0
+      total_iters: ${warmup_steps}
+    - _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+      _partial_: true
+      T_max: ${decay_steps}
+      eta_min: ${end_lr}
+  milestones: ${warmup_steps}
+use_kl: true
+beta: 0.00005
+num_samples_to_save: 8

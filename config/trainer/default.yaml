@@ -1,0 +1,33 @@
+_target_: lightning.pytorch.trainer.Trainer
+
+# default_root_dir: ${paths.output_dir}
+
+min_epochs: 1 # prevents early stopping
+max_epochs: ${max_epochs}
+
+accelerator: cpu
+devices: 1
+
+# mixed precision for extra speed-up
+# precision: 16
+
+# perform a validation loop every N training epochs
+check_val_every_n_epoch: ${check_val_every_n_epoch}
+
+# set True to to ensure deterministic results
+# makes training slower but gives more reproducibility than just setting seeds
+deterministic: False
+
+# Enable progress bar
+enable_progress_bar: true
+
+# Enable model checkpointing and add logger
+logger:
+  _target_: lightning.pytorch.loggers.TensorBoardLogger
+  save_dir: "logs"
+  name: "vae_training"
+
+callbacks:
+  _target_: lightning.pytorch.callbacks.Callback
+  _recursive_: false
+  _convert_: all

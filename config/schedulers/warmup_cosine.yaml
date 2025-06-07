@@ -1,0 +1,15 @@
+# wraps two sub-schedulers: LinearLR then CosineAnnealingLR
+_target_: src.schedulers.warmup_cosine.WarmupCosineScheduler
+
+# each entry here will be passed (with optimizer) to instantiate()
+schedulers_cfg:
+  - _target_: torch.optim.lr_scheduler.LinearLR
+    start_factor: ${end_lr}/${base_lr}
+    end_factor: 1.0
+    total_iters: ${warmup_steps}
+  - _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: ${decay_steps}
+    eta_min: ${end_lr}
+
+# when to switch from warm-up to cosine
+milestones: [${warmup_steps}]

@@ -1,0 +1,20 @@
+# Model checkpoint that saves the best model according to validation metric
+model_checkpoint:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: "${oc.env:PWD}/checkpoints/${now:%Y-%m-%d_%H-%M-%S}"
+  filename: "epoch_{epoch:03d}_val_loss_{val_loss:.4f}"
+  monitor: "val_loss"
+  mode: "min"
+  save_top_k: 5
+  save_last: true
+  verbose: true
+  auto_insert_metric_name: false
+
+# Early stopping callback
+early_stopping:
+  _target_: lightning.pytorch.callbacks.EarlyStopping
+  monitor: "val_loss"
+  patience: 10
+  mode: "min"
+  min_delta: 0.001
+  verbose: true
