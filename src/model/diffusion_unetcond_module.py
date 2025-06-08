@@ -21,21 +21,11 @@ class DiffusionUNetCondModule(pl.LightningModule):
         self.val_loss_best = MinMetric()
         
         
-        # encoder_module_list = []
-        # for i in range(len(encoder_model_params['cnn_layers'])):
-        #     if i == 0:
-        #         encoder_module_list.append(nn.Conv2d(encoder_model_params['in_channels'], encoder_model_params['cnn_layers'][i], kernel_size=5, padding=1))
-        #     else:
-        #         encoder_module_list.append(nn.Conv2d(encoder_model_params['cnn_layers'][i-1], encoder_model_params['cnn_layers'][i], kernel_size=5, padding=1))
-        #     encoder_module_list.append(nn.ReLU())
-        # encoder_module_list.append(nn.Conv2d(encoder_model_params['cnn_layers'][-1], encoder_model_params['out_channels'], kernel_size=5, padding=1))
-        # encoder_module_list.append(nn.Flatten())
-        # self.encoder_model = nn.Sequential(*encoder_module_list)
         
         # Downward encoder to reduce 3x64x64 input to 1x16x16, then flatten.
         self.encoder_model = nn.Sequential(
-            # Input: Bx3x64x64
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            # Input: Bx4x64x64
+            nn.Conv2d(4, 16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),  # -> Bx16x32x32
             
@@ -112,9 +102,11 @@ class DiffusionUNetCondModule(pl.LightningModule):
         inp, tgt, noise_pred, noise = self.validation_batch
         
         # Take a few samples for generation
-        num_samples = min(4, inp.size(0))
+        num_samples = min(8, inp.size(0))
         inp_samples = inp[:num_samples]
         tgt_samples = tgt[:num_samples]
+        
+        image_size = inp_samples.shape[-1]
         
         # Generate samples using full denoising process
         with torch.no_grad():
@@ -123,14 +115,14 @@ class DiffusionUNetCondModule(pl.LightningModule):
         # Log samples if using tensorboard
         if hasattr(self.logger, 'experiment'):
             # Create comparison grid: input, target, generated
-            new_tgt_samples, new_generated_samples = torch.zeros_like(inp_samples), torch.zeros_like(inp_samples)
-            new_tgt_samples[:, :3, :, :] = tgt_samples
-            new_generated_samples[:, :3, :, :] = generated_samples
+            new_tgt_samples, new_generated_samples = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device), torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
+            new_tgt_samples[:, :2, :, :] = tgt_samples
+            new_generated_samples[:, :2, :, :] = generated_samples
             
-            comparison = torch.cat([inp_samples, new_tgt_samples, new_generated_samples], dim=0)
+            comparison = torch.cat([inp_samples[:, :3, :, :], inp_samples[:, 1:4, :, :], new_tgt_samples, new_generated_samples], dim=0)
             grid = torchvision.utils.make_grid(comparison, nrow=num_samples, normalize=True)
             self.logger.experiment.add_image('Validation_Samples', grid, self.current_epoch)
-    
+            
     def _full_denoising_process(self, inp, tgt):
         """Run full denoising process for sample generation"""
         batch_size = inp.size(0)

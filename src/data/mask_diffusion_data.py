@@ -26,6 +26,8 @@ class MaskDiffusionDataset(Dataset):
             sample_files = datafiles[int(0.8*len(datafiles)):int(0.9*len(datafiles))]
         elif self.split == "test":
             sample_files = datafiles[int(0.9*len(datafiles)):]
+            
+        print(self.split, len(sample_files))
         
         self.samples = sample_files
             
@@ -42,8 +44,8 @@ class MaskDiffusionDataset(Dataset):
         goal_mask = data['goal_mask']
         reachable_objects_mask = data['reachable_objects_image'][:, :, :1]
         
-        inp = np.concatenate([scene], axis=0)
-        tgt = np.concatenate([reachable_objects_mask, object_mask, goal_mask], axis=-1)
+        inp = np.concatenate([scene, reachable_objects_mask], axis=-1)
+        tgt = np.concatenate([object_mask, goal_mask], axis=-1)
         
         if self.transform:
             inp = self.transform(inp)
@@ -78,6 +80,13 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         """
         preprocess data if needed
         """
+        pass
+        
+        
+    def setup(self, stage: Optional[str] = None):
+        """
+        Load data. Set variables: self.train_dataset, self.val_dataset, self.test_dataset
+        """
         datafiles = []
         if isinstance(self.data_dir, list):
             for folder in self.data_dir:
@@ -85,26 +94,17 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         else:
             datafiles = [os.path.join(self.data_dir, f) for f in os.listdir(self.data_dir)]
         
-        datafiles = datafiles[:100]
-        
+        valid_datafiles = []
         pbar = tqdm(range(len(datafiles)), desc="Preparing data")
         for idx in pbar:
             file = datafiles[idx]
             npz_file = np.load(file)
             object_mask = npz_file['object_mask']
-            if np.sum(object_mask) == 0:
-                continue
-            self.datafiles.append(file)
+            if np.sum(object_mask) > 0:
+                valid_datafiles.append(file)
+            npz_file.close()
             
-        # self.datafiles = self.datafiles[:100]
-            
-        print(f"Found {len(self.datafiles)} datafiles")
-        random.shuffle(self.datafiles)
         
-    def setup(self, stage: Optional[str] = None):
-        """
-        Load data. Set variables: self.train_dataset, self.val_dataset, self.test_dataset
-        """
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Resize((self.image_size, self.image_size)),
@@ -113,41 +113,44 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         
         if stage == "fit" or stage is None:
             self.train_dataset = MaskDiffusionDataset(
-                self.datafiles, split="train", transform=transform
+                valid_datafiles, split="train", transform=transform
             )
-            
             self.val_dataset = MaskDiffusionDataset(
-                self.datafiles, split="val", transform=transform
+                valid_datafiles, split="val", transform=transform
             )
             
         if stage == "test" or stage is None:
             self.test_dataset = MaskDiffusionDataset(
-                self.datafiles, split="test", transform=transform
+                valid_datafiles, split="test", transform=transform
             )
     
     def train_dataloader(self):
-        return DataLoader(
+        loader = DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             shuffle=True,
         )
+        
+        return loader
     
     def val_dataloader(self):
-        return DataLoader(
+        loader = DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             shuffle=False,
         )
+        return loader
     
     def test_dataloader(self):
-        return DataLoader(
+        loader = DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             shuffle=False,
         )
+        return loader

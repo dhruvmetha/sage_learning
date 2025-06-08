@@ -1,12 +1,15 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4"
 import hydra
 import lightning.pytorch as pl
+import torch
+torch.set_float32_matmul_precision("medium")
 
 @hydra.main(config_path="../config", config_name="train_diffusion.yaml")
 def main(cfg):
     if cfg.get("seed"):
         pl.seed_everything(cfg.seed)
+        
         
     data_module: pl.LightningDataModule = hydra.utils.instantiate(cfg.data)
     

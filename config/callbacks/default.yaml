@@ -5,10 +5,11 @@ model_checkpoint:
   filename: "epoch_{epoch:03d}_val_loss_{val_loss:.4f}"
   monitor: "val_loss"
   mode: "min"
-  save_top_k: 5
+  save_top_k: 2
   save_last: true
   verbose: true
   auto_insert_metric_name: false
+  save_weights_only: true
 
 # Early stopping callback
 early_stopping:
