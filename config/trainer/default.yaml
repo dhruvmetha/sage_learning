@@ -25,7 +25,7 @@ enable_progress_bar: true
 logger:
   _target_: lightning.pytorch.loggers.TensorBoardLogger
   save_dir: "logs"
-  name: "vae_training"
+  name: "diffusion_unetcond_training"
 
 callbacks:
   _target_: lightning.pytorch.callbacks.Callback

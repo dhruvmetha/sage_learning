@@ -6,8 +6,8 @@ import os
 import torch.nn as nn
 import lightning.pytorch as pl
 
-class DiffusionUNetModule(pl.LightningModule):
-    def __init__(self, unet, noise_scheduler, optimizer):
+class DiffusionUNetCondModule(pl.LightningModule):
+    def __init__(self, unet, noise_scheduler, optimizer, encoder_model_params):
         super().__init__()
         self.unet = unet
         self.noise_scheduler = noise_scheduler
@@ -20,12 +20,42 @@ class DiffusionUNetModule(pl.LightningModule):
         self.val_loss = MeanMetric()
         self.val_loss_best = MinMetric()
         
+        
+        # encoder_module_list = []
+        # for i in range(len(encoder_model_params['cnn_layers'])):
+        #     if i == 0:
+        #         encoder_module_list.append(nn.Conv2d(encoder_model_params['in_channels'], encoder_model_params['cnn_layers'][i], kernel_size=5, padding=1))
+        #     else:
+        #         encoder_module_list.append(nn.Conv2d(encoder_model_params['cnn_layers'][i-1], encoder_model_params['cnn_layers'][i], kernel_size=5, padding=1))
+        #     encoder_module_list.append(nn.ReLU())
+        # encoder_module_list.append(nn.Conv2d(encoder_model_params['cnn_layers'][-1], encoder_model_params['out_channels'], kernel_size=5, padding=1))
+        # encoder_module_list.append(nn.Flatten())
+        # self.encoder_model = nn.Sequential(*encoder_module_list)
+        
+        # Downward encoder to reduce 3x64x64 input to 1x16x16, then flatten.
+        self.encoder_model = nn.Sequential(
+            # Input: Bx3x64x64
+            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # -> Bx16x32x32
+            
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # -> Bx32x16x16
+            
+            nn.Conv2d(32, 1, kernel_size=3, stride=1, padding=1), # -> Bx1x16x16
+            nn.Flatten(), # -> Bx256
+        )
+        
         # Save hyperparameters for checkpointing
         self.save_hyperparameters(ignore=["unet", "noise_scheduler"])
     
     
-    def forward(self, x, timesteps):
-        return self.unet(x, timesteps).sample
+    def forward(self, x, timesteps, cond):
+        # print(x.shape, cond.shape)
+        cond = self.encoder_model(cond).unsqueeze(1)
+        # print(cond.shape)
+        return self.unet(x, timesteps, encoder_hidden_states=cond).sample
     
     def loss_fn(self, x, pred):
         return self.criterion(pred, x)
@@ -38,7 +68,7 @@ class DiffusionUNetModule(pl.LightningModule):
         
         noisy_np = torch.cat([inp, noisy_tgt], dim=1)
         
-        noise_pred = self(noisy_np, timesteps)
+        noise_pred = self(noisy_np, timesteps, inp)
         loss = self.loss_fn(noise_pred, noise)
         
         self.train_loss(loss)
@@ -57,7 +87,7 @@ class DiffusionUNetModule(pl.LightningModule):
         noisy_np = torch.cat([inp, noisy_tgt], dim=1)
         
         # Complete the validation step
-        noise_pred = self(noisy_np, timesteps)
+        noise_pred = self(noisy_np, timesteps, inp)
         loss = self.loss_fn(noise_pred, noise)
         
         # Log validation loss
@@ -117,7 +147,7 @@ class DiffusionUNetModule(pl.LightningModule):
             
             # Predict noise
             with torch.no_grad():
-                noise_pred = self(noisy_input, timesteps)
+                noise_pred = self(noisy_input, timesteps, inp)
             
             # Remove predicted noise
             sample = self.noise_scheduler.step(noise_pred, t, sample).prev_sample

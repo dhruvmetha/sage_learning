@@ -1,16 +1,16 @@
 defaults:
     - _self_
     - data: mask_diffusion_data
-    - model: diffusion
+    - model: diffusion_unetcond
     - trainer: gpu
 
 seed: 42
 num_workers: 4
-batch_size: 128
+batch_size: 32
 
 # trainer
 max_epochs: 1000
-check_val_every_n_epoch: 10
+check_val_every_n_epoch: 200
 
 base_lr: 0.0001
 end_lr: 0.000001
