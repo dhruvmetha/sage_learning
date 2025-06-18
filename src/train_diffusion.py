@@ -10,7 +10,6 @@ def main(cfg):
     if cfg.get("seed"):
         pl.seed_everything(cfg.seed)
         
-        
     data_module: pl.LightningDataModule = hydra.utils.instantiate(cfg.data)
     
     model: pl.LightningModule = hydra.utils.instantiate(cfg.model)

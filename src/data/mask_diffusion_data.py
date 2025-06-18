@@ -103,7 +103,6 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
             if np.sum(object_mask) > 0:
                 valid_datafiles.append(file)
             npz_file.close()
-            
         
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -132,7 +131,6 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             shuffle=True,
         )
-        
         return loader
     
     def val_dataloader(self):

@@ -1,4 +1,5 @@
 from torchmetrics import MeanMetric, MinMetric
+from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 import torchvision
@@ -144,6 +145,27 @@ class DiffusionUNetCondModule(pl.LightningModule):
             # Remove predicted noise
             sample = self.noise_scheduler.step(noise_pred, t, sample).prev_sample
             
+        return sample
+    
+    
+    def sample_from_model(self, inp, samples=32):
+        
+        print(inp.shape)
+        # sample = torch.randn((samples, 2, ) + inp.shape[2:], device=inp.device) # different noise for each sample
+        sample = torch.randn((1, 2,) + inp.shape[2:], device=inp.device)
+        sample = sample.repeat(samples, 1, 1, 1)
+        inp = inp.repeat(samples, 1, 1, 1)
+        
+        for t in tqdm(reversed(range(self.noise_scheduler.config.num_train_timesteps))):
+            timesteps = torch.full((samples,), t, device=inp.device, dtype=torch.long)
+            noisy_input = torch.cat([inp, sample], dim=1)
+            
+            with torch.no_grad():
+                noise_pred = self(noisy_input, timesteps, inp)
+                
+            sample = self.noise_scheduler.step(noise_pred, t, sample).prev_sample
+            
+        print(sample.shape)
         return sample
     
     def configure_optimizers(self):

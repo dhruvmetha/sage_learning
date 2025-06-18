@@ -1,3 +1,4 @@
 outputs/
+test/
 *.pyc
 *.egg-info/
