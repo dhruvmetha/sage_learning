@@ -1,0 +1,13 @@
+# Configuration for split inference with separate obstacle and goal models
+
+# Paths to the hydra run directories containing the trained models
+obstacle_run_path: "outputs/2025-07-14/01-35-54"  # Path to obstacle model run
+goal_run_path: "outputs/2025-07-14/01-59-56"      # Path to goal model run
+
+# Optional: specify where to save results (defaults to obstacle_run_path if not provided)
+run_path: "outputs/2025-07-14/01-59-56"
+
+# ZMQ server configuration (optional - uses defaults from code if not specified)
+zmq:
+  host: "arrakis.cs.rutgers.edu"
+  port: 5557

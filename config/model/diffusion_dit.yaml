@@ -1,0 +1,24 @@
+_target_: src.model.diffusion_module.DiffusionModule
+model:
+  _target_: src.model.dit.dit.DiT
+  img_size: ${image_size}
+  patch: 4
+  in_ch: 6
+  out_ch: 1
+  dim: 256
+  depth: 8
+  heads: 8
+
+noise_scheduler:
+  _target_: diffusers.DDPMScheduler
+  num_train_timesteps: 100
+  beta_schedule: "squaredcos_cap_v2"
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${base_lr}
+  weight_decay: 0.01
+  
+discrete: true
+continuous: false

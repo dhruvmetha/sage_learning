@@ -9,7 +9,7 @@ import numpy as np
 import random
 
 class MaskDiffusionDataset(Dataset):
-    def __init__(self, datafiles: List[str], transform=None, split="train"):
+    def __init__(self, datafiles: List[str], transform=None, split="train", use_action_goal: bool = True):
         """
         Args:
             data_dir: path to data directory
@@ -18,18 +18,19 @@ class MaskDiffusionDataset(Dataset):
         """
         self.transform = transform
         self.split = split
+        self.use_action_goal = use_action_goal
         
         # split the datafiles into train, val, test 
-        if self.split == "train":
-            sample_files = datafiles[:int(0.8*len(datafiles))]
-        elif self.split == "val":
-            sample_files = datafiles[int(0.8*len(datafiles)):int(0.9*len(datafiles))]
-        elif self.split == "test":
-            sample_files = datafiles[int(0.9*len(datafiles)):]
+        # if self.split == "train":
+        #     sample_files = datafiles[:int(0.8*len(datafiles))]
+        # elif self.split == "val":
+        #     sample_files = datafiles[int(0.9*len(datafiles)):]
+        # elif self.split == "test":
+        #     sample_files = datafiles[int(0.9*len(datafiles)):]
             
-        print(self.split, len(sample_files))
+        # print(self.split, len(sample_files))
         
-        self.samples = sample_files
+        self.samples = datafiles
             
     def __len__(self):
         return len(self.samples)
@@ -38,20 +39,35 @@ class MaskDiffusionDataset(Dataset):
         sample = self.samples[idx]
         
         data = np.load(sample)
-        scene = data['scene']
+        robot_image = data['robot_image']
+        goal_image = data['goal_image']
+        movable_objects_image = data['movable_objects_image']
+        static_objects_image = data['static_objects_image']
+        reachable_objects_image = data['reachable_objects_image']
         
         object_mask = data['object_mask']
         goal_mask = data['goal_mask']
-        reachable_objects_mask = data['reachable_objects_image'][:, :, :1]
-        
-        inp = np.concatenate([scene, reachable_objects_mask], axis=-1)
-        tgt = np.concatenate([object_mask, goal_mask], axis=-1)
         
         if self.transform:
-            inp = self.transform(inp)
-            tgt = self.transform(tgt)
+            return {
+                "robot": self.transform(robot_image),
+                "goal": self.transform(goal_image),
+                "movable_objects": self.transform(movable_objects_image),
+                "static_objects": self.transform(static_objects_image),
+                "reachable_objects": self.transform(reachable_objects_image),
+                "object_mask": self.transform(object_mask),
+                "goal_mask": self.transform(goal_mask),
+            }
         
-        return inp, tgt
+        return {
+            "robot": robot_image,
+            "goal": goal_image,
+            "movable_objects": movable_objects_image,
+            "static_objects": static_objects_image,
+            "reachable_objects": reachable_objects_image,
+            "object_mask": object_mask,
+            "goal_mask": goal_mask,
+        }
 
 class MaskDiffusionDataModule(pl.LightningDataModule):
     def __init__(
@@ -61,6 +77,7 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         batch_size: int = 32,
         num_workers: int = 4,
         pin_memory: bool = True,
+        use_action_goal: bool = True,
     ):
         super().__init__()
         
@@ -69,6 +86,7 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.image_size = image_size
+        self.use_action_goal = use_action_goal
         
         self.train_dataset = None
         self.val_dataset = None
@@ -87,22 +105,45 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         """
         Load data. Set variables: self.train_dataset, self.val_dataset, self.test_dataset
         """
+        
+        unique_envs = set()
         datafiles = []
         if isinstance(self.data_dir, list):
             for folder in self.data_dir:
                 datafiles.extend([os.path.join(folder, f) for f in os.listdir(folder)])
         else:
-            datafiles = [os.path.join(self.data_dir, f) for f in os.listdir(self.data_dir)]
+            for f in tqdm(os.listdir(self.data_dir), desc="Loading data"):
+                if "final_state" in f:
+                    datafiles.append(os.path.join(self.data_dir, f))
+                    unique_envs.add(int(f.split("env_config_")[-1].split("_")[0]))
         
-        valid_datafiles = []
-        pbar = tqdm(range(len(datafiles)), desc="Preparing data")
-        for idx in pbar:
-            file = datafiles[idx]
-            npz_file = np.load(file)
-            object_mask = npz_file['object_mask']
-            if np.sum(object_mask) > 0:
-                valid_datafiles.append(file)
-            npz_file.close()
+        print("Sorting envs")
+        sorted_envs = sorted(list(unique_envs))
+        
+        train_datafiles = []
+        val_datafiles = []
+        test_datafiles = []
+        
+    
+        for env in tqdm(sorted_envs[:-20], desc="setting up train data"):
+            train_datafiles.extend([f for f in datafiles if ("env_config_" + str(env) + "_") in f])
+            
+        for env in tqdm(sorted_envs[-20:], desc="setting up val data"):
+            val_datafiles.extend([f for f in datafiles if ("env_config_" + str(env) + "_") in f])
+        
+        # valid_datafiles = datafiles
+        # pbar = tqdm(range(len(datafiles)), desc="Preparing data")
+        # for idx in pbar:
+        #     file = datafiles[idx]
+        #     npz_file = np.load(file)
+        #     object_mask = npz_file['object_mask']
+        #     if np.sum(object_mask) > 0:
+        #         valid_datafiles.append(file)
+        #     npz_file.close()
+        
+        # train_datafiles = train_datafiles
+        # val_datafiles = val_datafiles
+        print("train_datafiles:", len(train_datafiles), "val_datafiles:", len(val_datafiles))
         
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -112,15 +153,15 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         
         if stage == "fit" or stage is None:
             self.train_dataset = MaskDiffusionDataset(
-                valid_datafiles, split="train", transform=transform
+                train_datafiles, split="train", transform=transform, use_action_goal=self.use_action_goal
             )
             self.val_dataset = MaskDiffusionDataset(
-                valid_datafiles, split="val", transform=transform
+                val_datafiles, split="val", transform=transform, use_action_goal=self.use_action_goal
             )
             
         if stage == "test" or stage is None:
             self.test_dataset = MaskDiffusionDataset(
-                valid_datafiles, split="test", transform=transform
+                val_datafiles, split="test", transform=transform, use_action_goal=self.use_action_goal
             )
     
     def train_dataloader(self):
@@ -139,7 +180,7 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            shuffle=False,
+            shuffle=True,
         )
         return loader
     
@@ -149,6 +190,6 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            shuffle=False,
+            shuffle=True,
         )
         return loader

@@ -1,7 +1,7 @@
 _target_: src.model.diffusion_unetcond_module.DiffusionUNetCondModule
 unet:
   _target_: diffusers.UNet2DConditionModel
-  in_channels: 6
+  in_channels: 7
   out_channels: 2
   sample_size: 64
   cross_attention_dim: 256

@@ -22,6 +22,7 @@ class ImageConverter:
             if geom_name is None:
                 geom_name = f"geom_{i}"
             geom_sizes[geom_name] = model.geom_size[i]
+            
         del model
         return geom_sizes
     
@@ -69,35 +70,49 @@ class ImageConverter:
         # Create base images
         self.data_point = data_point
         
-        scene_image = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 3), dtype=np.uint8)
-        reachable_objects_image = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 3), dtype=np.uint8)
-        object_mask = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
-        goal_mask = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
+        # Create base images (already correctly initialized as 1-channel)
+        robot_image = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
+        goal_image = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
+        movable_objects_image = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
+        static_objects_image = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
+        reachable_objects_image = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
+        # object_mask = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
+        # goal_mask = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
+        # true_goal_mask = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
         
         obj2center_px = {}
         obj2angle = {}
         
         # Draw robot
         robot_pos = data_point['robot']['position']
-        self._draw_circle(scene_image, (robot_pos[0], robot_pos[1]), 0.2, (255, 0, 0))
+        self._draw_circle(robot_image, (robot_pos[0], robot_pos[1]), 0.2, 255)
         
         # Draw goal indicator
-        self._draw_circle(scene_image, (robot_goal_pos[0], robot_goal_pos[1]), 0.25, (0, 255, 0))
+        self._draw_circle(goal_image, (robot_goal_pos[0], robot_goal_pos[1]), 0.25, 255)
         
         # Draw objects
         for obj_name, obj_data in data_point['objects'].items():
             # TODO: for now, remove in next iteration of diffusion training
-            if "movable" not in obj_name:
-                continue
             size_x, size_y = self.object_sizes[obj_name][0], self.object_sizes[obj_name][1]
             size_x *= 2
             size_y *= 2
             rotation = R.from_quat(obj_data['quaternion'], scalar_first=True).as_euler('xyz', degrees=True)[2]
-            _, center_px = self._draw_rotated_rectangle(scene_image,
-                                      (obj_data['position'][0], obj_data['position'][1]),
-                                      (size_x, size_y),
-                                      rotation,
-                                      (255, 255, 0))
+        
+            # Check if object is movable based on name containing "movable"
+            if "movable" in obj_name:
+                # Draw on movable objects image
+                _, center_px = self._draw_rotated_rectangle(movable_objects_image,
+                                          (obj_data['position'][0], obj_data['position'][1]),
+                                          (size_x, size_y),
+                                          rotation,
+                                          255)
+            else:
+                # Draw on static objects image
+                _, center_px = self._draw_rotated_rectangle(static_objects_image,
+                                          (obj_data['position'][0], obj_data['position'][1]),
+                                          (size_x, size_y),
+                                          rotation,
+                                          255)
             
             obj2center_px[obj_name] = center_px
             obj2angle[obj_name] = rotation
@@ -107,7 +122,7 @@ class ImageConverter:
                                       (obj_data['position'][0], obj_data['position'][1]),
                                       (size_x, size_y),
                                       rotation,
-                                      (255, 255, 0))
+                                      255)
                 
             
         # if 'reachable_objects' in data_point['state']:
@@ -150,10 +165,52 @@ class ImageConverter:
         
         # Normalize arrays
         return {
-            'scene': scene_image.astype(np.float32) / 255.0,
-            # 'object_mask': object_mask.astype(np.float32) / 255.0,
-            # 'goal_mask': goal_mask.astype(np.float32) / 255.0,
-            'reachable_objects': reachable_objects_image.astype(np.float32) / 255.0,
+            'robot_image': robot_image.astype(np.float32) / 255.0,
+            'goal_image': goal_image.astype(np.float32) / 255.0,
+            'movable_objects_image': movable_objects_image.astype(np.float32) / 255.0,
+            'static_objects_image': static_objects_image.astype(np.float32) / 255.0,
+            'reachable_objects_image': reachable_objects_image.astype(np.float32) / 255.0,
             'obj2center_px': obj2center_px,
             'obj2angle': obj2angle
         }
+
+    def create_object_mask(self, object_name):
+        """
+        Create a binary mask for a specific object.
+        
+        Args:
+            object_name (str): Name of the object to create mask for
+            
+        Returns:
+            np.ndarray: Binary mask with shape (IMG_SIZE, IMG_SIZE, 1) where 1.0 represents 
+                       the object's occupancy and 0.0 represents free space
+        """
+        if self.data_point is None:
+            raise ValueError("data_point is not set. Call process_datapoint first.")
+            
+        if object_name not in self.data_point['objects']:
+            raise ValueError(f"Object '{object_name}' not found in data_point")
+            
+        # Create empty mask
+        object_mask = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 1), dtype=np.uint8)
+        
+        # Get object data
+        obj_data = self.data_point['objects'][object_name]
+        
+        # Get object size with the same scaling as in process_datapoint
+        size_x, size_y = self.object_sizes[object_name][0], self.object_sizes[object_name][1]
+        size_x *= 2
+        size_y *= 2
+        
+        # Get rotation
+        rotation = R.from_quat(obj_data['quaternion'], scalar_first=True).as_euler('xyz', degrees=True)[2]
+        
+        # Draw the object on the mask
+        self._draw_rotated_rectangle(object_mask,
+                                   (obj_data['position'][0], obj_data['position'][1]),
+                                   (size_x, size_y),
+                                   rotation,
+                                   255)
+        
+        # Return normalized binary mask (0.0 and 1.0)
+        return object_mask.astype(np.float32) / 255.0

@@ -24,7 +24,7 @@ def find_rectangle_corners(mask):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if not contours:
-        return None
+        return None, None, None, None
     # Get the largest contour
     contour = max(contours, key=cv2.contourArea)
     

@@ -1,6 +1,7 @@
 _target_: src.data.mask_diffusion_data.MaskDiffusionDataModule
-data_dir: /common/users/dm1487/namo_data/images/jun6/random_start_random_goal_many_env
+data_dir: /common/users/dm1487/namo_data/images/jul11/random_start_random_goal_single_obstacle_room_2_200k
 batch_size: ${batch_size}
 num_workers: ${num_workers}
 pin_memory: true
-image_size: 64
+image_size: ${image_size}
+use_action_goal: true # this is a boolean flag to use the action goal and not the next "object" state as the target.
