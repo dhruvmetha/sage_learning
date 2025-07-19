@@ -9,7 +9,7 @@ import numpy as np
 import random
 
 class MaskDiffusionDataset(Dataset):
-    def __init__(self, datafiles: List[str], transform=None, split="train", use_action_goal: bool = True):
+    def __init__(self, datafiles: List[str], transform=None, split="train", use_coord_grid=False):
         """
         Args:
             data_dir: path to data directory
@@ -18,7 +18,8 @@ class MaskDiffusionDataset(Dataset):
         """
         self.transform = transform
         self.split = split
-        self.use_action_goal = use_action_goal
+        self.use_coord_grid = use_coord_grid
+        
         
         # split the datafiles into train, val, test 
         # if self.split == "train":
@@ -48,8 +49,18 @@ class MaskDiffusionDataset(Dataset):
         object_mask = data['object_mask']
         goal_mask = data['goal_mask']
         
+        image_size = robot_image.shape[1]
+        
+        if self.use_coord_grid:
+            ys, xs = np.meshgrid(np.linspace(0, 1, image_size), 
+                                 np.linspace(0, 1, image_size), 
+                                 indexing='ij')
+            coord_grid = np.stack([xs, ys], axis=-1)
+            coord_grid = coord_grid.reshape(image_size, image_size, 2).astype(np.float32)
+            
+        
         if self.transform:
-            return {
+            ret = {
                 "robot": self.transform(robot_image),
                 "goal": self.transform(goal_image),
                 "movable_objects": self.transform(movable_objects_image),
@@ -58,8 +69,11 @@ class MaskDiffusionDataset(Dataset):
                 "object_mask": self.transform(object_mask),
                 "goal_mask": self.transform(goal_mask),
             }
+            if self.use_coord_grid:
+                ret["coord_grid"] = self.transform(coord_grid)
+            return ret
         
-        return {
+        ret = {
             "robot": robot_image,
             "goal": goal_image,
             "movable_objects": movable_objects_image,
@@ -68,6 +82,9 @@ class MaskDiffusionDataset(Dataset):
             "object_mask": object_mask,
             "goal_mask": goal_mask,
         }
+        if self.use_coord_grid:
+            ret["coord_grid"] = coord_grid
+        return ret
 
 class MaskDiffusionDataModule(pl.LightningDataModule):
     def __init__(
@@ -77,7 +94,7 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         batch_size: int = 32,
         num_workers: int = 4,
         pin_memory: bool = True,
-        use_action_goal: bool = True,
+        use_coord_grid: bool = False,
     ):
         super().__init__()
         
@@ -86,7 +103,7 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.image_size = image_size
-        self.use_action_goal = use_action_goal
+        self.use_coord_grid = use_coord_grid
         
         self.train_dataset = None
         self.val_dataset = None
@@ -124,12 +141,16 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         val_datafiles = []
         test_datafiles = []
         
+        # datafiles = datafiles[:100]
     
         for env in tqdm(sorted_envs[:-20], desc="setting up train data"):
             train_datafiles.extend([f for f in datafiles if ("env_config_" + str(env) + "_") in f])
             
         for env in tqdm(sorted_envs[-20:], desc="setting up val data"):
             val_datafiles.extend([f for f in datafiles if ("env_config_" + str(env) + "_") in f])
+            
+        # train_datafiles = train_datafiles[:64]
+        # val_datafiles = train_datafiles[:64]
         
         # valid_datafiles = datafiles
         # pbar = tqdm(range(len(datafiles)), desc="Preparing data")
@@ -153,15 +174,15 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         
         if stage == "fit" or stage is None:
             self.train_dataset = MaskDiffusionDataset(
-                train_datafiles, split="train", transform=transform, use_action_goal=self.use_action_goal
+                train_datafiles, split="train", transform=transform, use_coord_grid=self.use_coord_grid
             )
             self.val_dataset = MaskDiffusionDataset(
-                val_datafiles, split="val", transform=transform, use_action_goal=self.use_action_goal
+                val_datafiles, split="val", transform=transform, use_coord_grid=self.use_coord_grid
             )
             
         if stage == "test" or stage is None:
             self.test_dataset = MaskDiffusionDataset(
-                val_datafiles, split="test", transform=transform, use_action_goal=self.use_action_goal
+                val_datafiles, split="test", transform=transform, use_coord_grid=self.use_coord_grid
             )
     
     def train_dataloader(self):

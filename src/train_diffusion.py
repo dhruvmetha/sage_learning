@@ -1,8 +1,8 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import hydra
 import lightning.pytorch as pl
 import torch
+torch.set_default_dtype(torch.float32)
 torch.set_float32_matmul_precision("medium")
 from pathlib import Path
 
@@ -10,6 +10,8 @@ from pathlib import Path
 def main(cfg):
     if cfg.get("seed"):
         pl.seed_everything(cfg.seed)
+        
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
         
     data_module: pl.LightningDataModule = hydra.utils.instantiate(cfg.data)
     

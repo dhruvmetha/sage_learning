@@ -108,7 +108,7 @@ class TransformerBlockAdaLN(nn.Module):
 # DiT with AdaLN‑Zero
 # ---------------------------------------------------------------
 
-class RelationalDiT(nn.Module):
+class DiT(nn.Module):
     """Minimal AdaLN‑equipped Diffusion Transformer for square RGB images."""
 
     def __init__(
@@ -123,11 +123,6 @@ class RelationalDiT(nn.Module):
     ) -> None:
         super().__init__()
         assert img_size % patch == 0, "Image size must be divisible by patch size."
-        
-        self.robot_embed = PatchEmbed(1, img_size, dim)
-        self.goal_embed = PatchEmbed(1, img_size, dim)
-        self.movable_embed = PatchEmbed(1, patch, dim)
-        
         self.patch_embed = PatchEmbed(in_ch, patch, dim)
         num_patches = (img_size // patch) ** 2
 

@@ -18,3 +18,4 @@ warmup_steps: 1000
 decay_steps: 300000
 
 image_size: 64
+gpu_id: 1

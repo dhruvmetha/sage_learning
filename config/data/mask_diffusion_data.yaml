@@ -4,4 +4,4 @@ batch_size: ${batch_size}
 num_workers: ${num_workers}
 pin_memory: true
 image_size: ${image_size}
-use_action_goal: true # this is a boolean flag to use the action goal and not the next "object" state as the target.
+use_coord_grid: true # for simple relational information

@@ -3,8 +3,8 @@ model:
   _target_: src.model.dit.dit.DiT
   img_size: ${image_size}
   patch: 4
-  in_ch: 6
-  out_ch: 1
+  in_ch: 9
+  out_ch: 2
   dim: 256
   depth: 8
   heads: 8
