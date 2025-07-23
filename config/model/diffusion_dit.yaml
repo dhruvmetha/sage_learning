@@ -3,8 +3,8 @@ model:
   _target_: src.model.dit.dit.DiT
   img_size: ${image_size}
   patch: 4
-  in_ch: 9
-  out_ch: 2
+  in_ch: 5
+  out_ch: 1
   dim: 256
   depth: 8
   heads: 8
@@ -19,6 +19,8 @@ optimizer:
   _partial_: true
   lr: ${base_lr}
   weight_decay: 0.01
-  
-discrete: true
-continuous: false
+
+loss_type: ${loss_type}
+split: true
+discrete: false
+continuous: true

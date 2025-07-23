@@ -1,0 +1,33 @@
+# Test configuration for quick evaluation pipeline testing
+defaults:
+  - _self_
+  - eval_environments: test  # Use test environment set
+
+# Auto-detection settings
+auto_detect_latest: true
+max_models_to_detect: 1  # Just test with 1 model
+
+# Evaluation settings - minimal for testing
+num_trials: 1  # Just 1 trial per environment for speed
+coordination: "ssh"  # Use SSH for full automation test
+max_parallel_servers: 1  # Only 1 server for testing
+start_port: 5556
+
+# GPU management  
+available_gpus: [0, 1, 2, 3, 4]  # All GPUs available on arrakis
+max_gpus_to_use: 1   # Use just 1 GPU for testing
+
+# SSH coordination settings
+ssh:
+  host: "westeros.cs.rutgers.edu"
+  ml4kp_path: "/common/home/dm1487/robotics_research/ktamp/ml4kp_ktamp"
+  eval_script_path: "executables/utils/eval_namo.py"
+
+# Results configuration  
+results_dir: "test_eval_results"
+save_images: true
+save_aggregated_stats: true
+
+# Logging
+verbose: true
+log_level: "INFO"

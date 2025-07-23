@@ -8,42 +8,71 @@ import torch.nn as nn
 import lightning.pytorch as pl
 
 class DiffusionModule(pl.LightningModule):
-    def __init__(self, model, noise_scheduler, optimizer, discrete=True, continuous=False):
+    def __init__(self, model, noise_scheduler, optimizer, loss_type, split=True, discrete=True, continuous=False):
         super().__init__()
         self.model = model
         self.noise_scheduler = noise_scheduler
         self.optimizer_partial = optimizer
         
+        self.loss_type = loss_type
+        self.split = split
         self.discrete = discrete
         self.continuous = continuous
+        if self.split:
+            if int(self.discrete) + int(self.continuous) != 1:
+                raise ValueError("split must be true only if one of discrete or continuous is true")
         
         self.dice_weight = getattr(self.hparams, "dice_weight", 0.005)
         
         self.optimizer = None
-        self.criterion = nn.MSELoss()
         
         self.train_loss = MeanMetric()
         self.val_loss = MeanMetric()
         self.val_loss_best = MinMetric()
+        self.mse_loss_criterion = nn.MSELoss()
         
         # Save hyperparameters for checkpointing
         self.save_hyperparameters(ignore=["model", "noise_scheduler"])
-        
     
     def forward(self, x, timesteps):
         return self.model(x, timesteps)
     
-    def loss_fn(self, x, pred):
-        return self.criterion(pred, x)
+    def loss_fn(self, x, pred, timesteps):
+        if self.loss_type == "mse":
+            return self.mse_loss_criterion(x, pred)
+        elif self.loss_type == "mse_dice":
+            mse_loss = self.mse_loss_criterion(x, pred)
+                # Add numerical stability checks for x0 prediction
+            alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(x.device)
+            sqrt_recip_alphas = torch.sqrt(1.0 / (alphas_cumprod[timesteps] + 1e-8)).view(-1,1,1,1)
+            sqrt_recipm1 = torch.sqrt(1.0 / (alphas_cumprod[timesteps] + 1e-8) - 1).view(-1,1,1,1)
+            x0_pred = (x - sqrt_recipm1 * pred) * sqrt_recip_alphas
+            
+            # Clamp x0_pred to prevent extreme values before sigmoid
+            x0_pred = torch.clamp(x0_pred, -10.0, 10.0)
+            x0_pred = torch.sigmoid(x0_pred)
+            dice_loss = self.focal_dice_loss(x0_pred, (x + 1) / 2)
+            return mse_loss + self.dice_weight * dice_loss
+        else:
+            raise ValueError(f"Invalid loss type: {self.loss_type}")
     
     def training_step(self, batch, batch_idx):
         
-        if "coord_grid" in batch:
-            inp = torch.cat([batch['robot'], batch['goal'], batch['movable_objects'], batch['static_objects'], batch['reachable_objects'], batch['coord_grid']], dim=1)
-        else:
-            inp = torch.cat([batch['robot'], batch['goal'], batch['movable_objects'], batch['static_objects'], batch['reachable_objects']], dim=1)
+        inp_arr = [batch['robot'], batch['goal'], batch['movable_objects'], batch['static_objects']]
+        tgt_arr = []
+        if self.split: # for split model
+            if self.discrete:
+                # inp_arr.append(batch['reachable_objects'])
+                tgt_arr.append(batch['object_mask'])
+            elif self.continuous:
+                inp_arr.append(batch['object_mask'])
+                tgt_arr.append(batch['goal_mask'])
         
-        tgt = torch.cat([batch['object_mask'], batch['goal_mask']], dim=1)
+        if "coord_grid" in batch:
+            inp_arr.append(batch['coord_grid'])
+        
+        inp = torch.cat(inp_arr, dim=1)
+        tgt = torch.cat(tgt_arr, dim=1)
         
         # Ensure targets are in the correct range [-1, 1] for diffusion
         if tgt.max() > 1.0 or tgt.min() < -1.0:
@@ -56,27 +85,7 @@ class DiffusionModule(pl.LightningModule):
         noisy_np = torch.cat([inp, noisy_tgt], dim=1)
         
         noise_pred = self(noisy_np, timesteps)
-        mse_loss = self.loss_fn(noise_pred, noise)
-        
-        # Add numerical stability checks for x0 prediction
-        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(inp.device)
-        sqrt_recip_alphas = torch.sqrt(1.0 / (alphas_cumprod[timesteps] + 1e-8)).view(-1,1,1,1)
-        sqrt_recipm1 = torch.sqrt(1.0 / (alphas_cumprod[timesteps] + 1e-8) - 1).view(-1,1,1,1)
-        x0_pred = (noisy_tgt - sqrt_recipm1 * noise_pred) * sqrt_recip_alphas
-        
-        # Clamp x0_pred to prevent extreme values before sigmoid
-        x0_pred = torch.clamp(x0_pred, -10.0, 10.0)
-        x0_pred = torch.sigmoid(x0_pred)
-        
-        dice_loss = self.focal_dice_loss(x0_pred, (tgt + 1) / 2)
-        
-        # Check for NaN values and handle them
-        if torch.isnan(mse_loss) or torch.isnan(dice_loss):
-            print(f"NaN detected: mse_loss={mse_loss}, dice_loss={dice_loss}")
-            # Use only MSE loss if dice loss is NaN
-            loss = mse_loss if not torch.isnan(mse_loss) else torch.tensor(0.0, device=inp.device, requires_grad=True)
-        else:
-            loss = mse_loss + self.dice_weight * dice_loss
+        loss = self.loss_fn(noise, noise_pred, timesteps)
         
         # Final NaN check
         if torch.isnan(loss):
@@ -89,14 +98,21 @@ class DiffusionModule(pl.LightningModule):
         return loss
         
     def validation_step(self, batch, batch_idx):
-        # inp, tgt = batch
+        inp_arr = [batch['robot'], batch['goal'], batch['movable_objects'], batch['static_objects']]
+        tgt_arr = []
+        if self.split:
+            if self.discrete:
+                # inp_arr.append(batch['reachable_objects'])
+                tgt_arr.append(batch['object_mask'])
+            elif self.continuous:
+                inp_arr.append(batch['object_mask'])
+                tgt_arr.append(batch['goal_mask'])
         
         if "coord_grid" in batch:
-            inp = torch.cat([batch['robot'], batch['goal'], batch['movable_objects'], batch['static_objects'], batch['reachable_objects'], batch['coord_grid']], dim=1)
-        else:
-            inp = torch.cat([batch['robot'], batch['goal'], batch['movable_objects'], batch['static_objects'], batch['reachable_objects']], dim=1)
+            inp_arr.append(batch['coord_grid'])
         
-        tgt = torch.cat([batch['object_mask'], batch['goal_mask']], dim=1)
+        inp = torch.cat(inp_arr, dim=1)
+        tgt = torch.cat(tgt_arr, dim=1)
         
         # Ensure targets are in the correct range [-1, 1] for diffusion
         if tgt.max() > 1.0 or tgt.min() < -1.0:
@@ -106,36 +122,14 @@ class DiffusionModule(pl.LightningModule):
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (inp.shape[0],), device=inp.device).long()
         noisy_tgt = self.noise_scheduler.add_noise(tgt, noise, timesteps)
         
-        
         noisy_np = torch.cat([inp, noisy_tgt], dim=1)
         
-        # Complete the validation step
         noise_pred = self(noisy_np, timesteps)
-        mse_loss = self.loss_fn(noise_pred, noise)
-        
-        # Add numerical stability checks for x0 prediction
-        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(inp.device)
-        sqrt_recip_alphas = torch.sqrt(1.0 / (alphas_cumprod[timesteps] + 1e-8)).view(-1,1,1,1)
-        sqrt_recipm1 = torch.sqrt(1.0 / (alphas_cumprod[timesteps] + 1e-8) - 1).view(-1,1,1,1)
-        x0_pred = (noisy_tgt - sqrt_recipm1 * noise_pred) * sqrt_recip_alphas
-        
-        # Clamp x0_pred to prevent extreme values before sigmoid
-        x0_pred = torch.clamp(x0_pred, -10.0, 10.0)
-        x0_pred = torch.sigmoid(x0_pred)
-        
-        dice_loss = self.focal_dice_loss(x0_pred, (tgt + 1) / 2)
-        
-        # Check for NaN values and handle them
-        if torch.isnan(mse_loss) or torch.isnan(dice_loss):
-            print(f"NaN detected in validation: mse_loss={mse_loss}, dice_loss={dice_loss}")
-            # Use only MSE loss if dice loss is NaN
-            loss = mse_loss if not torch.isnan(mse_loss) else torch.tensor(0.0, device=inp.device, requires_grad=True)
-        else:
-            loss = mse_loss + self.dice_weight * dice_loss
+        loss = self.loss_fn(noise, noise_pred, timesteps)
         
         # Final NaN check
         if torch.isnan(loss):
-            print("Validation loss is NaN, skipping this batch")
+            print("Loss is NaN, skipping this batch")
             return None
         
         # Log validation loss
@@ -190,7 +184,8 @@ class DiffusionModule(pl.LightningModule):
             vis_1[:, 2, :, :] = inp_samples[:, 3, :, :]
             
             vis_2 = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
-            vis_2[:, 0, :, :] = inp_samples[:, 4, :, :]
+            if self.continuous:
+                vis_2[:, 0, :, :] = inp_samples[:, 4, :, :]
             
             comparison = torch.cat([vis_1, vis_2, new_tgt_samples, new_generated_samples_1, new_generated_samples_2, new_generated_samples_3, new_generated_samples_4], dim=0)
             grid = torchvision.utils.make_grid(comparison, nrow=num_samples, normalize=True)
@@ -226,8 +221,6 @@ class DiffusionModule(pl.LightningModule):
         sample = torch.randn((1, tgt_size,) + inp.shape[2:], device=inp.device)
         sample = sample.repeat(samples, 1, 1, 1)
         inp = inp.repeat(samples, 1, 1, 1)
-        
-        print(inp.shape, sample.shape)
         
         for t in tqdm(reversed(range(self.noise_scheduler.config.num_train_timesteps))):
             timesteps = torch.full((samples,), t, device=inp.device, dtype=torch.long)

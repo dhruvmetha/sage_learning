@@ -1,0 +1,23 @@
+# Test evaluation environment set - minimal for quick testing
+# Just a few environments with 1 trial each
+
+# Easy test environments (subset of the main set)
+easy_test:
+  - "env_config_182936"
+  - "env_config_182741"
+  - "env_config_182884"
+
+# Medium test (just 2 for speed)
+medium_test:
+  - "env_config_182884"
+  - "env_config_182782"
+
+# Single environment for fastest test
+single_test:
+  - "env_config_182936"
+
+# Model directory path (used in eval_namo.py --model argument)
+model_path: "custom_walled_envs/jun22/random_start_random_goal_single_obstacle_room_2_200k_halfrad"
+
+# Default environment sets to run (start with smallest)
+default_sets: ["single_test"]

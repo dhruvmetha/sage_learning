@@ -1,0 +1,18 @@
+# Configuration for inference_diffusion_zmq.py
+defaults:
+  - _self_
+
+# Path to trained model run (required)
+run_path: null
+
+# ZMQ server configuration
+zmq:
+  host: "arrakis.cs.rutgers.edu"
+  port: 5556
+
+# Results output configuration (optional overrides)
+results_suffix: "ood_results_25"  # Will create {run_path}/{results_suffix}/
+
+# Coordinate grid configuration (optional override)
+# If not specified, will use the model's training configuration
+# use_coord_grid: true

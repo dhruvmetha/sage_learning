@@ -1,7 +1,7 @@
 _target_: src.data.mask_diffusion_data.MaskDiffusionDataModule
-data_dir: /common/users/dm1487/namo_data/images/jul11/random_start_random_goal_single_obstacle_room_2_200k
+data_dir: /common/users/dm1487/namo_data/images/jul23/random_start_random_goal_many_env_small
 batch_size: ${batch_size}
 num_workers: ${num_workers}
 pin_memory: true
 image_size: ${image_size}
-use_coord_grid: true # for simple relational information
+use_coord_grid: false # for simple relational information

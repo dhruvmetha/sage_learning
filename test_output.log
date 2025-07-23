@@ -1,0 +1,83 @@
+[2025-07-20 07:24:58,881][__main__][INFO] - Auto Evaluation Pipeline Configuration:
+[2025-07-20 07:24:58,883][__main__][INFO] - model_runs:
+- outputs/2025-07-16/22-39-31
+auto_detect_latest: true
+max_models_to_detect: 3
+num_trials: 1
+coordination: ssh
+max_parallel_servers: 3
+start_port: 5556
+available_gpus:
+- 0
+- 1
+- 2
+- 3
+- 4
+max_gpus_to_use: 3
+ssh:
+  host: westeros.cs.rutgers.edu
+  ml4kp_path: /common/home/dm1487/robotics_research/ktamp/ml4kp_ktamp
+  eval_script_path: executables/utils/eval_namo.py
+results_dir: eval_results
+save_images: true
+save_aggregated_stats: true
+log_dir: debug_logs
+experiment_name: null
+verbose: true
+log_level: INFO
+log_retention_days: 7
+max_log_file_size: 100MB
+eval_environments:
+  current:
+  - env_config_182936
+  - env_config_182741
+  - env_config_182884
+  - env_config_182782
+  - env_config_182930
+  - env_config_182945
+  - env_config_182959
+  - env_config_182799
+  - env_config_182788
+  easy:
+  - env_config_182936
+  - env_config_182884
+  - env_config_183030
+  - env_config_183036
+  - env_config_183010
+  medium:
+  - env_config_182863
+  - env_config_182904
+  - env_config_182815
+  - env_config_182794
+  - env_config_182739
+  - env_config_182796
+  - env_config_182860
+  - env_config_182926
+  - env_config_182900
+  hard:
+  - env_config_367
+  - env_config_47
+  - env_config_216
+  - env_config_142
+  ood:
+  - env_config_182976
+  - env_config_182863
+  - env_config_182904
+  - env_config_183176
+  - env_config_183171
+  model_path: custom_walled_envs/jun22/random_start_random_goal_single_obstacle_room_2_200k_halfrad
+  default_sets:
+  - current
+
+[2025-07-20 07:24:59,615][utils.ssh_coordinator][INFO] - SSH connection to westeros.cs.rutgers.edu successful
+[2025-07-20 07:24:59,994][utils.ssh_coordinator][INFO] - ML4KP path /common/home/dm1487/robotics_research/ktamp/ml4kp_ktamp exists on westeros.cs.rutgers.edu
+[2025-07-20 07:25:00,148][utils.gpu_manager][INFO] - Allocated GPU 0 to inference_22-39-31
+[2025-07-20 07:25:00,149][utils.gpu_manager][INFO] - Allocated port 5556
+[2025-07-20 07:25:00,149][utils.gpu_manager][INFO] - Allocated resources: GPU 0, Port 5556 for inference_22-39-31
+[2025-07-20 07:25:07,172][utils.ssh_coordinator][INFO] - Started evaluation process 22-39-31_current_3381173
+[2025-07-20 07:25:32,184][utils.results_aggregator][WARNING] - No results files found for model unknown_22-39-31 in outputs/2025-07-16/22-39-31
+[2025-07-20 07:25:32,404][utils.ssh_coordinator][INFO] - All processes cleaned up
+[2025-07-20 07:25:32,404][utils.gpu_manager][INFO] - Released GPU 0 from inference_22-39-31
+[2025-07-20 07:25:32,405][utils.gpu_manager][INFO] - Released port 5556
+[2025-07-20 07:25:32,406][utils.gpu_manager][INFO] - Released resources for inference_22-39-31
+All logs saved to: debug_logs/auto_eval_2025-07-20_07-24-59

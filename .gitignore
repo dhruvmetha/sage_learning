@@ -2,4 +2,4 @@ outputs/
 test/
 *.pyc
 *.egg-info/
-namo/
+example_ml4kp_ktamp/

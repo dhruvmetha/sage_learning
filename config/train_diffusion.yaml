@@ -4,6 +4,10 @@ defaults:
     - model: diffusion_dit
     - trainer: gpu
 
+# Experiment naming
+model_name: diffusion_dit
+loss_type: mse
+
 seed: 42
 num_workers: 4
 batch_size: 64
@@ -19,3 +23,10 @@ decay_steps: 300000
 
 image_size: 64
 gpu_id: 1
+
+# Hydra output directory configuration
+hydra:
+  job:
+    name: ${model_name}_${loss_type}_lr${base_lr}_bs${batch_size}
+  run:
+    dir: outputs/${model_name}/${loss_type}/${now:%Y-%m-%d_%H-%M-%S}

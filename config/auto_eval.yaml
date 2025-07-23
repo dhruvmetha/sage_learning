@@ -1,0 +1,47 @@
+# Configuration for automated evaluation pipeline
+defaults:
+  - _self_
+  - eval_environments: standard
+
+# Model runs to evaluate (auto-detect latest if empty)
+model_runs: ["outputs/2025-07-14/01-59-56"]  # e.g., ["outputs/2025-07-17/00-16-11", "outputs/2025-07-16/23-57-38"]
+
+
+use_split_inference: true
+obstacle_run_path: "outputs/2025-07-14/01-35-54"
+goal_run_path: "outputs/2025-07-14/01-59-56"
+
+# Auto-detection settings
+auto_detect_latest: true
+max_models_to_detect: 3
+
+# Evaluation settings
+num_trials: 2 
+coordination: "ssh"  # "ssh" or "manual"
+max_parallel_servers: 1
+start_port: 5556
+
+# GPU management  
+available_gpus: [0, 1, 2, 3, 4]  # Available GPU IDs on arrakis
+max_gpus_to_use: 3   # Use up to 3 GPUs simultaneously
+
+# SSH coordination settings
+ssh:
+  host: "westeros.cs.rutgers.edu"
+  ml4kp_path: "/common/home/dm1487/robotics_research/ktamp/ml4kp_ktamp"
+  eval_script_path: "executables/utils/eval_namo.py"
+
+# Results configuration  
+results_dir: "eval_results"
+save_images: true
+save_aggregated_stats: true
+
+# Logging configuration
+log_dir: "debug_logs"  # Base directory for all logs
+experiment_name: null  # Optional experiment name (uses timestamp if null)
+verbose: true
+log_level: "INFO"
+
+# Log monitoring and debugging
+log_retention_days: 7  # How long to keep logs (for future cleanup utility)
+max_log_file_size: "100MB"  # Maximum size per log file (for future rotation)

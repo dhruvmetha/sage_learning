@@ -1,0 +1,54 @@
+
+# Environment difficulty categories (from comments in eval_namo.py)
+
+easy:
+  - "env_config_182926"
+  - "env_config_182967"
+  - "env_config_182904"
+  - "env_config_182794"
+  - "env_config_182934"
+  - "env_config_182815"
+  - "env_config_182782"
+  - "env_config_182955"
+  - "env_config_182900"
+  - "env_config_182841"
+  - "env_config_182791"
+  - "env_config_182883"
+  - "env_config_182816"
+  - "env_config_182796"
+  - "env_config_182773"
+  - "env_config_182860"
+  - "env_config_182903"
+  - "env_config_182927"
+  - "env_config_182863"
+  - "env_config_182739"
+  - "env_config_182933"
+
+medium:
+  - "env_config_182965"
+  - "env_config_182936"
+  - "env_config_182741"
+  - "env_config_182896"
+  - "env_config_182879"
+  - "env_config_182821"
+  - "env_config_182766"
+  - "env_config_182930"
+  - "env_config_182976"
+  - "env_config_182884"
+  - "env_config_182847"
+  - "env_config_182807"
+  - "env_config_182850"
+  - "env_config_182736"
+
+hard:
+  - "env_config_182959"
+  - "env_config_182799"
+  - "env_config_182788"
+  - "env_config_182873"
+  - "env_config_182945"
+
+# Model directory path (used in eval_namo.py --model argument)
+model_path: "custom_walled_envs/jun22/random_start_random_goal_single_obstacle_room_2_200k_halfrad"
+
+# Default environment sets to run
+default_sets: ["medium", "hard"]

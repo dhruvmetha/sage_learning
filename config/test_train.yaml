@@ -1,0 +1,21 @@
+defaults:
+    - _self_
+    - data: mask_diffusion_data
+    - model: diffusion_unetcond   # Use simpler model for quick test
+    - trainer: gpu
+
+seed: 42
+num_workers: 2  # Reduce for quick test
+batch_size: 16  # Small batch for quick test
+
+# trainer - quick test settings
+max_epochs: 2  # Just 2 epochs for testing
+check_val_every_n_epoch: 1
+
+base_lr: 0.0001
+end_lr: 0.000001
+warmup_steps: 50   # Reduced warmup
+decay_steps: 500   # Reduced decay
+
+image_size: 64
+gpu_id: 0  # Use GPU 0
