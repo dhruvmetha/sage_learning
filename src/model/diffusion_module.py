@@ -53,6 +53,18 @@ class DiffusionModule(pl.LightningModule):
             x0_pred = torch.sigmoid(x0_pred)
             dice_loss = self.focal_dice_loss(x0_pred, (x + 1) / 2)
             return mse_loss + self.dice_weight * dice_loss
+        elif self.loss_type == "dice":
+                # Add numerical stability checks for x0 prediction
+            alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(x.device)
+            sqrt_recip_alphas = torch.sqrt(1.0 / (alphas_cumprod[timesteps] + 1e-8)).view(-1,1,1,1)
+            sqrt_recipm1 = torch.sqrt(1.0 / (alphas_cumprod[timesteps] + 1e-8) - 1).view(-1,1,1,1)
+            x0_pred = (x - sqrt_recipm1 * pred) * sqrt_recip_alphas
+            
+            # Clamp x0_pred to prevent extreme values before sigmoid
+            x0_pred = torch.clamp(x0_pred, -10.0, 10.0)
+            x0_pred = torch.sigmoid(x0_pred)
+            dice_loss = self.focal_dice_loss(x0_pred, (x + 1) / 2)
+            return dice_loss
         else:
             raise ValueError(f"Invalid loss type: {self.loss_type}")
     

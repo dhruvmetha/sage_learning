@@ -1,10 +1,8 @@
-_target_: src.model.diffusion_module.DiffusionModule
+_target_: src.model.diffusion_multigranularity_goal_module.DiffusionMultiGranularityGoalModule
+
 model:
-  _target_: src.model.dit.dit.DiT
+  _target_: src.model.multigranularity.multi_granularity_goal_dit.MultiGranularityGoalDiT
   img_size: ${image_size}
-  patch: 4
-  in_ch: 6
-  out_ch: 1
   dim: 256
   depth: 8
   heads: 8
@@ -21,6 +19,3 @@ optimizer:
   weight_decay: 0.01
 
 loss_type: ${loss_type}
-split: true
-discrete: false
-continuous: true

@@ -1,0 +1,27 @@
+_target_: src.model.diffusion_multigranularity_module.DiffusionMultiGranularityModule
+
+model:
+  _target_: src.model.multigranularity.multi_granularity_dit.MultiGranularityDiT
+  img_size: ${image_size}
+  dim: 256
+  depth: 8
+  heads: 8
+  robot_patch_size: 64    # 64x64 → 1 token
+  goal_patch_size: 64     # 64x64 → 1 token  
+  object_patch_size: 4    # 4x4 → 256 tokens each
+
+noise_scheduler:
+  _target_: diffusers.DDPMScheduler
+  num_train_timesteps: 100
+  beta_schedule: "squaredcos_cap_v2"
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${base_lr}
+  weight_decay: 0.01
+
+loss_type: ${loss_type}
+split: true
+discrete: true
+continuous: false
