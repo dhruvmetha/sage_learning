@@ -1,17 +1,32 @@
 import os
+import sys
 import hydra
 import lightning.pytorch as pl
 import torch
 torch.set_default_dtype(torch.float32)
-torch.set_float32_matmul_precision("medium")
+
+# Configure TF32 for faster computation on Ampere+ GPUs (RTX A4000)
+# Using old API only - PyTorch Lightning is not yet compatible with new API
+torch.set_float32_matmul_precision('medium')  # Enables TF32 for matmul operations
+
+# Use file_system sharing strategy to avoid NFS issues with multiprocessing
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
+
 from pathlib import Path
 
-@hydra.main(config_path="../config", config_name="train_diffusion.yaml")
+# Add project root to Python path to ensure imports work
+project_root = Path(__file__).parent.parent.absolute()
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+@hydra.main(config_path="../config", config_name="train_diffusion.yaml", version_base="1.1")
 def main(cfg):
     if cfg.get("seed"):
         pl.seed_everything(cfg.seed)
-        
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
+    
+    # Don't set CUDA_VISIBLE_DEVICES for multi-GPU training
+    # Lightning's DDP strategy handles device selection automatically
         
     data_module: pl.LightningDataModule = hydra.utils.instantiate(cfg.data)
     
@@ -36,7 +51,13 @@ def main(cfg):
         print(f"✅ Model loaded successfully: {type(model).__name__}")
     
     trainer: pl.Trainer = hydra.utils.instantiate(cfg.trainer)
-    trainer.fit(model=model, datamodule=data_module)
+    
+    # Check if resuming from checkpoint
+    ckpt_path = cfg.get("ckpt_path", None)
+    if ckpt_path is not None:
+        print(f"✅ Resuming training from checkpoint: {ckpt_path}")
+    
+    trainer.fit(model=model, datamodule=data_module, ckpt_path=ckpt_path)
     
 if __name__ == "__main__":
     main()

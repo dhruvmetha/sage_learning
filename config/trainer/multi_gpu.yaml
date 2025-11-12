@@ -1,0 +1,35 @@
+_target_: lightning.pytorch.trainer.Trainer
+accelerator: gpu
+devices: 4  # Use all 4 GPUs
+strategy: ddp  # Distributed Data Parallel
+max_epochs: 300
+precision: 16-mixed  # Mixed precision for faster training
+gradient_clip_val: 1.0
+accumulate_grad_batches: 2  # Effective batch = 4 * 4 * 2 = 32
+log_every_n_steps: 50
+check_val_every_n_epoch: 5
+num_sanity_val_steps: 2
+fast_dev_run: false  # Set to true for quick testing (runs 1 batch only)
+
+callbacks:
+  - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    monitor: val_loss
+    mode: min
+    save_top_k: 3
+    save_last: true
+    filename: "epoch{epoch:03d}-val_loss{val_loss:.4f}"
+    auto_insert_metric_name: false
+  - _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+  - _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: val_loss
+    patience: 20
+    mode: min
+
+logger:
+  - _target_: lightning.pytorch.loggers.TensorBoardLogger
+    save_dir: ${paths.output_dir}
+    name: ${name}
+    version: null
+    default_hp_metric: false
