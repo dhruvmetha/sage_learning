@@ -15,9 +15,4 @@ setup(
         "tqdm",
     ],
     python_requires=">=3.6",
-    entry_points={
-        "console_scripts": [
-            "train-vae=train_vae:main",
-        ],
-    },
 )
