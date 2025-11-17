@@ -37,7 +37,7 @@ class DiffusionModule(pl.LightningModule):
         return self.criterion(pred, x)
     
     def training_step(self, batch, batch_idx):
-        # Build input tensor: 6 channels (robot, goal, movable, static, reachable, target_object)
+        # Build input tensor: 5 channels (robot, goal, movable, static, target_object)
         # Support multiple key naming conventions for backward compatibility
         inp_parts = []
         
@@ -66,18 +66,8 @@ class DiffusionModule(pl.LightningModule):
             inp_parts.append(batch['static_objects_image'])
         else:
             raise KeyError('No static objects key found in batch')
-        
-        # Channel 5: reachable objects
-        if 'reachable' in batch:
-            inp_parts.append(batch['reachable'])
-        elif 'reachable_objects' in batch:
-            inp_parts.append(batch['reachable_objects'])
-        elif 'reachable_objects_image' in batch:
-            inp_parts.append(batch['reachable_objects_image'])
-        else:
-            raise KeyError('No reachable objects key found in batch')
-        
-        # Channel 6: target_object (the object we're predicting a goal position for)
+
+        # Channel 5: target_object (the object we're predicting a goal position for)
         if 'target_object' in batch:
             inp_parts.append(batch['target_object'])
         elif 'selected_object_mask' in batch:
@@ -141,7 +131,7 @@ class DiffusionModule(pl.LightningModule):
         return loss
         
     def validation_step(self, batch, batch_idx):
-        # Build input tensor: 6 channels (robot, goal, movable, static, reachable, target_object)
+        # Build input tensor: 5 channels (robot, goal, movable, static, target_object)
         inp_parts = []
         
         # Channel 1: robot
@@ -169,18 +159,8 @@ class DiffusionModule(pl.LightningModule):
             inp_parts.append(batch['static_objects_image'])
         else:
             raise KeyError('No static objects key found in batch')
-        
-        # Channel 5: reachable objects
-        if 'reachable' in batch:
-            inp_parts.append(batch['reachable'])
-        elif 'reachable_objects' in batch:
-            inp_parts.append(batch['reachable_objects'])
-        elif 'reachable_objects_image' in batch:
-            inp_parts.append(batch['reachable_objects_image'])
-        else:
-            raise KeyError('No reachable objects key found in batch')
-        
-        # Channel 6: target_object
+
+        # Channel 5: target_object
         if 'target_object' in batch:
             inp_parts.append(batch['target_object'])
         elif 'selected_object_mask' in batch:
@@ -273,34 +253,55 @@ class DiffusionModule(pl.LightningModule):
             generated_samples_4 = self._full_denoising_process(inp_samples, tgt_samples)
         # Log samples if using tensorboard
         if hasattr(self.logger, 'experiment'):
-            # Create comparison grid: input, target, generated
-            # Prepare tensors for logging; handle arbitrary channel counts gracefully
-            num_tgt_ch = tgt_samples.shape[1]
-            max_vis_ch = max(3, num_tgt_ch)
-            new_tgt_samples = torch.zeros(num_samples, max_vis_ch, image_size, image_size, device=inp_samples.device)
-            new_generated_samples_1 = torch.zeros_like(new_tgt_samples)
-            new_generated_samples_2 = torch.zeros_like(new_tgt_samples)
-            new_generated_samples_3 = torch.zeros_like(new_tgt_samples)
-            new_generated_samples_4 = torch.zeros_like(new_tgt_samples)
 
-            # copy available channels
-            new_tgt_samples[:, :num_tgt_ch, :, :] = tgt_samples[:, :num_tgt_ch, :, :]
-            new_generated_samples_1[:, :generated_samples_1.shape[1], :, :] = generated_samples_1[:, :generated_samples_1.shape[1], :, :]
-            new_generated_samples_2[:, :generated_samples_2.shape[1], :, :] = generated_samples_2[:, :generated_samples_2.shape[1], :, :]
-            new_generated_samples_3[:, :generated_samples_3.shape[1], :, :] = generated_samples_3[:, :generated_samples_3.shape[1], :, :]
-            new_generated_samples_4[:, :generated_samples_4.shape[1], :, :] = generated_samples_4[:, :generated_samples_4.shape[1], :, :]
+            def to_display(x: torch.Tensor) -> torch.Tensor:
+                """Convert [-1, 1] tensors to [0, 1]."""
+                return torch.clamp((x + 1) / 2, 0, 1)
 
-            # Build visualizations from inp_samples safely (use first few channels if present)
-            vis_1 = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
-            for i in range(3):
-                if i < inp_samples.shape[1]:
-                    vis_1[:, i, :, :] = inp_samples[:, i, :, :]
+            # 1) Scene visualization (robot + goal + movable + static)
+            scene_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
+            robot = to_display(inp_samples[:, 0:1])
+            goal = to_display(inp_samples[:, 1:2]) if inp_samples.shape[1] > 1 else None
+            movable = to_display(inp_samples[:, 2:3]) if inp_samples.shape[1] > 2 else None
+            static = to_display(inp_samples[:, 3:4]) if inp_samples.shape[1] > 3 else None
 
-            vis_2 = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
-            if inp_samples.shape[1] > 3:
-                vis_2[:, 0, :, :] = inp_samples[:, 3, :, :]
-            
-            comparison = torch.cat([vis_1, vis_2, new_tgt_samples, new_generated_samples_1, new_generated_samples_2, new_generated_samples_3, new_generated_samples_4], dim=0)
+            # robot -> blue
+            scene_vis[:, 2, :, :] = robot[:, 0, :, :]
+            # goal -> green
+            if goal is not None:
+                scene_vis[:, 1, :, :] = goal[:, 0, :, :]
+            # movable -> yellow (red + green)
+            if movable is not None:
+                scene_vis[:, 0, :, :] = torch.clamp(scene_vis[:, 0, :, :] + movable[:, 0, :, :], 0, 1)
+                scene_vis[:, 1, :, :] = torch.clamp(scene_vis[:, 1, :, :] + movable[:, 0, :, :], 0, 1)
+            # static -> grey overlay
+            if static is not None:
+                grey = static[:, 0, :, :]
+                scene_vis = torch.clamp(scene_vis + grey.unsqueeze(1).repeat(1, 3, 1, 1) * 0.5, 0, 1)
+
+            # 2) Target object mask (always channel 4 of input)
+            target_object_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
+            if inp_samples.shape[1] > 4:
+                target_object = to_display(inp_samples[:, 4:5])
+                target_object_vis[:, 0, :, :] = target_object[:, 0, :, :]
+
+            # 3) Ground-truth goal mask (targets are single channel)
+            goal_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
+            tgt_disp = to_display(tgt_samples[:, 0:1])
+            goal_vis[:, 1, :, :] = tgt_disp[:, 0, :, :]
+
+            # 4) Generated goal predictions (four independent samples)
+            generated_tiles = []
+            for generated in (generated_samples_1, generated_samples_2, generated_samples_3, generated_samples_4):
+                gen_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
+                gen_disp = to_display(generated[:, 0:1])
+                gen_vis[:, 1, :, :] = gen_disp[:, 0, :, :]
+                generated_tiles.append(gen_vis)
+
+            comparison = torch.cat(
+                [scene_vis, target_object_vis, goal_vis] + generated_tiles,
+                dim=0,
+            )
             grid = torchvision.utils.make_grid(comparison, nrow=num_samples, normalize=True)
             self.logger.experiment.add_image('Validation_Samples', grid, self.current_epoch)
             
@@ -333,7 +334,7 @@ class DiffusionModule(pl.LightningModule):
         Sample from the diffusion model.
         
         Args:
-            inp: Input tensor with shape (B, C, H, W) where C=6 (robot, goal, movable, static, reachable, target_object)
+            inp: Input tensor with shape (B, C, H, W) where C=5 (robot, goal, movable, static, target_object)
             tgt_size: Number of channels in target (default=1 for target_goal)
             samples: Number of samples to generate
             

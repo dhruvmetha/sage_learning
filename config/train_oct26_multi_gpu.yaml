@@ -12,11 +12,11 @@ name: "oct26_1push_diffusion_only_goal"
 
 # Output paths
 paths:
-  output_dir: ${oc.env:HOME}/Robotics/Mujoco/sage_learning/outputs/${name}
+  output_dir: /common/users/dm1487/namo_data/outputs/diffusion_only_goal/${name}
   log_dir: ${paths.output_dir}/logs
 
 # Optimization settings
-batch_size: 4  # Per GPU (effective batch = 4 * 4 * 2 = 32 with grad accumulation)
+batch_size: 10  # Per GPU (effective batch = 4 * 4 * 2 = 32 with grad accumulation)
 num_workers: 4  # Per GPU (total = 4 * 4 = 16 workers, safe for system limits)
 base_lr: 0.0001  # Standard for DiT with large batch (used by model config)
 

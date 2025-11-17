@@ -153,14 +153,13 @@ class GoalInferenceModel:
         except Exception as e:
             raise ValueError(f"Error creating object mask for '{selected_object}': {e}")
         
-        # Prepare input for goal model (include reachable objects + selected object mask)
+        # Prepare input for goal model (stack scene context + selected object mask)
         inp_for_goal = np.concatenate([
             inp_data['robot_image'],
             inp_data['goal_image'],
             inp_data['movable_objects_image'],
             inp_data['static_objects_image'],
-            inp_data['reachable_objects_image'],  # Include reachable objects (channel 5)
-            selected_object_mask                   # Selected object mask (channel 6)
+            selected_object_mask                   # Selected object mask (channel 5)
         ], axis=-1)
         
         
@@ -170,7 +169,7 @@ class GoalInferenceModel:
         
         inp_for_goal = self.transform(inp_for_goal).unsqueeze(0).to(self.device)
 
-        print(f"📊 Input channels for model: {inp_for_goal.shape[1]} (expected: 6)")
+        print(f"📊 Input channels for model: {inp_for_goal.shape[1]} (expected: 5)")
 
         # Generate goal samples
         with torch.no_grad():

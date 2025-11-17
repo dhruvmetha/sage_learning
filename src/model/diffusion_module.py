@@ -35,13 +35,32 @@ class DiffusionModule(pl.LightningModule):
     
     def loss_fn(self, x, pred):
         return self.criterion(pred, x)
+
+    def _build_model_input(self, batch):
+        """
+        Construct the model input tensor by concatenating the available context channels.
+        Always includes robot, goal, movable, static. Optionally includes target_object and coord grid.
+        """
+        inp_parts = [
+            batch['robot'],
+            batch['goal'],
+            batch['movable_objects'],
+            batch['static_objects'],
+        ]
+
+        target_object = batch.get('target_object')
+        if target_object is not None:
+            if target_object.dim() == 3:
+                target_object = target_object.unsqueeze(1)
+            inp_parts.append(target_object)
+
+        if "coord_grid" in batch:
+            inp_parts.append(batch['coord_grid'])
+
+        return torch.cat(inp_parts, dim=1)
     
     def training_step(self, batch, batch_idx):
-        
-        if "coord_grid" in batch:
-            inp = torch.cat([batch['robot'], batch['goal'], batch['movable_objects'], batch['static_objects'], batch['reachable_objects'], batch['coord_grid']], dim=1)
-        else:
-            inp = torch.cat([batch['robot'], batch['goal'], batch['movable_objects'], batch['static_objects'], batch['reachable_objects']], dim=1)
+        inp = self._build_model_input(batch)
         
         tgt = torch.cat([batch['object_mask'], batch['goal_mask']], dim=1)
         
@@ -90,11 +109,7 @@ class DiffusionModule(pl.LightningModule):
         
     def validation_step(self, batch, batch_idx):
         # inp, tgt = batch
-        
-        if "coord_grid" in batch:
-            inp = torch.cat([batch['robot'], batch['goal'], batch['movable_objects'], batch['static_objects'], batch['reachable_objects'], batch['coord_grid']], dim=1)
-        else:
-            inp = torch.cat([batch['robot'], batch['goal'], batch['movable_objects'], batch['static_objects'], batch['reachable_objects']], dim=1)
+        inp = self._build_model_input(batch)
         
         tgt = torch.cat([batch['object_mask'], batch['goal_mask']], dim=1)
         
@@ -144,7 +159,8 @@ class DiffusionModule(pl.LightningModule):
         
         # Save first batch for potential sample generation
         if batch_idx == 0:
-            self.validation_batch = (inp, tgt, noise_pred, noise)
+            target_object = batch.get('target_object')
+            self.validation_batch = (inp, tgt, noise_pred, noise, target_object)
         return loss
     
     def on_validation_epoch_end(self):
@@ -156,7 +172,11 @@ class DiffusionModule(pl.LightningModule):
             self._generate_validation_samples()
     
     def _generate_validation_samples(self):
-        inp, tgt, noise_pred, noise = self.validation_batch
+        if len(self.validation_batch) == 5:
+            inp, tgt, noise_pred, noise, target_object = self.validation_batch
+        else:
+            inp, tgt, noise_pred, noise = self.validation_batch
+            target_object = None
         
         # Take a few samples for generation
         num_samples = min(8, inp.size(0))
@@ -173,26 +193,50 @@ class DiffusionModule(pl.LightningModule):
             generated_samples_4 = self._full_denoising_process(inp_samples, tgt_samples)
         # Log samples if using tensorboard
         if hasattr(self.logger, 'experiment'):
-            # Create comparison grid: input, target, generated
-            new_tgt_samples, new_generated_samples_1, new_generated_samples_2, new_generated_samples_3, new_generated_samples_4 = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device), torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device), torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device), torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device), torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
-            
-            # for any number of channels
-            num_channels = min(3, tgt_samples.shape[1])
-            new_tgt_samples[:, :num_channels, :, :] = tgt_samples[:, :num_channels, :, :]
-            new_generated_samples_1[:, :num_channels, :, :] = generated_samples_1[:, :num_channels, :, :]
-            new_generated_samples_2[:, :num_channels, :, :] = generated_samples_2[:, :num_channels, :, :]
-            new_generated_samples_3[:, :num_channels, :, :] = generated_samples_3[:, :num_channels, :, :]
-            new_generated_samples_4[:, :num_channels, :, :] = generated_samples_4[:, :num_channels, :, :]
-            
-            vis_1 = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
-            vis_1[:, 0, :, :] = inp_samples[:, 0, :, :] + inp_samples[:, 1, :, :]
-            vis_1[:, 1, :, :] = inp_samples[:, 2, :, :]
-            vis_1[:, 2, :, :] = inp_samples[:, 3, :, :]
-            
-            vis_2 = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
-            vis_2[:, 0, :, :] = inp_samples[:, 4, :, :]
-            
-            comparison = torch.cat([vis_1, vis_2, new_tgt_samples, new_generated_samples_1, new_generated_samples_2, new_generated_samples_3, new_generated_samples_4], dim=0)
+            def _to_display(x: torch.Tensor) -> torch.Tensor:
+                return torch.clamp((x + 1) / 2, 0, 1)
+
+            def _masks_to_rgb(masks: torch.Tensor) -> torch.Tensor:
+                rgb = torch.zeros(num_samples, 3, image_size, image_size, device=masks.device)
+                channels = min(3, masks.shape[1])
+                for ch in range(channels):
+                    rgb[:, ch, :, :] = masks[:, ch, :, :]
+                return rgb
+
+            robot = _to_display(inp_samples[:, 0:1])
+            goal = _to_display(inp_samples[:, 1:2]) if inp_samples.shape[1] > 1 else None
+            movable = _to_display(inp_samples[:, 2:3]) if inp_samples.shape[1] > 2 else None
+            static = _to_display(inp_samples[:, 3:4]) if inp_samples.shape[1] > 3 else None
+
+            scene_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
+            scene_vis[:, 0, :, :] = robot[:, 0, :, :]
+            if goal is not None:
+                scene_vis[:, 1, :, :] = goal[:, 0, :, :]
+            if movable is not None:
+                scene_vis[:, 2, :, :] = movable[:, 0, :, :]
+            if static is not None:
+                scene_vis[:, 0, :, :] = torch.clamp(scene_vis[:, 0, :, :] + static[:, 0, :, :] * 0.5, 0, 1)
+                scene_vis[:, 1, :, :] = torch.clamp(scene_vis[:, 1, :, :] + static[:, 0, :, :] * 0.5, 0, 1)
+
+            object_mask = _to_display(tgt_samples[:, 0:1])
+            goal_mask = _to_display(tgt_samples[:, 1:2]) if tgt_samples.shape[1] > 1 else None
+
+            object_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
+            object_vis[:, 0, :, :] = object_mask[:, 0, :, :]
+
+            goal_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
+            if goal_mask is not None:
+                goal_vis[:, 1, :, :] = goal_mask[:, 0, :, :]
+
+            comparison_parts = [scene_vis, object_vis, goal_vis]
+
+            generated_vis = []
+            for generated in (generated_samples_1, generated_samples_2, generated_samples_3, generated_samples_4):
+                generated_vis.append(_masks_to_rgb(_to_display(generated)))
+
+            comparison_parts.extend(generated_vis)
+
+            comparison = torch.cat(comparison_parts, dim=0)
             grid = torchvision.utils.make_grid(comparison, nrow=num_samples, normalize=True)
             self.logger.experiment.add_image('Validation_Samples', grid, self.current_epoch)
             
