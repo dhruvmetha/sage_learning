@@ -18,6 +18,7 @@ setup(
         "scipy",
         "matplotlib",
         "tqdm",
+        "tensorboard",
     ],
     python_requires=">=3.8",
 )

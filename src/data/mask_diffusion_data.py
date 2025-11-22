@@ -199,9 +199,13 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
             split_idx = max(1, min(split_idx, len(all_datafiles) - 1))
             train_datafiles = all_datafiles[:split_idx]
             val_datafiles = all_datafiles[split_idx:]
-            
-        train_datafiles = train_datafiles[:10]
-        val_datafiles = val_datafiles[:10]
+
+        
+        print(self.batch_size)
+        limit = max(40, self.batch_size)
+        print(f"Limit: {limit}")
+        train_datafiles = train_datafiles # [:limit]
+        val_datafiles = val_datafiles # [:limit]
 
         print(
             f"Total .npz files: {len(all_datafiles)} | "

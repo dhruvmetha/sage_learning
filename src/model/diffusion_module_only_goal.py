@@ -239,7 +239,7 @@ class DiffusionModule(pl.LightningModule):
         inp, tgt, noise_pred, noise = self.validation_batch
         
         # Take a few samples for generation
-        num_samples = min(8, inp.size(0))
+        num_samples = min(16, inp.size(0))
         inp_samples = inp[:num_samples]
         tgt_samples = tgt[:num_samples]
         
@@ -253,42 +253,57 @@ class DiffusionModule(pl.LightningModule):
             generated_samples_4 = self._full_denoising_process(inp_samples, tgt_samples)
         # Log samples if using tensorboard
         if hasattr(self.logger, 'experiment'):
-
             def to_display(x: torch.Tensor) -> torch.Tensor:
                 """Convert [-1, 1] tensors to [0, 1]."""
                 return torch.clamp((x + 1) / 2, 0, 1)
 
-            # 1) Scene visualization (robot + goal + movable + static)
-            scene_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
+            # Extract channels
             robot = to_display(inp_samples[:, 0:1])
             goal = to_display(inp_samples[:, 1:2]) if inp_samples.shape[1] > 1 else None
             movable = to_display(inp_samples[:, 2:3]) if inp_samples.shape[1] > 2 else None
             static = to_display(inp_samples[:, 3:4]) if inp_samples.shape[1] > 3 else None
+            target_object = to_display(inp_samples[:, 4:5]) if inp_samples.shape[1] > 4 else None
 
+            # Helper to add context (movable/static)
+            def add_context(vis_tensor):
+                # movable -> yellow (red + green)
+                if movable is not None:
+                    vis_tensor[:, 0, :, :] = torch.clamp(vis_tensor[:, 0, :, :] + movable[:, 0, :, :], 0, 1)
+                    vis_tensor[:, 1, :, :] = torch.clamp(vis_tensor[:, 1, :, :] + movable[:, 0, :, :], 0, 1)
+                # static -> grey overlay
+                if static is not None:
+                    grey = static[:, 0, :, :]
+                    vis_tensor = torch.clamp(vis_tensor + grey.unsqueeze(1).repeat(1, 3, 1, 1) * 0.5, 0, 1)
+                return vis_tensor
+
+            # 1) Scene visualization (robot + goal + movable + static)
+            scene_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
             # robot -> blue
             scene_vis[:, 2, :, :] = robot[:, 0, :, :]
             # goal -> green
             if goal is not None:
                 scene_vis[:, 1, :, :] = goal[:, 0, :, :]
-            # movable -> yellow (red + green)
-            if movable is not None:
-                scene_vis[:, 0, :, :] = torch.clamp(scene_vis[:, 0, :, :] + movable[:, 0, :, :], 0, 1)
-                scene_vis[:, 1, :, :] = torch.clamp(scene_vis[:, 1, :, :] + movable[:, 0, :, :], 0, 1)
-            # static -> grey overlay
-            if static is not None:
-                grey = static[:, 0, :, :]
-                scene_vis = torch.clamp(scene_vis + grey.unsqueeze(1).repeat(1, 3, 1, 1) * 0.5, 0, 1)
+            
+            scene_vis = add_context(scene_vis)
 
             # 2) Target object mask (always channel 4 of input)
             target_object_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
-            if inp_samples.shape[1] > 4:
-                target_object = to_display(inp_samples[:, 4:5])
+            if target_object is not None:
                 target_object_vis[:, 0, :, :] = target_object[:, 0, :, :]
 
             # 3) Ground-truth goal mask (targets are single channel)
             goal_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
             tgt_disp = to_display(tgt_samples[:, 0:1])
             goal_vis[:, 1, :, :] = tgt_disp[:, 0, :, :]
+            
+            # Add target object mask to ground truth samples
+            if target_object is not None:
+                goal_vis[:, 0, :, :] = torch.clamp(goal_vis[:, 0, :, :] + target_object[:, 0, :, :], 0, 1)
+            
+            # Add static ONLY to GT Goal (removed movable)
+            if static is not None:
+                grey = static[:, 0, :, :]
+                goal_vis = torch.clamp(goal_vis + grey.unsqueeze(1).repeat(1, 3, 1, 1) * 0.5, 0, 1)
 
             # 4) Generated goal predictions (four independent samples)
             generated_tiles = []
@@ -296,6 +311,16 @@ class DiffusionModule(pl.LightningModule):
                 gen_vis = torch.zeros(num_samples, 3, image_size, image_size, device=inp_samples.device)
                 gen_disp = to_display(generated[:, 0:1])
                 gen_vis[:, 1, :, :] = gen_disp[:, 0, :, :]
+                
+                # Add target object mask to generated samples
+                if target_object is not None:
+                     gen_vis[:, 0, :, :] = torch.clamp(gen_vis[:, 0, :, :] + target_object[:, 0, :, :], 0, 1)
+
+                # Add static ONLY to generated samples (removed movable)
+                if static is not None:
+                    grey = static[:, 0, :, :]
+                    gen_vis = torch.clamp(gen_vis + grey.unsqueeze(1).repeat(1, 3, 1, 1) * 0.5, 0, 1)
+                
                 generated_tiles.append(gen_vis)
 
             comparison = torch.cat(

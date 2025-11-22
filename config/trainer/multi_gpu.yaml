@@ -27,9 +27,9 @@ callbacks:
   #   patience: 20
   #   mode: min
 
-logger:
-  - _target_: lightning.pytorch.loggers.TensorBoardLogger
-    save_dir: ${paths.output_dir}
-    name: ${name}
-    version: null
-    default_hp_metric: false
+# logger:
+#   - _target_: lightning.pytorch.loggers.TensorBoardLogger
+#     save_dir: ${paths.output_dir}
+#     name: ${name}
+#     version: null
+#     default_hp_metric: false

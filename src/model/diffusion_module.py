@@ -179,7 +179,7 @@ class DiffusionModule(pl.LightningModule):
             target_object = None
         
         # Take a few samples for generation
-        num_samples = min(8, inp.size(0))
+        num_samples = min(16, inp.size(0))
         inp_samples = inp[:num_samples]
         tgt_samples = tgt[:num_samples]
         

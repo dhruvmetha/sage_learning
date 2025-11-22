@@ -8,15 +8,23 @@ defaults:
   - trainer: multi_gpu.yaml
 
 # Task name for logging
-name: "oct26_1push_diffusion_only_goal"
+name: "nov20_1push_diffusion_only_goal"
 
 # Output paths
 paths:
-  output_dir: /common/users/dm1487/namo_data/outputs/diffusion_only_goal/${name}
+  output_dir: /common/users/dm1487/namo_data/outputs/diffusion_only_goal/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}
   log_dir: ${paths.output_dir}/logs
 
+# Trainer overrides
+trainer:
+  logger:
+    - _target_: lightning.pytorch.loggers.TensorBoardLogger
+      save_dir: ${paths.output_dir}
+      name: "tensorboard"
+      version: ""
+
 # Optimization settings
-batch_size: 10  # Per GPU (effective batch = 4 * 4 * 2 = 32 with grad accumulation)
+batch_size: 32  # Per GPU (effective batch = 4 * 4 * 2 = 32 with grad accumulation)
 num_workers: 4  # Per GPU (total = 4 * 4 = 16 workers, safe for system limits)
 base_lr: 0.0001  # Standard for DiT with large batch (used by model config)
 
