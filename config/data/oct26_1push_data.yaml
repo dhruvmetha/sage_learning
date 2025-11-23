@@ -1,0 +1,7 @@
+_target_: src.data.mask_diffusion_data.MaskDiffusionDataModule
+data_dir: /common/users/dm1487/namo_data/images/nov17/1_push
+batch_size: ${batch_size}
+num_workers: ${num_workers}
+pin_memory: true
+image_size: 64  # Downsample from 224x224 to 64x64 to fit in 16GB VRAM
+use_coord_grid: false  # Not using coord_grid for this training run
