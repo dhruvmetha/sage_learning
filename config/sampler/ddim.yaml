@@ -1,0 +1,12 @@
+# DDIM Sampler Configuration
+# Deterministic sampling for diffusion models
+
+_target_: src.model.samplers.ddpm_sampler.DDPMSampler
+
+num_timesteps: 100
+beta_schedule: cosine
+
+# DDIM eta: 0 = deterministic
+ddim_eta: 0.0
+
+clip_sample: false

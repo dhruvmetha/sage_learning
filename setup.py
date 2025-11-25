@@ -8,10 +8,10 @@ setup(
     author_email="",
     packages=find_packages(include=["ktamp_learning", "ktamp_learning.*", "src", "src.*"]),
     install_requires=[
-        "torch",
+        "torch>=2.1",
         "torchvision",
-        "pytorch-lightning",
-        "hydra-core",
+        "lightning>=2.0",
+        "hydra-core>=1.3",
         "omegaconf",
         "numpy",
         "opencv-python",
@@ -19,6 +19,9 @@ setup(
         "matplotlib",
         "tqdm",
         "tensorboard",
+        "torchmetrics",
+        "diffusers",  # For scheduler compatibility (optional)
+        # "flow_matching",  # Facebook's flow matching library (install separately: pip install flow_matching)
     ],
-    python_requires=">=3.8",
+    python_requires=">=3.9",
 )

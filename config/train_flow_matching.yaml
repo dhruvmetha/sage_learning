@@ -1,0 +1,35 @@
+# Training Configuration for Flow Matching
+# Use: python src/train_generative.py --config-name=train_flow_matching
+
+defaults:
+  - _self_
+  - data: mask_diffusion_data
+  - model: generative_flow_matching
+  - trainer: gpu
+  - callbacks: default
+
+# Random seed
+seed: 42
+
+# Data loading
+num_workers: 4
+batch_size: 64
+
+# Training
+max_epochs: 100
+check_val_every_n_epoch: 1
+
+# Learning rate schedule
+base_lr: 0.0001
+end_lr: 0.000001
+warmup_steps: 1000
+decay_steps: 300000
+
+# Image size
+image_size: 64
+
+# GPU
+gpu_id: 0
+
+# Sampling steps for inference (flow matching needs fewer steps)
+sampling_steps: 20

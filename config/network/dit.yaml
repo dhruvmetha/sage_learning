@@ -1,0 +1,24 @@
+# DiT (Diffusion Transformer) Network Configuration
+
+_target_: src.model.dit.dit.DiT
+
+# Image size (must match data)
+img_size: ${image_size}
+
+# Patch size for tokenization
+patch: 4
+
+# Input channels: context (4-5) + target (2) + optional
+in_ch: 7
+
+# Output channels: target (object_mask + goal_mask)
+out_ch: 2
+
+# Model dimension
+dim: 256
+
+# Number of transformer blocks
+depth: 8
+
+# Number of attention heads
+heads: 8

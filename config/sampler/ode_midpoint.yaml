@@ -1,0 +1,7 @@
+# ODE Sampler Configuration (Midpoint Method)
+# Best balance of speed and accuracy for flow matching
+
+_target_: src.model.samplers.ode_sampler.ODESampler
+
+# ODE solver method: 'euler', 'midpoint', 'rk4', 'heun'
+method: midpoint

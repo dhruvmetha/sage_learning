@@ -1,0 +1,39 @@
+# Flow Matching Model Configuration
+# Uses FlowMatchingPath + ODESampler
+
+_target_: src.model.generative_module.GenerativeModule
+
+# Neural network backbone
+network:
+  _target_: src.model.dit.dit.DiT
+  img_size: ${image_size}
+  patch: 4
+  in_ch: 7      # 4 context + 1 target_object + 2 noisy target
+  out_ch: 2     # object_mask + goal_mask
+  dim: 256
+  depth: 8
+  heads: 8
+
+# Flow matching path (linear interpolation)
+path:
+  _target_: src.model.paths.flow_matching_path.FlowMatchingPath
+  sigma_min: 0.0
+
+# ODE sampler for inference
+sampler:
+  _target_: src.model.samplers.ode_sampler.ODESampler
+  method: midpoint
+
+# Optimizer
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${base_lr}
+  weight_decay: 0.01
+
+# Auxiliary loss weight (dice loss on reconstructed output)
+aux_loss_weight: 0.005
+
+# Channel configuration
+context_channels: 5
+target_channels: 2

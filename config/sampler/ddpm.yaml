@@ -1,0 +1,16 @@
+# DDPM Sampler Configuration
+# Stochastic sampling for diffusion models
+
+_target_: src.model.samplers.ddpm_sampler.DDPMSampler
+
+# Number of timesteps (should match path)
+num_timesteps: 100
+
+# Beta schedule (should match path)
+beta_schedule: cosine
+
+# DDIM eta: 0 = deterministic DDIM, 1 = stochastic DDPM
+ddim_eta: 1.0
+
+# Whether to clip samples during generation
+clip_sample: false
