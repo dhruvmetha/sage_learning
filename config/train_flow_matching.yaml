@@ -5,7 +5,7 @@ defaults:
   - _self_
   - data: mask_diffusion_data
   - model: generative_flow_matching
-  - trainer: gpu
+  - trainer: multi_gpu
   - callbacks: default
 
 # Random seed
@@ -16,7 +16,7 @@ num_workers: 4
 batch_size: 64
 
 # Training
-max_epochs: 100
+max_epochs: 1000
 check_val_every_n_epoch: 1
 
 # Learning rate schedule
@@ -33,3 +33,7 @@ gpu_id: 0
 
 # Sampling steps for inference (flow matching needs fewer steps)
 sampling_steps: 20
+
+# Paths
+paths:
+  output_dir: ${hydra:runtime.output_dir}

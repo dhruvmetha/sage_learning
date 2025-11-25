@@ -110,22 +110,15 @@ class GenerativeModule(pl.LightningModule):
         """
         Build context tensor from batch.
 
-        Concatenates: robot, goal, movable_objects, static_objects,
-        and optionally target_object and coord_grid.
+        Concatenates: robot, goal, movable_objects, static_objects, target_object, and optionally coord_grid.
         """
         parts = [
             batch['robot'],
             batch['goal'],
-            batch['movable_objects'],
-            batch['static_objects'],
+            batch['movable'],
+            batch['static'],
+            batch['target_object']
         ]
-
-        # Optional: target object channel
-        if 'target_object' in batch and batch['target_object'] is not None:
-            target_obj = batch['target_object']
-            if target_obj.dim() == 3:
-                target_obj = target_obj.unsqueeze(1)
-            parts.append(target_obj)
 
         # Optional: coordinate grid
         if 'coord_grid' in batch:
@@ -135,12 +128,9 @@ class GenerativeModule(pl.LightningModule):
 
     def _build_target(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Build target tensor from batch.
-
-        Concatenates object_mask and goal_mask, clamped to [-1, 1].
+        Build target tensor from batch, clamped to [-1, 1].
         """
-        target = torch.cat([batch['object_mask'], batch['goal_mask']], dim=1)
-        return torch.clamp(target, -1.0, 1.0)
+        return torch.clamp(batch['target_goal'], -1, 1)
 
     def _compute_loss(
         self,
@@ -174,7 +164,7 @@ class GenerativeModule(pl.LightningModule):
             x_1_pred = torch.sigmoid(torch.clamp(x_1_pred, -10.0, 10.0))
             x_1_target = (x_1 + 1) / 2  # Convert from [-1, 1] to [0, 1]
 
-            aux_loss = self._dice_loss(x_1_pred, x_1_target)
+            aux_loss = self._focal_dice_loss(x_1_pred, x_1_target)
 
             # Check for NaN
             if torch.isnan(aux_loss):
@@ -185,33 +175,29 @@ class GenerativeModule(pl.LightningModule):
         return primary_loss
 
     @staticmethod
-    def _dice_loss(
+    def _focal_dice_loss(
         pred: torch.Tensor,
         target: torch.Tensor,
-        smooth: float = 1.0
+        alpha: float=0.5,
+        gamma: float=2.0,
+        smooth: float=1.0
     ) -> torch.Tensor:
-        """
-        Compute Dice loss for auxiliary supervision.
-
-        Args:
-            pred: Predictions in [0, 1]
-            target: Targets in [0, 1]
-            smooth: Smoothing factor for numerical stability
-
-        Returns:
-            Dice loss (1 - Dice coefficient)
-        """
+        # pred, target: B×1×H×W in [0,1]
         pred = pred.flatten(1)
         target = target.flatten(1)
-
+        
+        # Clamp predictions to prevent extreme values
         pred = torch.clamp(pred, 0.0, 1.0)
         target = torch.clamp(target, 0.0, 1.0)
-
-        intersection = (pred * target).sum(dim=1)
-        union = pred.sum(dim=1) + target.sum(dim=1)
-
-        dice = (2 * intersection + smooth) / (union + smooth + 1e-8)
-
+        
+        focal_weight = alpha * (1 - pred) ** gamma * target + (1 - alpha) * pred ** gamma * (1 - target)
+        
+        intersection = (pred * target * focal_weight).sum(dim=1)
+        denom = (pred * focal_weight).sum(dim=1) + (target * focal_weight).sum(dim=1)
+        
+        # Add numerical stability
+        dice = (2 * intersection + smooth) / (denom + smooth + 1e-8)
+        
         return 1 - dice.mean()
 
     def training_step(

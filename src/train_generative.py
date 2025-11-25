@@ -118,7 +118,12 @@ def main(cfg):
     trainer.fit(model=model, datamodule=data_module, ckpt_path=ckpt_path)
 
     print("\nTraining complete!")
-    print(f"Best validation loss: {model.val_loss_best.compute():.6f}")
+    
+    # Use checkpoint callback to get best loss if available to avoid DDP sync issues
+    if trainer.checkpoint_callback and getattr(trainer.checkpoint_callback, 'best_model_score', None) is not None:
+        print(f"Best validation loss: {trainer.checkpoint_callback.best_model_score:.6f}")
+    else:
+        print(f"Best validation loss: {model.val_loss_best.compute():.6f}")
 
 
 if __name__ == "__main__":

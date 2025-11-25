@@ -8,8 +8,8 @@ network:
   _target_: src.model.dit.dit.DiT
   img_size: ${image_size}
   patch: 4
-  in_ch: 7      # 4 context + 1 target_object + 2 noisy target
-  out_ch: 2     # object_mask + goal_mask
+  in_ch: 8      # 5 context (robot,goal,mov,stat,tgt_obj) + 2 coord_grid + 1 noisy_target
+  out_ch: 1     # target_goal
   dim: 256
   depth: 8
   heads: 8
@@ -22,7 +22,7 @@ path:
 # ODE sampler for inference
 sampler:
   _target_: src.model.samplers.ode_sampler.ODESampler
-  method: midpoint
+  method: euler
 
 # Optimizer
 optimizer:
@@ -36,4 +36,4 @@ aux_loss_weight: 0.005
 
 # Channel configuration
 context_channels: 5
-target_channels: 2
+target_channels: 1
