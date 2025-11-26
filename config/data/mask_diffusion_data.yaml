@@ -1,7 +1,8 @@
 _target_: src.data.mask_diffusion_data.MaskDiffusionDataModule
-data_dir: /common/users/shared/robot_learning/dm1487/namo/datasets/images/nov22/train/1_push_train
+data_dir: /common/users/shared/robot_learning/dm1487/namo/datasets/images/nov22/train/1_push
 batch_size: ${batch_size}
 num_workers: ${num_workers}
 pin_memory: true
 image_size: ${image_size}
 use_coord_grid: true # for simple relational information
+train_split: 0.9  # 90% train, 10% validation (~5348 samples)

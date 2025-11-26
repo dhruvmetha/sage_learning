@@ -56,6 +56,7 @@ batch_size: 64
 max_epochs: 1000
 base_lr: 0.0001
 image_size: 64
+train_split: 0.9  # 90% train, 10% validation
 ```
 
 ## Trainer Configurations
@@ -64,7 +65,7 @@ image_size: 64
 - Default for training configs
 - Mixed precision (`16-mixed`)
 - Gradient clipping (1.0)
-- TensorBoard logging
+- Weights & Biases logging
 - Callbacks: ModelCheckpoint, LearningRateMonitor, RichProgressBar
 
 ### Multi-GPU (`trainer=multi_gpu`)
@@ -154,16 +155,20 @@ python src/train_generative.py --config-name=train_fb_flow_matching model.path.s
 
 ## Monitoring
 
-### TensorBoard
+### Weights & Biases
 ```bash
-tensorboard --logdir=outputs/
+# Setup (first time)
+pip install wandb
+wandb login
+
+# View runs at https://wandb.ai
 ```
 
 Logged metrics:
 - `train_loss`: Training loss (MSE + auxiliary)
 - `val_loss`: Validation loss
 - `val_loss_best`: Best validation loss
-- `Validation_Samples_*`: Generated samples vs ground truth
+- `val_sample_1` to `val_sample_8`: Validation images (scene | target | 4 generated samples)
 
 ### Checkpoints
 
@@ -218,6 +223,6 @@ outputs/<run_name>/
 ├── checkpoints/
 │   ├── last.ckpt
 │   └── epochXXX-val_lossX.XXXX.ckpt
-└── tensorboard/
-    └── events.out.tfevents.*  # TensorBoard logs
+└── wandb/
+    └── run-*/                # WandB run files
 ```

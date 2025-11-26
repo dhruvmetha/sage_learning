@@ -290,63 +290,83 @@ class GenerativeModule(pl.LightningModule):
             self._generate_validation_samples()
 
     def _generate_validation_samples(self):
-        """Generate and log samples during validation."""
+        """Generate and log samples during validation.
+
+        Logs 8 images, each showing a different validation example.
+        Each image has 4 panels:
+        1. Scene: robot(R) + robot_goal(G) + static(B) + movable(B)
+        2. Target object context: robot(R) + robot_goal(G) + static(B) + target_object(cyan)
+        3. Ground truth: robot(R) + robot_goal(G) + target_object(B) + ground_truth_location(G)
+        4. Prediction: robot(R) + robot_goal(G) + static(B) + target_object(cyan) + prediction(G)
+        """
         context = self._validation_context
         target = self._validation_target
 
-        num_samples = min(16, context.size(0))
-        context_samples = context[:num_samples]
-        target_samples = target[:num_samples]
+        num_examples = min(8, context.size(0))
+        image_size = context.shape[-1]
 
-        image_size = context_samples.shape[-1]
-
-        # Generate samples
-        with torch.no_grad():
-            generated_1 = self.sample(context_samples, num_samples=1, num_steps=20)
-            generated_2 = self.sample(context_samples, num_samples=1, num_steps=20)
-            generated_3 = self.sample(context_samples, num_samples=1, num_steps=20)
-            generated_4 = self.sample(context_samples, num_samples=1, num_steps=20)
-
-        # Log to tensorboard if available
+        # Log images if logger is available
         if hasattr(self.logger, 'experiment'):
+            import wandb
+
             def _to_display(x: torch.Tensor) -> torch.Tensor:
                 return torch.clamp((x + 1) / 2, 0, 1)
 
-            def _masks_to_rgb(masks: torch.Tensor) -> torch.Tensor:
-                rgb = torch.zeros(num_samples, 3, image_size, image_size, device=masks.device)
-                channels = min(3, masks.shape[1])
-                for ch in range(channels):
-                    rgb[:, ch, :, :] = masks[:, ch, :, :]
-                return rgb
+            log_dict = {}
+            for i in range(num_examples):
+                # Get single example
+                # Context channels: 0=robot, 1=robot_goal, 2=movable, 3=static, 4=target_object
+                ctx = context[i:i+1]  # (1, 5, H, W)
+                gt_target = target[i:i+1]   # (1, 1, H, W) - ground truth target location
 
-            # Visualize input scene
-            robot = _to_display(context_samples[:, 0:1])
-            goal = _to_display(context_samples[:, 1:2])
-            movable = _to_display(context_samples[:, 2:3])
-            static = _to_display(context_samples[:, 3:4])
+                robot = _to_display(ctx[0, 0:1])[0]        # robot position
+                robot_goal = _to_display(ctx[0, 1:2])[0]   # robot goal
+                movable = _to_display(ctx[0, 2:3])[0]      # movable objects
+                static = _to_display(ctx[0, 3:4])[0]       # static obstacles
+                target_obj = _to_display(ctx[0, 4:5])[0]   # target/selected object
+                gt_location = _to_display(gt_target[0, 0:1])[0]  # ground truth target location
 
-            scene_vis = torch.zeros(num_samples, 3, image_size, image_size, device=context_samples.device)
-            scene_vis[:, 0, :, :] = robot[:, 0, :, :]
-            scene_vis[:, 1, :, :] = goal[:, 0, :, :]
-            scene_vis[:, 2, :, :] = movable[:, 0, :, :]
+                # Generate prediction
+                with torch.no_grad():
+                    pred = self.sample(ctx, num_steps=20)
+                    pred_location = _to_display(pred[0, 0:1])[0]
 
-            # Visualize ground truth target_goal (green channel)
-            target_vis = torch.zeros(num_samples, 3, image_size, image_size, device=context_samples.device)
-            target_vis[:, 1, :, :] = _to_display(target_samples[:, 0:1])[:, 0, :, :]
+                # Image 1: Scene (robot=R, robot_goal=G, static+movable=B)
+                img1 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                img1[0, 0] = robot                          # R
+                img1[0, 1] = robot_goal                     # G
+                img1[0, 2] = torch.clamp(static + movable, 0, 1)  # B
 
-            # Build comparison grid
-            comparison_parts = [scene_vis, target_vis]
+                # Image 2: Target object context (robot=R, robot_goal=G, static=B, target_obj=cyan)
+                img2 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                img2[0, 0] = robot                          # R
+                img2[0, 1] = torch.clamp(robot_goal + target_obj, 0, 1)  # G (goal + target_obj = cyan with B)
+                img2[0, 2] = torch.clamp(static + target_obj, 0, 1)      # B
 
-            for generated in [generated_1, generated_2, generated_3, generated_4]:
-                comparison_parts.append(_masks_to_rgb(_to_display(generated)))
+                # Image 3: Ground truth (robot=R, robot_goal=G, target_obj=B, gt_location=G)
+                img3 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                img3[0, 0] = robot                          # R
+                img3[0, 1] = torch.clamp(robot_goal + gt_location, 0, 1)  # G
+                img3[0, 2] = target_obj                     # B
 
-            comparison = torch.cat(comparison_parts, dim=0)
-            grid = torchvision.utils.make_grid(comparison, nrow=num_samples, normalize=True)
-            self.logger.experiment.add_image(
-                f'Validation_Samples_{self.path.prediction_type}',
-                grid,
-                self.current_epoch
-            )
+                # Image 4: Prediction (robot=R, robot_goal=G, static=B, target_obj=cyan, pred=G)
+                img4 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                img4[0, 0] = robot                          # R
+                img4[0, 1] = torch.clamp(robot_goal + pred_location, 0, 1)  # G
+                img4[0, 2] = torch.clamp(static + target_obj, 0, 1)         # B
+
+                # Build row: scene | target_obj_context | ground_truth | prediction
+                row = torch.cat([img1, img2, img3, img4], dim=0)
+                grid = torchvision.utils.make_grid(row, nrow=4, normalize=True, padding=2)
+
+                # Convert to numpy and log
+                grid_np = grid.cpu().permute(1, 2, 0).numpy()
+                log_dict[f'val_sample_{i+1}'] = wandb.Image(
+                    grid_np,
+                    caption=f"Epoch {self.current_epoch} | Scene | Target Obj | Ground Truth | Prediction"
+                )
+
+            self.logger.experiment.log(log_dict)
 
     def sample(
         self,

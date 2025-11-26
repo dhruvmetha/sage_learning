@@ -3,12 +3,6 @@
 # Base classes
 from .base import BasePath, PathSample, BaseSampler
 
-# Path implementations
-from .paths import FlowMatchingPath, DiffusionPath
-
-# Sampler implementations
-from .samplers import ODESampler, DDPMSampler
-
 # Unified generative module (supports both Flow Matching and Diffusion)
 from .generative_module import GenerativeModule
 
@@ -17,12 +11,22 @@ __all__ = [
     "BasePath",
     "PathSample",
     "BaseSampler",
-    # Paths
-    "FlowMatchingPath",
-    "DiffusionPath",
-    # Samplers
-    "ODESampler",
-    "DDPMSampler",
     # Main module
     "GenerativeModule",
 ]
+
+# Optional: Facebook flow matching
+try:
+    from .paths import FBFlowMatchingPath
+    from .samplers import FBODESampler
+    __all__.extend(["FBFlowMatchingPath", "FBODESampler"])
+except ImportError:
+    pass
+
+# Optional: HuggingFace diffusion
+try:
+    from .paths import HFDiffusionPath
+    from .samplers import HFDiffusionSampler
+    __all__.extend(["HFDiffusionPath", "HFDiffusionSampler"])
+except ImportError:
+    pass

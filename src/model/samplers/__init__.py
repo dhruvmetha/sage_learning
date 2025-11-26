@@ -7,7 +7,7 @@ Available:
 - HFDiffusionSampler: HuggingFace's diffusers library (requires: pip install diffusers)
 """
 
-from .base_sampler import BaseSampler
+from ..base import BaseSampler
 
 __all__ = ["BaseSampler"]
 

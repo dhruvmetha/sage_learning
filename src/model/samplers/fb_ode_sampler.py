@@ -170,12 +170,21 @@ class _VelocityModelWrapper:
 
     Facebook's ODESolver expects a model with forward(x, t, **extras) signature.
     Our models use forward(x, t) where x is [context, noisy] concatenated.
+
+    The ODE solver passes scalar t values, but our model expects batched t.
+    This wrapper handles the conversion.
     """
 
     def __init__(self, model: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]):
         self.model = model
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, **extras) -> torch.Tensor:
+        # ODE solver passes scalar t, expand to batch size
+        batch_size = x.shape[0]
+        if t.dim() == 0:
+            t = t.expand(batch_size)
+        elif t.dim() == 1 and t.shape[0] == 1:
+            t = t.expand(batch_size)
         return self.model(x, t)
 
     def __call__(self, x: torch.Tensor, t: torch.Tensor, **extras) -> torch.Tensor:

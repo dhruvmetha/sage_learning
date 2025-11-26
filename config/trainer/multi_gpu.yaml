@@ -68,10 +68,10 @@ callbacks:
   - _target_: lightning.pytorch.callbacks.RichProgressBar
     refresh_rate: 10
 
-# Logger
+# Logger - Weights & Biases
 logger:
-  - _target_: lightning.pytorch.loggers.TensorBoardLogger
+  - _target_: lightning.pytorch.loggers.WandbLogger
+    project: sage_learning
     save_dir: ${paths.output_dir}
-    name: tensorboard
-    version: ""
-    default_hp_metric: false
+    log_model: false  # Don't upload model checkpoints to wandb
+    tags: ["flow_matching", "multi_gpu"]

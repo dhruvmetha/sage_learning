@@ -7,7 +7,7 @@ Available:
 - HFDiffusionPath: HuggingFace's diffusers library (requires: pip install diffusers)
 """
 
-from .base_path import BasePath
+from ..base import BasePath
 
 __all__ = ["BasePath"]
 

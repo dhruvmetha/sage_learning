@@ -149,15 +149,18 @@ goals = model.infer(json_message, xml_path, robot_goal, selected_object="box1", 
 ## Dependencies
 
 **Core:**
-- torch, torchvision, lightning, hydra-core
+- torch, torchvision, lightning, hydra-core, wandb
 
-**For Flow Matching:**
+**Setup:**
 ```bash
+# Logging
+pip install wandb
+wandb login
+
+# For Flow Matching
 pip install flow-matching torchdyn
-```
 
-**For Diffusion:**
-```bash
+# For Diffusion
 pip install diffusers
 ```
 
