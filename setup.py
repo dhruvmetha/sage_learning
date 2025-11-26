@@ -20,8 +20,12 @@ setup(
         "tqdm",
         "tensorboard",
         "torchmetrics",
-        "diffusers",  # For scheduler compatibility (optional)
-        # "flow_matching",  # Facebook's flow matching library (install separately: pip install flow_matching)
     ],
+    extras_require={
+        "fb": [
+            "flow-matching",  # Facebook's flow matching library
+            "torchdyn",       # For adaptive ODE solvers (dopri5, tsit5)
+        ],
+    },
     python_requires=">=3.9",
 )

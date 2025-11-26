@@ -1,0 +1,16 @@
+# Facebook Flow Matching Adaptive ODE Sampler
+# Uses dopri5 (Dormand-Prince) adaptive solver
+# Install: pip install flow-matching torchdyn
+
+_target_: src.model.samplers.fb_ode_sampler.FBODESampler
+
+# Adaptive solver - adjusts step size automatically based on error
+method: dopri5
+
+# Not used for adaptive solvers
+step_size: null
+
+# Tolerances control accuracy vs speed tradeoff
+# Tighter tolerances = more accurate but slower
+atol: 1e-5
+rtol: 1e-5

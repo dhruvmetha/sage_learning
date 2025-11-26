@@ -115,11 +115,11 @@ class DiT(nn.Module):
         self,
         img_size: int = 32,
         patch: int = 4,
-        in_ch: int = 3,
+        in_ch: int = 6,
         dim: int = 256,
         depth: int = 8,
         heads: int = 8,
-        out_ch: int = 2,
+        out_ch: int = 1,
     ) -> None:
         super().__init__()
         assert img_size % patch == 0, "Image size must be divisible by patch size."

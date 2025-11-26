@@ -8,7 +8,7 @@ Usage:
     python src/train_generative.py --config-name=train_flow_matching
 
     # Train with diffusion
-    python src/train_generative.py --config-name=train_generative_diffusion
+    python src/train_generative.py --config-name=train_diffusion
 
     # Override parameters
     python src/train_generative.py --config-name=train_flow_matching \

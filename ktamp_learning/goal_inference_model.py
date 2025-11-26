@@ -161,34 +161,16 @@ class GoalInferenceModel:
             inp_data['static_objects_image'],
             selected_object_mask                   # Selected object mask (channel 5)
         ], axis=-1)
-        
-        
-        # save inp_for_goal to a folder
-        # os.makedirs('goal_inference_samples', exist_ok=True)
-        # plt.imsave(f'goal_inference_samples/inp_for_goal.png', inp_for_goal[:,:,0] + inp_for_goal[:,:,1] + inp_for_goal[:,:,3] + inp_for_goal[:,:,4])
-        
-        inp_for_goal = self.transform(inp_for_goal).unsqueeze(0).to(self.device)
 
-        print(f"📊 Input channels for model: {inp_for_goal.shape[1]} (expected: 5)")
+        inp_for_goal = self.transform(inp_for_goal).unsqueeze(0).to(self.device)
 
         # Generate goal samples
         with torch.no_grad():
             goal_samples = (self.model.sample_from_model(inp_for_goal, samples=samples)
                           .permute(0, 2, 3, 1).cpu().numpy() + 1) / 2
-            
-        # print(inp_for_goal.shape)
+
         inp_for_goal = inp_for_goal.cpu().squeeze(0).numpy()
-        # print(inp_for_goal.shape)
-        # print("#"*5)
-        # print(goal_samples.shape)
-        # print("#"*5)
-        # save goal samples to a folder
-        # os.makedirs('goal_inference_samples', exist_ok=True)
-        # for i, goal_sample in enumerate(goal_samples):  
-        #     print(goal_sample.shape)
-        #     plt.imsave(f'goal_inference_samples/goal_sample_{i}_mask.png', (goal_sample[:,:,0] > 0.5) * 1.0)
-        #     plt.imsave(f'goal_inference_samples/goal_sample_{i}.png', goal_sample[:,:,0] + inp_for_goal[0, :, :] + inp_for_goal[1, :, :] + inp_for_goal[3, :, :] + inp_for_goal[4, :, :])
-        
+
         # Process goal samples and extract SE(2) poses
         valid_goals = []
         scale = image_converter.IMG_SIZE / self.data_cfg.image_size

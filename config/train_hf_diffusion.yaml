@@ -1,0 +1,52 @@
+# Training Configuration for HuggingFace Diffusion
+# Uses HuggingFace's diffusers library for DDPM/DDIM
+#
+# Install dependencies:
+#   pip install diffusers
+#
+# Usage:
+#   python src/train_generative.py --config-name=train_hf_diffusion
+#
+# For DDPM (stochastic) instead of DDIM:
+#   python src/train_generative.py --config-name=train_hf_diffusion model.sampler.sampler_type=ddpm
+#
+# For fewer inference steps (DDIM can handle 20-50 steps):
+#   python src/train_generative.py --config-name=train_hf_diffusion sampling_steps=50
+
+defaults:
+  - _self_
+  - data: mask_diffusion_data
+  - model: generative_hf_diffusion
+  - trainer: single_gpu
+  - callbacks: default
+
+# Random seed
+seed: 42
+
+# Data loading
+num_workers: 4
+batch_size: 64
+
+# Training
+max_epochs: 1000
+check_val_every_n_epoch: 1
+
+# Learning rate schedule
+base_lr: 0.0001
+end_lr: 0.000001
+warmup_steps: 1000
+decay_steps: 300000
+
+# Image size
+image_size: 64
+
+# GPU (for legacy compatibility)
+gpu_id: 0
+
+# Sampling steps for inference
+# DDIM can use fewer steps (20-50), DDPM needs more (~100-1000)
+sampling_steps: 50
+
+# Paths
+paths:
+  output_dir: ${hydra:runtime.output_dir}

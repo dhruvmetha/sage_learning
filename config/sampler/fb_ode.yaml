@@ -1,0 +1,18 @@
+# Facebook Flow Matching ODE Sampler Configuration
+# Uses Facebook's flow_matching library
+# Install: pip install flow-matching
+
+_target_: src.model.samplers.fb_ode_sampler.FBODESampler
+
+# ODE solver method:
+#   Fixed-step: 'euler', 'midpoint', 'rk4'
+#   Adaptive: 'dopri5', 'tsit5' (more efficient, adjusts step size automatically)
+method: midpoint
+
+# Step size for fixed-step methods (ignored for adaptive)
+# If null, computed as 1/num_steps
+step_size: null
+
+# Tolerances for adaptive solvers
+atol: 1e-5
+rtol: 1e-5

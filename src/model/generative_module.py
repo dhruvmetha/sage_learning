@@ -30,8 +30,7 @@ import torch.nn as nn
 import torchvision
 import lightning.pytorch as pl
 from torchmetrics import MeanMetric, MinMetric
-from typing import Optional, Dict, Any, Callable
-from tqdm import tqdm
+from typing import Optional, Dict, Any
 
 from .base.base_path import BasePath
 from .base.base_sampler import BaseSampler
@@ -51,8 +50,8 @@ class GenerativeModule(pl.LightningModule):
         sampler: Sampler implementation (ODESampler, DDPMSampler, etc.)
         optimizer: Optimizer partial function
         aux_loss_weight: Weight for auxiliary losses (e.g., dice loss)
-        context_channels: Number of input context channels
-        target_channels: Number of output target channels
+        context_channels: Number of input context channels (default 5: robot, goal, movable, static, target_object)
+        target_channels: Number of output target channels (default 1: target_goal only)
     """
 
     def __init__(
@@ -62,8 +61,8 @@ class GenerativeModule(pl.LightningModule):
         sampler: BaseSampler,
         optimizer: Any,
         aux_loss_weight: float = 0.0,
-        context_channels: int = 4,
-        target_channels: int = 2,
+        context_channels: int = 5,
+        target_channels: int = 1,
     ):
         super().__init__()
 
@@ -331,16 +330,12 @@ class GenerativeModule(pl.LightningModule):
             scene_vis[:, 1, :, :] = goal[:, 0, :, :]
             scene_vis[:, 2, :, :] = movable[:, 0, :, :]
 
-            # Visualize targets
-            object_vis = torch.zeros(num_samples, 3, image_size, image_size, device=context_samples.device)
-            object_vis[:, 0, :, :] = _to_display(target_samples[:, 0:1])[:, 0, :, :]
-
-            goal_vis = torch.zeros(num_samples, 3, image_size, image_size, device=context_samples.device)
-            if target_samples.shape[1] > 1:
-                goal_vis[:, 1, :, :] = _to_display(target_samples[:, 1:2])[:, 0, :, :]
+            # Visualize ground truth target_goal (green channel)
+            target_vis = torch.zeros(num_samples, 3, image_size, image_size, device=context_samples.device)
+            target_vis[:, 1, :, :] = _to_display(target_samples[:, 0:1])[:, 0, :, :]
 
             # Build comparison grid
-            comparison_parts = [scene_vis, object_vis, goal_vis]
+            comparison_parts = [scene_vis, target_vis]
 
             for generated in [generated_1, generated_2, generated_3, generated_4]:
                 comparison_parts.append(_masks_to_rgb(_to_display(generated)))
@@ -393,16 +388,16 @@ class GenerativeModule(pl.LightningModule):
     def sample_from_model(
         self,
         inp: torch.Tensor,
-        tgt_size: int = 2,
+        tgt_size: int = 1,
         samples: int = 32,
         num_steps: int = 20
     ) -> torch.Tensor:
         """
-        Legacy interface for backward compatibility with existing inference code.
+        Sample generation interface for inference.
 
         Args:
-            inp: Input context tensor
-            tgt_size: Number of target channels (default 2)
+            inp: Input context tensor (B, C_context, H, W)
+            tgt_size: Number of target channels (default 1 for goal-only)
             samples: Number of samples to generate
             num_steps: Number of sampling steps
 

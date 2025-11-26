@@ -1,7 +1,0 @@
-# Flow Matching Path Configuration
-# Uses linear interpolation with optimal transport
-
-_target_: src.model.paths.flow_matching_path.FlowMatchingPath
-
-# Minimum sigma for numerical stability (0 = exact linear interpolation)
-sigma_min: 0.0

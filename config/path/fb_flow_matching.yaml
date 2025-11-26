@@ -1,0 +1,17 @@
+# Facebook Flow Matching Path Configuration
+# Uses Facebook's flow_matching library AffineProbPath
+# Install: pip install flow-matching
+
+_target_: src.model.paths.fb_flow_matching_path.FBFlowMatchingPath
+
+# Scheduler type - controls how interpolation between noise and data is done:
+#   'condot': Conditional Optimal Transport (default, recommended)
+#             Path: x_t = (1-t)*x_0 + t*x_1, velocity: v = x_1 - x_0
+#   'cosine': Cosine annealing schedule
+#   'linear_vp': Linear Variance Preserving
+#   'vp': Variance Preserving (similar to diffusion noise schedule)
+#   'polynomial': Polynomial Convex scheduler
+scheduler: condot
+
+# Minimum noise level for numerical stability
+sigma_min: 0.0

@@ -8,11 +8,11 @@ img_size: ${image_size}
 # Patch size for tokenization
 patch: 4
 
-# Input channels: context (4-5) + target (2) + optional
-in_ch: 7
+# Input channels: 5 context (robot, goal, movable, static, target_object) + 1 noisy target
+in_ch: 6
 
-# Output channels: target (object_mask + goal_mask)
-out_ch: 2
+# Output channels: target_goal only (goal-only prediction)
+out_ch: 1
 
 # Model dimension
 dim: 256

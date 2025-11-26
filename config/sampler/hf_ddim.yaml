@@ -1,0 +1,26 @@
+# HuggingFace DDIM Sampler Configuration
+# Deterministic sampling using HuggingFace's DDIMScheduler
+# Install: pip install diffusers
+#
+# DDIM allows faster sampling with fewer steps while maintaining quality.
+# Can use 20-50 steps vs 1000 for DDPM.
+
+_target_: src.model.samplers.hf_diffusion_sampler.HFDiffusionSampler
+
+# Sampler type
+sampler_type: ddim
+
+# Must match path configuration
+num_train_timesteps: 1000
+beta_schedule: squaredcos_cap_v2
+beta_start: 0.0001
+beta_end: 0.02
+prediction_type: epsilon
+
+# Whether to clip samples to [-1, 1] during generation
+clip_sample: false
+
+# DDIM eta parameter:
+#   0.0 = fully deterministic (default, recommended)
+#   1.0 = equivalent to DDPM (stochastic)
+eta: 0.0

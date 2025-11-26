@@ -1,5 +1,5 @@
 _target_: src.data.mask_diffusion_data.MaskDiffusionDataModule
-data_dir: /common/users/shared/robot_learning/dm1487/namo/datasets/images/nov22/train/1_push
+data_dir: /common/users/shared/robot_learning/dm1487/namo/datasets/images/nov22/train/1_push_train
 batch_size: ${batch_size}
 num_workers: ${num_workers}
 pin_memory: true

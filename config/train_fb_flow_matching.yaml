@@ -1,0 +1,51 @@
+# Training Configuration for Facebook Flow Matching
+# Uses Facebook's flow_matching library for path and sampler
+#
+# Install dependencies first:
+#   pip install flow-matching torchdyn
+#
+# Usage:
+#   python src/train_generative.py --config-name=train_fb_flow_matching
+#
+# For multi-GPU:
+#   python src/train_generative.py --config-name=train_fb_flow_matching trainer=multi_gpu
+#
+# For adaptive ODE solver (dopri5):
+#   python src/train_generative.py --config-name=train_fb_flow_matching model.sampler.method=dopri5
+
+defaults:
+  - _self_
+  - data: mask_diffusion_data
+  - model: generative_fb_flow_matching
+  - trainer: single_gpu
+  - callbacks: default
+
+# Random seed
+seed: 42
+
+# Data loading
+num_workers: 4
+batch_size: 64
+
+# Training
+max_epochs: 1000
+check_val_every_n_epoch: 1
+
+# Learning rate schedule
+base_lr: 0.0001
+end_lr: 0.000001
+warmup_steps: 1000
+decay_steps: 300000
+
+# Image size
+image_size: 64
+
+# GPU (for legacy compatibility)
+gpu_id: 0
+
+# Sampling steps for inference
+sampling_steps: 20
+
+# Paths
+paths:
+  output_dir: ${hydra:runtime.output_dir}
