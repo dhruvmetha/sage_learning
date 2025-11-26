@@ -326,10 +326,12 @@ class GenerativeModule(pl.LightningModule):
                 target_obj = _to_display(ctx[0, 4:5])[0]   # target/selected object
                 gt_location = _to_display(gt_target[0, 0:1])[0]  # ground truth target location
 
-                # Generate prediction
+                # Generate 4 predictions
                 with torch.no_grad():
-                    pred = self.sample(ctx, num_steps=20)
-                    pred_location = _to_display(pred[0, 0:1])[0]
+                    pred_1 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
+                    pred_2 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
+                    pred_3 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
+                    pred_4 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
 
                 # Image 1: Scene (robot=R, robot_goal=G, static+movable=B)
                 img1 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
@@ -349,21 +351,28 @@ class GenerativeModule(pl.LightningModule):
                 img3[0, 1] = torch.clamp(robot_goal + gt_location, 0, 1)  # G
                 img3[0, 2] = target_obj                     # B
 
-                # Image 4: Prediction (robot=R, robot_goal=G, static=B, target_obj=cyan, pred=G)
-                img4 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                img4[0, 0] = robot                          # R
-                img4[0, 1] = torch.clamp(robot_goal + pred_location, 0, 1)  # G
-                img4[0, 2] = torch.clamp(static + target_obj, 0, 1)         # B
+                # Images 4-7: Predictions (robot=R, robot_goal=G, static=B, target_obj=cyan, pred=G)
+                def make_pred_img(pred_loc):
+                    img = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                    img[0, 0] = robot                          # R
+                    img[0, 1] = torch.clamp(robot_goal + pred_loc, 0, 1)  # G
+                    img[0, 2] = torch.clamp(static + target_obj, 0, 1)    # B
+                    return img
 
-                # Build row: scene | target_obj_context | ground_truth | prediction
-                row = torch.cat([img1, img2, img3, img4], dim=0)
-                grid = torchvision.utils.make_grid(row, nrow=4, normalize=True, padding=2)
+                img4 = make_pred_img(pred_1)
+                img5 = make_pred_img(pred_2)
+                img6 = make_pred_img(pred_3)
+                img7 = make_pred_img(pred_4)
+
+                # Build row: scene | target_obj | ground_truth | pred1 | pred2 | pred3 | pred4
+                row = torch.cat([img1, img2, img3, img4, img5, img6, img7], dim=0)
+                grid = torchvision.utils.make_grid(row, nrow=7, normalize=True, padding=2)
 
                 # Convert to numpy and log
                 grid_np = grid.cpu().permute(1, 2, 0).numpy()
                 log_dict[f'val_sample_{i+1}'] = wandb.Image(
                     grid_np,
-                    caption=f"Epoch {self.current_epoch} | Scene | Target Obj | Ground Truth | Prediction"
+                    caption=f"Epoch {self.current_epoch} | Scene | TargetObj | GT | Pred1 | Pred2 | Pred3 | Pred4"
                 )
 
             self.logger.experiment.log(log_dict)

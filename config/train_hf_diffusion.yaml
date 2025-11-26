@@ -17,7 +17,7 @@ defaults:
   - _self_
   - data: mask_diffusion_data
   - model: generative_hf_diffusion
-  - trainer: single_gpu
+  - trainer: multi_gpu
   - callbacks: default
 
 # Random seed
