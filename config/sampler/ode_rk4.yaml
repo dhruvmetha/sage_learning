@@ -1,0 +1,5 @@
+# ODE Sampler Configuration (RK4 Method)
+# Most accurate fixed-step method
+
+_target_: src.model.samplers.ode_sampler.ODESampler
+method: rk4

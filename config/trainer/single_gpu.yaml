@@ -1,26 +1,14 @@
-# Multi-GPU Trainer Configuration
-# PyTorch Lightning best practices for distributed training
+# Single GPU Trainer Configuration
+# PyTorch Lightning best practices for single GPU training
 #
 # Usage:
-#   python src/train_generative.py trainer=multi_gpu ...
-#
-# Notes:
-#   - Uses DDP (DistributedDataParallel) strategy - most stable for multi-GPU
-#   - Effective batch size = batch_size * num_gpus
-#   - Learning rate may need scaling: lr * num_gpus (linear scaling rule)
+#   python src/train_generative.py trainer=single_gpu ...
 
 _target_: lightning.pytorch.trainer.Trainer
 
 # Hardware
 accelerator: gpu
-devices: auto  # Use all available GPUs, or set to specific number (e.g., 4)
-
-# Distributed strategy
-# DDP is the most common and stable strategy for multi-GPU training
-strategy:
-  _target_: lightning.pytorch.strategies.DDPStrategy
-  find_unused_parameters: false  # Set to true if model has unused params
-  static_graph: true  # Optimization for models with static computation graphs
+devices: 1
 
 # Training duration
 min_epochs: 1
@@ -29,26 +17,22 @@ max_epochs: ${max_epochs}
 # Mixed precision for faster training and lower memory
 precision: 16-mixed
 
-# Gradient clipping for stable training
+# Gradient clipping for stable training (important for diffusion/flow matching)
 gradient_clip_val: 1.0
 gradient_clip_algorithm: norm
 
 # Validation frequency
 check_val_every_n_epoch: ${check_val_every_n_epoch}
 
-# Logging (reduce frequency for multi-GPU to avoid log spam)
-log_every_n_steps: 10
+# Logging
+log_every_n_steps: 50
 enable_progress_bar: true
 
 # Sanity check before training
 num_sanity_val_steps: 2
 
-# Reproducibility
+# Reproducibility (set to true for debugging, false for speed)
 deterministic: false
-
-# Sync batch norm across GPUs (important if using BatchNorm layers)
-# DiT uses LayerNorm, so this is optional but doesn't hurt
-sync_batchnorm: true
 
 # Callbacks
 callbacks:
@@ -74,4 +58,4 @@ logger:
     project: sage_learning
     save_dir: ${paths.output_dir}
     log_model: false  # Don't upload model checkpoints to wandb
-    tags: ["flow_matching", "multi_gpu"]
+    tags: ["flow_matching", "single_gpu"]

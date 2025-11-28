@@ -1,0 +1,48 @@
+# HuggingFace Diffusion Model Configuration
+# Uses HuggingFace's diffusers library for DDPM/DDIM
+# Install: pip install diffusers
+
+_target_: src.model.generative_module.GenerativeModule
+
+# Neural network backbone
+network:
+  _target_: src.model.dit.dit.DiT
+  img_size: ${image_size}
+  patch: 4
+  in_ch: 8      # 5 context (robot,goal,mov,stat,tgt_obj) + 2 coord_grid + 1 noisy_target
+  out_ch: 1     # target_goal
+  dim: 256
+  depth: 8
+  heads: 8
+
+# HuggingFace diffusion path
+path:
+  _target_: src.model.paths.hf_diffusion_path.HFDiffusionPath
+  num_train_timesteps: 1000
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+
+# HuggingFace DDIM sampler (deterministic, faster)
+# Change to hf_ddpm for stochastic sampling
+sampler:
+  _target_: src.model.samplers.hf_diffusion_sampler.HFDiffusionSampler
+  sampler_type: ddim
+  num_train_timesteps: 1000
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+  eta: 0.0
+  clip_sample: false
+
+# Optimizer
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${base_lr}
+  weight_decay: 0.01
+
+# Auxiliary loss weight
+aux_loss_weight: 0.005
+
+# Channel configuration
+context_channels: 5
+target_channels: 1

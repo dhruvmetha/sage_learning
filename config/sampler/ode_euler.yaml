@@ -1,0 +1,5 @@
+# ODE Sampler Configuration (Euler Method)
+# Fastest but least accurate
+
+_target_: src.model.samplers.ode_sampler.ODESampler
+method: euler

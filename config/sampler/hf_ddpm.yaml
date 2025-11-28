@@ -1,0 +1,21 @@
+# HuggingFace DDPM Sampler Configuration
+# Stochastic sampling using HuggingFace's DDPMScheduler
+# Install: pip install diffusers
+
+_target_: src.model.samplers.hf_diffusion_sampler.HFDiffusionSampler
+
+# Sampler type
+sampler_type: ddpm
+
+# Must match path configuration
+num_train_timesteps: 1000
+beta_schedule: squaredcos_cap_v2
+beta_start: 0.0001
+beta_end: 0.02
+prediction_type: epsilon
+
+# Whether to clip samples to [-1, 1] during generation
+clip_sample: false
+
+# Not used for DDPM (only for DDIM)
+eta: 0.0

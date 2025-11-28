@@ -76,8 +76,8 @@ class MaskDiffusionDataset(Dataset):
             ret = {
                 "robot": self.transform(robot_image),
                 "goal": self.transform(goal_image),
-                "movable_objects": self.transform(movable_objects_image),
-                "static_objects": self.transform(static_objects_image),
+                "movable": self.transform(movable_objects_image),
+                "static": self.transform(static_objects_image),
             }
             
             # Add target_object if available
@@ -101,8 +101,8 @@ class MaskDiffusionDataset(Dataset):
         ret = {
             "robot": robot_image,
             "goal": goal_image,
-            "movable_objects": movable_objects_image,
-            "static_objects": static_objects_image,
+            "movable": movable_objects_image,
+            "static": static_objects_image,
         }
         
         if target_object is not None:
@@ -126,7 +126,7 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
         use_coord_grid: bool = False,
-        train_split: float = 0.9,
+        train_split: float = 1, # already separated testing data
     ):
         super().__init__()
         

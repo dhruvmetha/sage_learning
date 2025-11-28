@@ -8,10 +8,10 @@ setup(
     author_email="",
     packages=find_packages(include=["ktamp_learning", "ktamp_learning.*", "src", "src.*"]),
     install_requires=[
-        "torch",
+        "torch>=2.1",
         "torchvision",
-        "pytorch-lightning",
-        "hydra-core",
+        "lightning>=2.0",
+        "hydra-core>=1.3",
         "omegaconf",
         "numpy",
         "opencv-python",
@@ -19,6 +19,13 @@ setup(
         "matplotlib",
         "tqdm",
         "tensorboard",
+        "torchmetrics",
     ],
-    python_requires=">=3.8",
+    extras_require={
+        "fb": [
+            "flow-matching",  # Facebook's flow matching library
+            "torchdyn",       # For adaptive ODE solvers (dopri5, tsit5)
+        ],
+    },
+    python_requires=">=3.9",
 )

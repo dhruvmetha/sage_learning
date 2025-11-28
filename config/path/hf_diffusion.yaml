@@ -1,0 +1,25 @@
+# HuggingFace Diffusers Path Configuration
+# Uses HuggingFace's DDPMScheduler for forward noising
+# Install: pip install diffusers
+
+_target_: src.model.paths.hf_diffusion_path.HFDiffusionPath
+
+# Number of training timesteps
+num_train_timesteps: 1000
+
+# Beta schedule:
+#   'linear': Linear from beta_start to beta_end
+#   'scaled_linear': Scaled linear (Stable Diffusion style)
+#   'squaredcos_cap_v2': Squared cosine with cap (recommended)
+#   'sigmoid': Sigmoid schedule
+beta_schedule: squaredcos_cap_v2
+
+# Beta range
+beta_start: 0.0001
+beta_end: 0.02
+
+# What the model predicts:
+#   'epsilon': Predict noise (standard DDPM)
+#   'v_prediction': Predict velocity (better for some tasks)
+#   'sample': Predict x_0 directly
+prediction_type: epsilon

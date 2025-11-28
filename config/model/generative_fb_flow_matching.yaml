@@ -1,0 +1,43 @@
+# Facebook Flow Matching Model Configuration
+# Uses Facebook's flow_matching library for both path and sampler
+# Install: pip install flow-matching torchdyn
+
+_target_: src.model.generative_module.GenerativeModule
+
+# Neural network backbone
+network:
+  _target_: src.model.dit.dit.DiT
+  img_size: ${image_size}
+  patch: 4
+  in_ch: 8      # 5 context (robot,goal,mov,stat,tgt_obj) + 2 coord_grid + 1 noisy_target
+  out_ch: 1     # target_goal
+  dim: 256
+  depth: 8
+  heads: 8
+
+# Facebook's flow matching path (Conditional OT)
+path:
+  _target_: src.model.paths.fb_flow_matching_path.FBFlowMatchingPath
+  scheduler: condot
+  sigma_min: 0.0
+
+# Facebook's ODE sampler for inference
+sampler:
+  _target_: src.model.samplers.fb_ode_sampler.FBODESampler
+  method: midpoint  # or 'dopri5' for adaptive
+  atol: 1e-5
+  rtol: 1e-5
+
+# Optimizer
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${base_lr}
+  weight_decay: 0.01
+
+# Auxiliary loss weight (dice loss on reconstructed output)
+aux_loss_weight: 0.005
+
+# Channel configuration
+context_channels: 5
+target_channels: 1
