@@ -13,6 +13,18 @@
 # For adaptive ODE solver (dopri5):
 #   python src/train_generative.py --config-name=train_fb_flow_matching model.sampler.method=dopri5
 
+# Experiment name (used in output path)
+name: flow_matching
+output_dir: /common/users/dm1487/outputs/${name}
+
+# Hydra output directory structure
+hydra:
+  run:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
 defaults:
   - _self_
   - data: mask_diffusion_data

@@ -436,9 +436,8 @@ class GenerativeModule(pl.LightningModule):
         # Repeat input for multiple samples
         inp_repeated = inp.repeat(samples, 1, 1, 1)
 
-        # Initialize from same noise for consistency (like original code)
-        x_init = torch.randn(1, tgt_size, inp.shape[2], inp.shape[3], device=inp.device)
-        x_init = x_init.repeat(samples, 1, 1, 1)
+        # Initialize from different noise for each sample (enables diverse outputs)
+        x_init = torch.randn(samples, tgt_size, inp.shape[2], inp.shape[3], device=inp.device)
 
         def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             model_input = torch.cat([inp_repeated, x], dim=1)

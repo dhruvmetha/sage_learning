@@ -13,6 +13,17 @@
 # For fewer inference steps (DDIM can handle 20-50 steps):
 #   python src/train_generative.py --config-name=train_hf_diffusion sampling_steps=50
 
+# Experiment name (used in output path)
+name: diffusion
+
+# Hydra output directory structure
+hydra:
+  run:
+    dir: outputs/${name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: outputs/${name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
 defaults:
   - _self_
   - data: mask_diffusion_data

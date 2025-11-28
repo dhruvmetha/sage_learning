@@ -52,7 +52,12 @@ class GoalInferenceModel:
         
         # Use data config
         self.data_cfg = self.cfg.data
-        
+
+        # Check if model was trained with coord_grid
+        self.use_coord_grid = getattr(self.data_cfg, 'use_coord_grid', False)
+        if self.use_coord_grid:
+            print(f"  Using coordinate grid (2 extra channels)")
+
         # Setup image transform
         self.transform = transforms.Compose([
             transforms.ToTensor(),
@@ -154,14 +159,25 @@ class GoalInferenceModel:
             raise ValueError(f"Error creating object mask for '{selected_object}': {e}")
         
         # Prepare input for goal model (stack scene context + selected object mask)
-        inp_for_goal = np.concatenate([
+        input_channels = [
             inp_data['robot_image'],
             inp_data['goal_image'],
             inp_data['movable_objects_image'],
             inp_data['static_objects_image'],
             selected_object_mask                   # Selected object mask (channel 5)
-        ], axis=-1)
+        ]
 
+        # Add coordinate grid if model was trained with it (matches training exactly)
+        if self.use_coord_grid:
+            # Use original image size (before transform resizes to data_cfg.image_size)
+            orig_size = inp_data['robot_image'].shape[0]
+            ys, xs = np.meshgrid(np.linspace(0, 1, orig_size),
+                                 np.linspace(0, 1, orig_size),
+                                 indexing='ij')
+            coord_grid = np.stack([xs, ys], axis=-1).astype(np.float32)
+            input_channels.append(coord_grid)
+
+        inp_for_goal = np.concatenate(input_channels, axis=-1)
         inp_for_goal = self.transform(inp_for_goal).unsqueeze(0).to(self.device)
 
         # Generate goal samples
