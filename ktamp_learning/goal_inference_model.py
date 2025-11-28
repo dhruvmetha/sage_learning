@@ -34,21 +34,34 @@ class GoalInferenceModel:
     Model for performing goal pose inference using a trained diffusion model.
     Generates goal proposals for a selected object in SE(2) space.
     """
-    
-    def __init__(self, model_path, device="cuda"):
+
+    def __init__(self, model_path, device="cuda", sampler_method=None, num_steps=None):
         """
         Initialize the goal inference model.
-        
+
         Args:
             model_path: Path to model output directory (e.g., outputs/rel_reach_coord_goal_dit/mse/2025-08-10_06-59-27)
             device: Device to load model on (default: "cuda")
+            sampler_method: Override sampler method at inference time.
+                For Flow Matching: "euler", "midpoint", "rk4", "dopri5"
+                For Diffusion: "ddpm", "ddim"
+                If None, uses the method from training config.
+            num_steps: Override number of sampling steps (default: uses training config or 20)
         """
         self.device = device
         self.model_path = Path(model_path)
-        
+        self.sampler_method = sampler_method
+        self.num_steps = num_steps
+
         # Load model
         self.model, self.cfg = self._load_model()
+
+        # Override sampler if specified
+        if sampler_method is not None:
+            self._override_sampler(sampler_method)
+
         print(f"✅ Goal model loaded successfully: {type(self.model).__name__}")
+        print(f"  Sampler: {type(self.model.sampler).__name__} (method: {self._get_sampler_method()})")
         
         # Use data config
         self.data_cfg = self.cfg.data
@@ -128,7 +141,52 @@ class GoalInferenceModel:
         model.eval()
         
         return model, cfg
-    
+
+    def _override_sampler(self, method: str):
+        """Override the model's sampler with a new method.
+
+        Args:
+            method: Sampler method to use.
+                Flow Matching: "euler", "midpoint", "rk4", "dopri5"
+                Diffusion: "ddpm", "ddim"
+        """
+        flow_matching_methods = {"euler", "midpoint", "rk4", "dopri5"}
+        diffusion_methods = {"ddpm", "ddim"}
+
+        if method in flow_matching_methods:
+            from src.model.samplers.fb_ode_sampler import FBODESampler
+            self.model.sampler = FBODESampler(method=method)
+            print(f"  Overriding sampler to FBODESampler(method='{method}')")
+
+        elif method in diffusion_methods:
+            from src.model.samplers.hf_diffusion_sampler import HFDiffusionSampler
+            # Get diffusion params from config if available
+            sampler_cfg = self.cfg.model.get("sampler", {})
+            num_timesteps = sampler_cfg.get("num_train_timesteps", 1000)
+            self.model.sampler = HFDiffusionSampler(
+                sampler_type=method,
+                num_train_timesteps=num_timesteps,
+            )
+            print(f"  Overriding sampler to HFDiffusionSampler(sampler_type='{method}')")
+
+        else:
+            raise ValueError(
+                f"Unknown sampler method: '{method}'. "
+                f"Flow Matching: {flow_matching_methods}, Diffusion: {diffusion_methods}"
+            )
+
+    def _get_sampler_method(self) -> str:
+        """Get the current sampler method as a string."""
+        sampler = self.model.sampler
+        sampler_type = type(sampler).__name__
+
+        if sampler_type == "FBODESampler":
+            return getattr(sampler, "method", "unknown")
+        elif sampler_type == "HFDiffusionSampler":
+            return getattr(sampler, "sampler_type", "unknown")
+        else:
+            return "unknown"
+
     def infer(self, json_message, xml_path, robot_goal, selected_object, samples=32):
         """
         Perform goal inference to get goal proposals.
@@ -181,8 +239,9 @@ class GoalInferenceModel:
         inp_for_goal = self.transform(inp_for_goal).unsqueeze(0).to(self.device)
 
         # Generate goal samples
+        num_steps = self.num_steps if self.num_steps is not None else 20
         with torch.no_grad():
-            goal_samples = (self.model.sample_from_model(inp_for_goal, samples=samples)
+            goal_samples = (self.model.sample_from_model(inp_for_goal, samples=samples, num_steps=num_steps)
                           .permute(0, 2, 3, 1).cpu().numpy() + 1) / 2
 
         inp_for_goal = inp_for_goal.cpu().squeeze(0).numpy()
