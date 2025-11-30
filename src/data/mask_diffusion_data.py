@@ -7,71 +7,141 @@ import numpy as np
 import random
 
 class MaskDiffusionDataset(Dataset):
-    def __init__(self, datafiles: List[str], transform=None, split="train", use_coord_grid=False):
+    def __init__(self, datafiles: List[str], transform=None, split="train", use_coord_grid=False, use_local=False):
         """
         Args:
             data_dir: path to data directory
             transform: pytorch transforms for data augmentation
             split: one of 'train', 'val', or 'test'
+            use_coord_grid: whether to add coordinate grid channels
+            use_local: whether to use local (object-centered) masks instead of global masks
         """
         self.transform = transform
         self.split = split
         self.use_coord_grid = use_coord_grid
-        
-        
-        # split the datafiles into train, val, test 
+        self.use_local = use_local
+
+
+        # split the datafiles into train, val, test
         # if self.split == "train":
         #     sample_files = datafiles[:int(0.8*len(datafiles))]
         # elif self.split == "val":
         #     sample_files = datafiles[int(0.9*len(datafiles)):]
         # elif self.split == "test":
         #     sample_files = datafiles[int(0.9*len(datafiles)):]
-            
+
         # print(self.split, len(sample_files))
-        
+
         self.samples = datafiles
-            
+
     def __len__(self):
         return len(self.samples)
-    
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        
+
         # Use context manager to ensure file is closed
         with np.load(sample) as data:
-            # Support both old and new key naming conventions
-            # Copy data to avoid issues after file is closed
-            robot_image = (data.get('robot_image') if 'robot_image' in data else data['robot']).copy()
-            goal_image = (data.get('goal_image') if 'goal_image' in data else data['goal']).copy()
-            movable_objects_image = (data.get('movable_objects_image') if 'movable_objects_image' in data else data['movable']).copy()
-            static_objects_image = (data.get('static_objects_image') if 'static_objects_image' in data else data['static']).copy()
-            
-            # For target_object and target_goal (new dataset)
-            target_object = data.get('target_object', None)
-            if target_object is not None:
-                target_object = target_object.copy()
-            target_goal = data.get('target_goal', None)
-            if target_goal is not None:
-                target_goal = target_goal.copy()
-            
-            # Legacy keys (old dataset)
-            object_mask = data.get('object_mask', None)
-            if object_mask is not None:
-                object_mask = object_mask.copy()
-            goal_mask = data.get('goal_mask', None)
-            if goal_mask is not None:
-                goal_mask = goal_mask.copy()
-        
+            if self.use_local:
+                # Load local (object-centered) masks
+                # Input channels: local_static, local_movable, local_target_object, local_goal_region
+                # Target: local_target_goal
+                static_image = data.get('local_static')
+                movable_image = data.get('local_movable')
+                target_object = data.get('local_target_object')
+                goal_region = data.get('local_goal_region')
+                target_goal = data.get('local_target_goal')
+
+                # Skip samples without local masks
+                if static_image is None or target_object is None:
+                    # Fallback to global if local not available
+                    static_image = (data.get('static_objects_image') if 'static_objects_image' in data else data.get('static', np.zeros((224, 224)))).copy()
+                    movable_image = (data.get('movable_objects_image') if 'movable_objects_image' in data else data.get('movable', np.zeros((224, 224)))).copy()
+                    target_object = data.get('target_object', np.zeros((224, 224)))
+                    if target_object is not None:
+                        target_object = target_object.copy()
+                    goal_region = data.get('goal_region', np.zeros((224, 224)))
+                    if goal_region is not None:
+                        goal_region = goal_region.copy()
+                    target_goal = data.get('target_goal')
+                    if target_goal is not None:
+                        target_goal = target_goal.copy()
+                else:
+                    static_image = static_image.copy()
+                    movable_image = movable_image.copy() if movable_image is not None else np.zeros_like(static_image)
+                    target_object = target_object.copy()
+                    goal_region = goal_region.copy() if goal_region is not None else np.zeros_like(static_image)
+                    target_goal = target_goal.copy() if target_goal is not None else None
+
+                image_size = static_image.shape[0]
+
+                if self.use_coord_grid:
+                    ys, xs = np.meshgrid(np.linspace(0, 1, image_size),
+                                         np.linspace(0, 1, image_size),
+                                         indexing='ij')
+                    coord_grid = np.stack([xs, ys], axis=-1)
+                    coord_grid = coord_grid.reshape(image_size, image_size, 2).astype(np.float32)
+
+                if self.transform:
+                    ret = {
+                        "static": self.transform(static_image),
+                        "movable": self.transform(movable_image),
+                        "target_object": self.transform(target_object),
+                        "goal_region": self.transform(goal_region),
+                    }
+                    if target_goal is not None:
+                        ret["target_goal"] = self.transform(target_goal)
+                    if self.use_coord_grid:
+                        ret["coord_grid"] = self.transform(coord_grid)
+                    return ret
+
+                ret = {
+                    "static": static_image,
+                    "movable": movable_image,
+                    "target_object": target_object,
+                    "goal_region": goal_region,
+                }
+                if target_goal is not None:
+                    ret["target_goal"] = target_goal
+                if self.use_coord_grid:
+                    ret["coord_grid"] = coord_grid
+                return ret
+
+            else:
+                # Load global masks (original behavior)
+                # Support both old and new key naming conventions
+                # Copy data to avoid issues after file is closed
+                robot_image = (data.get('robot_image') if 'robot_image' in data else data['robot']).copy()
+                goal_image = (data.get('goal_image') if 'goal_image' in data else data['goal']).copy()
+                movable_objects_image = (data.get('movable_objects_image') if 'movable_objects_image' in data else data['movable']).copy()
+                static_objects_image = (data.get('static_objects_image') if 'static_objects_image' in data else data['static']).copy()
+
+                # For target_object and target_goal (new dataset)
+                target_object = data.get('target_object', None)
+                if target_object is not None:
+                    target_object = target_object.copy()
+                target_goal = data.get('target_goal', None)
+                if target_goal is not None:
+                    target_goal = target_goal.copy()
+
+                # Legacy keys (old dataset)
+                object_mask = data.get('object_mask', None)
+                if object_mask is not None:
+                    object_mask = object_mask.copy()
+                goal_mask = data.get('goal_mask', None)
+                if goal_mask is not None:
+                    goal_mask = goal_mask.copy()
+
         image_size = robot_image.shape[0]
-        
+
         if self.use_coord_grid:
-            ys, xs = np.meshgrid(np.linspace(0, 1, image_size), 
-                                 np.linspace(0, 1, image_size), 
+            ys, xs = np.meshgrid(np.linspace(0, 1, image_size),
+                                 np.linspace(0, 1, image_size),
                                  indexing='ij')
             coord_grid = np.stack([xs, ys], axis=-1)
             coord_grid = coord_grid.reshape(image_size, image_size, 2).astype(np.float32)
-            
-        
+
+
         if self.transform:
             ret = {
                 "robot": self.transform(robot_image),
@@ -79,32 +149,32 @@ class MaskDiffusionDataset(Dataset):
                 "movable": self.transform(movable_objects_image),
                 "static": self.transform(static_objects_image),
             }
-            
+
             # Add target_object if available
             if target_object is not None:
                 ret["target_object"] = self.transform(target_object)
-                
+
             # Add target_goal if available
             if target_goal is not None:
                 ret["target_goal"] = self.transform(target_goal)
-                
+
             # Add legacy masks if available (for backward compatibility)
             if object_mask is not None:
                 ret["object_mask"] = self.transform(object_mask)
             if goal_mask is not None:
                 ret["goal_mask"] = self.transform(goal_mask)
-                
+
             if self.use_coord_grid:
                 ret["coord_grid"] = self.transform(coord_grid)
             return ret
-        
+
         ret = {
             "robot": robot_image,
             "goal": goal_image,
             "movable": movable_objects_image,
             "static": static_objects_image,
         }
-        
+
         if target_object is not None:
             ret["target_object"] = target_object
         if target_goal is not None:
@@ -126,22 +196,24 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
         use_coord_grid: bool = False,
+        use_local: bool = False,
         train_split: float = 1, # already separated testing data
     ):
         super().__init__()
-        
+
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.image_size = image_size
         self.use_coord_grid = use_coord_grid
+        self.use_local = use_local
         self.train_split = train_split
-        
+
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
-        
+
         self.datafiles = []
         
     def prepare_data(self):
@@ -220,15 +292,18 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         
         if stage == "fit" or stage is None:
             self.train_dataset = MaskDiffusionDataset(
-                train_datafiles, split="train", transform=transform, use_coord_grid=self.use_coord_grid
+                train_datafiles, split="train", transform=transform,
+                use_coord_grid=self.use_coord_grid, use_local=self.use_local
             )
             self.val_dataset = MaskDiffusionDataset(
-                val_datafiles, split="val", transform=transform, use_coord_grid=self.use_coord_grid
+                val_datafiles, split="val", transform=transform,
+                use_coord_grid=self.use_coord_grid, use_local=self.use_local
             )
-            
+
         if stage == "test" or stage is None:
             self.test_dataset = MaskDiffusionDataset(
-                val_datafiles, split="test", transform=transform, use_coord_grid=self.use_coord_grid
+                val_datafiles, split="test", transform=transform,
+                use_coord_grid=self.use_coord_grid, use_local=self.use_local
             )
     
     def train_dataloader(self):

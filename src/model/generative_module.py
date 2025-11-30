@@ -63,6 +63,7 @@ class GenerativeModule(pl.LightningModule):
         aux_loss_weight: float = 0.0,
         context_channels: int = 5,
         target_channels: int = 1,
+        use_local: bool = False,
     ):
         super().__init__()
 
@@ -74,6 +75,7 @@ class GenerativeModule(pl.LightningModule):
         self.aux_loss_weight = aux_loss_weight
         self.context_channels = context_channels
         self.target_channels = target_channels
+        self.use_local = use_local
 
         # Loss function
         self.criterion = nn.MSELoss()
@@ -109,15 +111,26 @@ class GenerativeModule(pl.LightningModule):
         """
         Build context tensor from batch.
 
-        Concatenates: robot, goal, movable_objects, static_objects, target_object, and optionally coord_grid.
+        For global masks: Concatenates robot, goal, movable, static, target_object
+        For local masks: Concatenates static, movable, target_object, goal_region
         """
-        parts = [
-            batch['robot'],
-            batch['goal'],
-            batch['movable'],
-            batch['static'],
-            batch['target_object']
-        ]
+        if self.use_local:
+            # Local masks: static, movable, target_object, goal_region (4 channels)
+            parts = [
+                batch['static'],
+                batch['movable'],
+                batch['target_object'],
+                batch['goal_region'],
+            ]
+        else:
+            # Global masks: robot, goal, movable, static, target_object (5 channels)
+            parts = [
+                batch['robot'],
+                batch['goal'],
+                batch['movable'],
+                batch['static'],
+                batch['target_object']
+            ]
 
         # Optional: coordinate grid
         if 'coord_grid' in batch:

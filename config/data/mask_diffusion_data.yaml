@@ -5,4 +5,5 @@ num_workers: ${num_workers}
 pin_memory: true
 image_size: ${image_size}
 use_coord_grid: true # for simple relational information
+use_local: ${use_local}  # inherited from top-level config
 train_split: 0.9  # 90% train, 10% validation (~5348 samples)

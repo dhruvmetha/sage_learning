@@ -39,5 +39,10 @@ optimizer:
 aux_loss_weight: 0.005
 
 # Channel configuration
+# Global: 5 context (robot,goal,mov,stat,tgt_obj)
+# Local: 4 context (static,movable,target_object,goal_region)
 context_channels: 5
 target_channels: 1
+
+# Use local (object-centered) masks instead of global
+use_local: ${use_local}  # inherited from top-level config

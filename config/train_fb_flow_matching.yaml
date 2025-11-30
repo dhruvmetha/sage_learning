@@ -52,6 +52,10 @@ decay_steps: 300000
 # Image size
 image_size: 64
 
+# Use local (object-centered) masks instead of global
+# This controls both data loading and model context building
+use_local: false
+
 # GPU (for legacy compatibility)
 gpu_id: 0
 
