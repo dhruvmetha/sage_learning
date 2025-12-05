@@ -15,7 +15,8 @@
 
 # Experiment name (used in output path)
 name: flow_matching
-output_dir: /common/users/dm1487/outputs/${name}
+output_dir: /common/users/dm1487/namo_data/outputs/${name}
+data_dir: /common/users/dm1487/namo_data/images/nov30/1_push_train
 
 # Hydra output directory structure
 hydra:
@@ -54,7 +55,7 @@ image_size: 64
 
 # Use local (object-centered) masks instead of global
 # This controls both data loading and model context building
-use_local: false
+use_local: true
 
 # GPU (for legacy compatibility)
 gpu_id: 0

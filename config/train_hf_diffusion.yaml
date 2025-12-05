@@ -12,9 +12,17 @@
 #
 # For fewer inference steps (DDIM can handle 20-50 steps):
 #   python src/train_generative.py --config-name=train_hf_diffusion sampling_steps=50
+#
+# Resume training from a checkpoint:
+#   python src/train_generative.py --config-name=train_hf_diffusion ckpt_path=/path/to/checkpoint.ckpt
 
 # Experiment name (used in output path)
 name: diffusion
+output_dir: /common/users/dm1487/namo_data/outputs/${name}
+data_dir: /common/users/dm1487/namo_data/h5_files/dec2/aug9_envs/1_push_train
+
+# Resume from checkpoint (set to path to resume training, null to start fresh)
+ckpt_path: null
 
 # Hydra output directory structure
 hydra:
@@ -35,7 +43,9 @@ defaults:
 seed: 42
 
 # Data loading
-num_workers: 4
+# Note: HDF5 files can be slow with multiple workers due to file contention
+# Try num_workers: 0 first, then increase if it works
+num_workers: 0
 batch_size: 64
 
 # Training
@@ -53,7 +63,7 @@ image_size: 64
 
 # Use local (object-centered) masks instead of global
 # This controls both data loading and model context building
-use_local: false
+use_local: true
 
 # GPU (for legacy compatibility)
 gpu_id: 0
@@ -63,5 +73,6 @@ gpu_id: 0
 sampling_steps: 50
 
 # Paths
+# Checkpoints and logs will be saved to output_dir with a timestamp subdirectory
 paths:
-  output_dir: ${hydra:runtime.output_dir}
+  output_dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}

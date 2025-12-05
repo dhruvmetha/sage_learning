@@ -112,15 +112,16 @@ class GenerativeModule(pl.LightningModule):
         Build context tensor from batch.
 
         For global masks: Concatenates robot, goal, movable, static, target_object
-        For local masks: Concatenates static, movable, target_object, goal_region
+        For local masks: Concatenates static, movable, target_object, robot_region, goal_sample_region
         """
         if self.use_local:
-            # Local masks: static, movable, target_object, goal_region (4 channels)
+            # Local masks: static, movable, target_object, robot_region, goal_sample_region (5 channels)
             parts = [
                 batch['static'],
                 batch['movable'],
                 batch['target_object'],
-                batch['goal_region'],
+                batch['robot_region'],
+                batch['goal_sample_region'],
             ]
         else:
             # Global masks: robot, goal, movable, static, target_object (5 channels)
@@ -306,11 +307,15 @@ class GenerativeModule(pl.LightningModule):
         """Generate and log samples during validation.
 
         Logs 8 images, each showing a different validation example.
-        Each image has 4 panels:
-        1. Scene: robot(R) + robot_goal(G) + static(B) + movable(B)
-        2. Target object context: robot(R) + robot_goal(G) + static(B) + target_object(cyan)
-        3. Ground truth: robot(R) + robot_goal(G) + target_object(B) + ground_truth_location(G)
-        4. Prediction: robot(R) + robot_goal(G) + static(B) + target_object(cyan) + prediction(G)
+        Each image has 7 panels with different visualizations depending on mode.
+
+        Global mode (use_local=False):
+        - Context channels: 0=robot, 1=robot_goal, 2=movable, 3=static, 4=target_object
+        - Panels: Scene | TargetObj | GT | Pred1-4
+
+        Local mode (use_local=True):
+        - Context channels: 0=static, 1=movable, 2=target_object, 3=goal_region
+        - Panels: Scene | TargetObj | GT | Pred1-4
         """
         context = self._validation_context
         target = self._validation_target
@@ -327,17 +332,9 @@ class GenerativeModule(pl.LightningModule):
 
             log_dict = {}
             for i in range(num_examples):
-                # Get single example
-                # Context channels: 0=robot, 1=robot_goal, 2=movable, 3=static, 4=target_object
-                ctx = context[i:i+1]  # (1, 5, H, W)
+                ctx = context[i:i+1]  # (1, C, H, W)
                 gt_target = target[i:i+1]   # (1, 1, H, W) - ground truth target location
-
-                robot = _to_display(ctx[0, 0:1])[0]        # robot position
-                robot_goal = _to_display(ctx[0, 1:2])[0]   # robot goal
-                movable = _to_display(ctx[0, 2:3])[0]      # movable objects
-                static = _to_display(ctx[0, 3:4])[0]       # static obstacles
-                target_obj = _to_display(ctx[0, 4:5])[0]   # target/selected object
-                gt_location = _to_display(gt_target[0, 0:1])[0]  # ground truth target location
+                gt_location = _to_display(gt_target[0, 0:1])[0]
 
                 # Generate 4 predictions
                 with torch.no_grad():
@@ -346,31 +343,79 @@ class GenerativeModule(pl.LightningModule):
                     pred_3 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
                     pred_4 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
 
-                # Image 1: Scene (robot=R, robot_goal=G, static+movable=B)
-                img1 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                img1[0, 0] = robot                          # R
-                img1[0, 1] = robot_goal                     # G
-                img1[0, 2] = torch.clamp(static + movable, 0, 1)  # B
+                if self.use_local:
+                    # Local mode channels: 0=static, 1=movable, 2=target_object, 3=robot_region, 4=goal_sample_region
+                    static = _to_display(ctx[0, 0:1])[0]
+                    movable = _to_display(ctx[0, 1:2])[0]
+                    target_obj = _to_display(ctx[0, 2:3])[0]
+                    robot_region = _to_display(ctx[0, 3:4])[0]
+                    goal_sample_region = _to_display(ctx[0, 4:5])[0]
 
-                # Image 2: Target object context (robot=R, robot_goal=G, static=B, target_obj=cyan)
-                img2 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                img2[0, 0] = robot                          # R
-                img2[0, 1] = torch.clamp(robot_goal + target_obj, 0, 1)  # G (goal + target_obj = cyan with B)
-                img2[0, 2] = torch.clamp(static + target_obj, 0, 1)      # B
+                    # Consistent colors: R=static/context, G=variable/pred, B=target_obj (always blue)
 
-                # Image 3: Ground truth (robot=R, robot_goal=G, target_obj=B, gt_location=G)
-                img3 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                img3[0, 0] = robot                          # R
-                img3[0, 1] = torch.clamp(robot_goal + gt_location, 0, 1)  # G
-                img3[0, 2] = target_obj                     # B
+                    # Image 1: Scene (R=static, G=movable, B=target_obj)
+                    img1 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                    img1[0, 0] = static
+                    img1[0, 1] = movable
+                    img1[0, 2] = target_obj
 
-                # Images 4-7: Predictions (robot=R, robot_goal=G, static=B, target_obj=cyan, pred=G)
-                def make_pred_img(pred_loc):
-                    img = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img[0, 0] = robot                          # R
-                    img[0, 1] = torch.clamp(robot_goal + pred_loc, 0, 1)  # G
-                    img[0, 2] = torch.clamp(static + target_obj, 0, 1)    # B
-                    return img
+                    # Image 2: Reachability (R=robot_region, G=goal_sample_region, B=target_obj)
+                    img2 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                    img2[0, 0] = robot_region
+                    img2[0, 1] = goal_sample_region
+                    img2[0, 2] = target_obj
+
+                    # Image 3: Ground truth (R=static, G=gt_location, B=target_obj)
+                    img3 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                    img3[0, 0] = static
+                    img3[0, 1] = gt_location
+                    img3[0, 2] = target_obj
+
+                    # Images 4-7: Predictions (R=static, G=prediction, B=target_obj)
+                    def make_pred_img(pred_loc):
+                        img = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                        img[0, 0] = static
+                        img[0, 1] = pred_loc
+                        img[0, 2] = target_obj
+                        return img
+
+                    caption = f"Epoch {self.current_epoch} | Scene(R=stat,G=mov,B=obj) | Reach(R=robot,G=goal,B=obj) | GT | Pred1-4"
+
+                else:
+                    # Global mode channels: 0=robot, 1=robot_goal, 2=movable, 3=static, 4=target_object
+                    robot = _to_display(ctx[0, 0:1])[0]
+                    robot_goal = _to_display(ctx[0, 1:2])[0]
+                    movable = _to_display(ctx[0, 2:3])[0]
+                    static = _to_display(ctx[0, 3:4])[0]
+                    target_obj = _to_display(ctx[0, 4:5])[0]
+
+                    # Image 1: Scene (robot=R, robot_goal=G, static+movable=B)
+                    img1 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                    img1[0, 0] = robot
+                    img1[0, 1] = robot_goal
+                    img1[0, 2] = torch.clamp(static + movable, 0, 1)
+
+                    # Image 2: Target object context (robot=R, robot_goal+target_obj=G, static+target_obj=B)
+                    img2 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                    img2[0, 0] = robot
+                    img2[0, 1] = torch.clamp(robot_goal + target_obj, 0, 1)
+                    img2[0, 2] = torch.clamp(static + target_obj, 0, 1)
+
+                    # Image 3: Ground truth (robot=R, robot_goal+gt_location=G, target_obj=B)
+                    img3 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                    img3[0, 0] = robot
+                    img3[0, 1] = torch.clamp(robot_goal + gt_location, 0, 1)
+                    img3[0, 2] = target_obj
+
+                    # Images 4-7: Predictions (robot=R, robot_goal+pred=G, static+target_obj=B)
+                    def make_pred_img(pred_loc):
+                        img = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
+                        img[0, 0] = robot
+                        img[0, 1] = torch.clamp(robot_goal + pred_loc, 0, 1)
+                        img[0, 2] = torch.clamp(static + target_obj, 0, 1)
+                        return img
+
+                    caption = f"Epoch {self.current_epoch} | Scene | TargetObj | GT | Pred1 | Pred2 | Pred3 | Pred4"
 
                 img4 = make_pred_img(pred_1)
                 img5 = make_pred_img(pred_2)
@@ -383,10 +428,7 @@ class GenerativeModule(pl.LightningModule):
 
                 # Convert to numpy and log
                 grid_np = grid.cpu().permute(1, 2, 0).numpy()
-                log_dict[f'val_sample_{i+1}'] = wandb.Image(
-                    grid_np,
-                    caption=f"Epoch {self.current_epoch} | Scene | TargetObj | GT | Pred1 | Pred2 | Pred3 | Pred4"
-                )
+                log_dict[f'val_sample_{i+1}'] = wandb.Image(grid_np, caption=caption)
 
             self.logger.experiment.log(log_dict)
 

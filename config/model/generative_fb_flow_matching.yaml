@@ -9,7 +9,7 @@ network:
   _target_: src.model.dit.dit.DiT
   img_size: ${image_size}
   patch: 4
-  in_ch: 8      # 5 context (robot,goal,mov,stat,tgt_obj) + 2 coord_grid + 1 noisy_target
+  in_ch: 7      # 4 context (static,mov,tgt_obj,goal_region) + 2 coord_grid + 1 noisy_target (local mode)
   out_ch: 1     # target_goal
   dim: 256
   depth: 8

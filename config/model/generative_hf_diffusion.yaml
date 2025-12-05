@@ -9,7 +9,7 @@ network:
   _target_: src.model.dit.dit.DiT
   img_size: ${image_size}
   patch: 4
-  in_ch: 8      # 5 context (robot,goal,mov,stat,tgt_obj) + 2 coord_grid + 1 noisy_target
+  in_ch: 8      # 5 context (static,movable,tgt_obj,robot_region,goal_sample_region) + 2 coord_grid + 1 noisy_target
   out_ch: 1     # target_goal
   dim: 256
   depth: 8
@@ -45,7 +45,7 @@ aux_loss_weight: 0.005
 
 # Channel configuration
 # Global: 5 context (robot,goal,mov,stat,tgt_obj)
-# Local: 4 context (static,movable,target_object,goal_region)
+# Local: 5 context (static,movable,target_object,robot_region,goal_sample_region)
 context_channels: 5
 target_channels: 1
 

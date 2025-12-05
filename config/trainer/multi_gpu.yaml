@@ -21,6 +21,7 @@ strategy:
   _target_: lightning.pytorch.strategies.DDPStrategy
   find_unused_parameters: false  # Set to true if model has unused params
   static_graph: true  # Optimization for models with static computation graphs
+  gradient_as_bucket_view: false  # Avoids stride mismatch warnings with ConvTranspose2d
 
 # Training duration
 min_epochs: 1
