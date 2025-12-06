@@ -35,12 +35,15 @@ MINIMAL_KEYS = [
     # Local masks
     'local_target_object',
     'local_target_goal',
+    'local_goal_mask_a1',  # Multi-horizon: next action's goal (preferred over local_target_goal)
+    'local_goal_mask_a2',  # Multi-horizon: second action's goal (if exists)
     'local_static',
     'local_movable',
     'local_robot_region',
     'local_goal_sample_region',
     # Metadata needed for training
     'xml_file',
+    'solution_depth',  # How many actions remain
 ]
 
 

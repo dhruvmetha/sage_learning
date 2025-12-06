@@ -53,13 +53,16 @@ class MaskDiffusionDataset(Dataset):
             if self.use_local:
                 # Load local (object-centered) masks
                 # Input channels: local_static, local_movable, local_target_object, local_robot_region, local_goal_sample_region
-                # Target: local_target_goal
+                # Target: local_goal_mask_a1 (next action's goal, works for both 1-push and multi-push)
                 static_image = data.get('local_static')
                 movable_image = data.get('local_movable')
                 target_object = data.get('local_target_object')
                 robot_region = data.get('local_robot_region')
                 goal_sample_region = data.get('local_goal_sample_region')
-                target_goal = data.get('local_target_goal')
+                # Use local_goal_mask_a1 as target (fallback to local_target_goal for backwards compatibility)
+                target_goal = data.get('local_goal_mask_a1')
+                if target_goal is None:
+                    target_goal = data.get('local_target_goal')
 
                 # Skip samples without local masks
                 if static_image is None or target_object is None:
@@ -242,7 +245,10 @@ class MaskDiffusionHDF5Dataset(Dataset):
             target_object = h5f['local_target_object'][real_idx] if 'local_target_object' in h5f else None
             robot_region = h5f['local_robot_region'][real_idx] if 'local_robot_region' in h5f else None
             goal_sample_region = h5f['local_goal_sample_region'][real_idx] if 'local_goal_sample_region' in h5f else None
-            target_goal = h5f['local_target_goal'][real_idx] if 'local_target_goal' in h5f else None
+            # Use local_goal_mask_a1 as target (fallback to local_target_goal for backwards compatibility)
+            target_goal = h5f['local_goal_mask_a1'][real_idx] if 'local_goal_mask_a1' in h5f else None
+            if target_goal is None:
+                target_goal = h5f['local_target_goal'][real_idx] if 'local_target_goal' in h5f else None
 
             if static_image is None:
                 # Fallback to global
