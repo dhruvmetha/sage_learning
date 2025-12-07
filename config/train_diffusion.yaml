@@ -1,0 +1,65 @@
+defaults:
+  - _self_
+
+trainer:
+  _target_: lightning.pytorch.Trainer
+  max_epochs: 100
+  accelerator: gpu
+  devices: 1
+  # Use DDP if you have multiple GPUs to speed it up
+  strategy: auto 
+  logger:
+    _target_: lightning.pytorch.loggers.WandbLogger
+    project: "sage_learning"
+    name: "diffusion_baseline" # Name it differently to compare in WandB
+
+model:
+  _target_: src.model.generative_module.UnifiedGenerativeModule
+  
+  # --- NETWORK (Same as Flow Matching) ---
+  network:
+    _target_: src.model.networks.vector_denoiser.VectorDenoiserBackbone
+    vector_dim: 3
+    image_channels: 5
+    hidden_dim: 256
+    num_layers: 6
+  
+  # --- LOGIC INJECTION (The Difference) ---
+  path:
+    _target_: src.model.common.DiffusionPath
+    timesteps: 1000
+    beta_start: 0.0001
+    beta_end: 0.02
+  
+  sampler:
+    _target_: src.model.common.DDPMSampler
+    timesteps: 1000
+  
+  # --- OPTIMIZER ---
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 1e-4 # Diffusion often prefers slightly lower LR than Flow Matching
+    weight_decay: 1e-4
+
+  # --- MODULE PARAMS ---
+  context_channels: 5
+  use_local: true
+  vector_dim: 3
+  
+  # Shared Stats (Essential for fair comparison)
+  pose_stats_file: "${hydra:runtime.cwd}/config/dataset_stats.json"
+  crop_size_meters: 5.0
+  xy_norm: 2.5     # Fallback if stats missing
+  theta_norm: 3.14 # Fallback if stats missing
+
+data:
+  _target_: src.data.mask_diffusion_data.MaskDiffusionDataModule
+  
+  # Point to the exact same data file
+  h5_file: "/common/users/shared/robot_learning/dm1487/namo/datasets/images/dec2/aug9_envs/1_push_train/h5/training_data.h5"
+  
+  batch_size: 32
+  num_workers: 4
+  image_size: 224
+  use_local: true

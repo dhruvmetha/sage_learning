@@ -1,32 +1,15 @@
-# Model module exports
+# Unified generative module
+from .generative_module import UnifiedGenerativeModule
 
-# Base classes
-from .base import BasePath, PathSample, BaseSampler
+# Common utilities (The new home for BasePath and Samplers)
+from .common import BasePath, BaseSampler
 
-# Unified generative module (supports both Flow Matching and Diffusion)
-from .generative_module import GenerativeModule
+# Networks
+from .networks.vector_denoiser import VectorDenoiserBackbone
 
 __all__ = [
-    # Base
+    "UnifiedGenerativeModule",
     "BasePath",
-    "PathSample",
     "BaseSampler",
-    # Main module
-    "GenerativeModule",
+    "VectorDenoiserBackbone",
 ]
-
-# Optional: Facebook flow matching
-try:
-    from .paths import FBFlowMatchingPath
-    from .samplers import FBODESampler
-    __all__.extend(["FBFlowMatchingPath", "FBODESampler"])
-except ImportError:
-    pass
-
-# Optional: HuggingFace diffusion
-try:
-    from .paths import HFDiffusionPath
-    from .samplers import HFDiffusionSampler
-    __all__.extend(["HFDiffusionPath", "HFDiffusionSampler"])
-except ImportError:
-    pass

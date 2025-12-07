@@ -1,514 +1,278 @@
-"""
-Unified Generative Module
-
-A PyTorch Lightning module that supports both diffusion and flow matching
-through pluggable path and sampler components.
-
-This design allows switching between generative methods via configuration
-without changing the core training/inference code.
-
-Usage:
-    # Flow Matching
-    module = GenerativeModule(
-        network=DiT(...),
-        path=FlowMatchingPath(),
-        sampler=ODESampler(method='midpoint'),
-        optimizer=...,
-    )
-
-    # Diffusion
-    module = GenerativeModule(
-        network=DiT(...),
-        path=DiffusionPath(num_timesteps=100),
-        sampler=DDPMSampler(num_timesteps=100),
-        optimizer=...,
-    )
-"""
-
 import torch
 import torch.nn as nn
-import torchvision
 import lightning.pytorch as pl
 from torchmetrics import MeanMetric, MinMetric
 from typing import Optional, Dict, Any
+import math
+import json
+import numpy as np
+import cv2
 
-from .base.base_path import BasePath
-from .base.base_sampler import BaseSampler
+# UPDATED IMPORTS to match your structure
+from .networks.vector_denoiser import VectorDenoiserBackbone
+from .common import BasePath, BaseSampler
 
-
-class GenerativeModule(pl.LightningModule):
-    """
-    Unified generative module supporting diffusion, flow matching, and more.
-
-    The generative method is determined by the path and sampler components:
-    - path: Defines how to interpolate between noise and data (training)
-    - sampler: Defines how to generate samples from noise (inference)
-
-    Args:
-        network: Neural network backbone (DiT, UNet, etc.)
-        path: Path implementation (FlowMatchingPath, DiffusionPath, etc.)
-        sampler: Sampler implementation (ODESampler, DDPMSampler, etc.)
-        optimizer: Optimizer partial function
-        aux_loss_weight: Weight for auxiliary losses (e.g., dice loss)
-        context_channels: Number of input context channels (default 5: robot, goal, movable, static, target_object)
-        target_channels: Number of output target channels (default 1: target_goal only)
-    """
-
+class UnifiedGenerativeModule(pl.LightningModule):
     def __init__(
         self,
         network: nn.Module,
-        path: BasePath,
+        path: BasePath, 
         sampler: BaseSampler,
         optimizer: Any,
-        aux_loss_weight: float = 0.0,
         context_channels: int = 5,
-        target_channels: int = 1,
+        vector_dim: int = 3,
         use_local: bool = False,
+        pose_stats_file: Optional[str] = None,
+        xy_norm: float = 1.0,
+        theta_norm: float = math.pi,
+        crop_size_meters: float = 5.0,
     ):
         super().__init__()
-
         self.network = network
         self.path = path
         self.sampler = sampler
         self.optimizer_partial = optimizer
-
-        self.aux_loss_weight = aux_loss_weight
+        self.crop_size_meters = crop_size_meters
         self.context_channels = context_channels
-        self.target_channels = target_channels
+        self.vector_dim = vector_dim
         self.use_local = use_local
 
-        # Loss function
-        self.criterion = nn.MSELoss()
+        if pose_stats_file is not None:
+            stats = self._load_pose_stats(pose_stats_file)
+            self.xy_norm = stats.get('xy_norm', xy_norm)
+            self.theta_norm = stats.get('dtheta_norm', theta_norm)
+            print(f"Loaded stats from {pose_stats_file}: xy={self.xy_norm}, theta={self.theta_norm}")
+        else:
+            self.xy_norm = xy_norm
+            self.theta_norm = theta_norm
 
-        # Metrics
+        self.register_buffer('_xy_norm', torch.tensor(self.xy_norm))
+        self.register_buffer('_theta_norm', torch.tensor(self.theta_norm))
         self.train_loss = MeanMetric()
         self.val_loss = MeanMetric()
         self.val_loss_best = MinMetric()
-
-        # Save hyperparameters (excluding non-serializable objects)
         self.save_hyperparameters(ignore=["network", "path", "sampler", "optimizer"])
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the network.
-
-        Args:
-            x: Input tensor (context + noisy/interpolated target)
-            t: Time values, shape (B,) or (B, 1)
-
-        Returns:
-            Model prediction (noise or velocity depending on path)
-        """
-        # Ensure t has correct shape for the network
-        if t.dim() == 1:
-            t_input = t
-        else:
-            t_input = t.squeeze(-1)
-
-        return self.network(x, t_input)
-
-    def _build_context(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Build context tensor from batch.
-
-        For global masks: Concatenates robot, goal, movable, static, target_object
-        For local masks: Concatenates static, movable, target_object, robot_region, goal_sample_region
-        """
-        if self.use_local:
-            # Local masks: static, movable, target_object, robot_region, goal_sample_region (5 channels)
-            parts = [
-                batch['static'],
-                batch['movable'],
-                batch['target_object'],
-                batch['robot_region'],
-                batch['goal_sample_region'],
-            ]
-        else:
-            # Global masks: robot, goal, movable, static, target_object (5 channels)
-            parts = [
-                batch['robot'],
-                batch['goal'],
-                batch['movable'],
-                batch['static'],
-                batch['target_object']
-            ]
-
-        # Optional: coordinate grid
-        if 'coord_grid' in batch:
-            parts.append(batch['coord_grid'])
-
-        return torch.cat(parts, dim=1)
-
-    def _build_target(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Build target tensor from batch, clamped to [-1, 1].
-        """
-        return torch.clamp(batch['target_goal'], -1, 1)
-
-    def _compute_loss(
-        self,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        x_1: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute loss with optional auxiliary losses.
-
-        Args:
-            prediction: Model output (noise or velocity)
-            target: Ground truth (noise or velocity)
-            x_t: Current interpolated/noised point
-            t: Time values
-            x_1: Original data (for auxiliary losses)
-
-        Returns:
-            Total loss
-        """
-        # Primary loss: MSE between prediction and target
-        primary_loss = self.criterion(prediction, target)
-
-        if self.aux_loss_weight > 0:
-            # Auxiliary loss: Dice loss on reconstructed x_1
-            x_1_pred = self.path.get_x1_from_prediction(x_t, t, prediction)
-
-            # Clamp and convert to [0, 1] for dice loss
-            x_1_pred = torch.sigmoid(torch.clamp(x_1_pred, -10.0, 10.0))
-            x_1_target = (x_1 + 1) / 2  # Convert from [-1, 1] to [0, 1]
-
-            aux_loss = self._focal_dice_loss(x_1_pred, x_1_target)
-
-            # Check for NaN
-            if torch.isnan(aux_loss):
-                return primary_loss
-
-            return primary_loss + self.aux_loss_weight * aux_loss
-
-        return primary_loss
+    def forward(self, x: torch.Tensor, t: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        return self.network(x, t, context)
 
     @staticmethod
-    def _focal_dice_loss(
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        alpha: float=0.5,
-        gamma: float=2.0,
-        smooth: float=1.0
-    ) -> torch.Tensor:
-        # pred, target: B×1×H×W in [0,1]
-        pred = pred.flatten(1)
-        target = target.flatten(1)
-        
-        # Clamp predictions to prevent extreme values
-        pred = torch.clamp(pred, 0.0, 1.0)
-        target = torch.clamp(target, 0.0, 1.0)
-        
-        focal_weight = alpha * (1 - pred) ** gamma * target + (1 - alpha) * pred ** gamma * (1 - target)
-        
-        intersection = (pred * target * focal_weight).sum(dim=1)
-        denom = (pred * focal_weight).sum(dim=1) + (target * focal_weight).sum(dim=1)
-        
-        # Add numerical stability
-        dice = (2 * intersection + smooth) / (denom + smooth + 1e-8)
-        
-        return 1 - dice.mean()
+    def _load_pose_stats(stats_file: str) -> Dict[str, float]:
+        with open(stats_file, 'r') as f:
+            return json.load(f)
 
-    def training_step(
-        self,
-        batch: Dict[str, torch.Tensor],
-        batch_idx: int
-    ) -> Optional[torch.Tensor]:
-        """
-        Training step: sample from path and compute loss.
-        """
-        # Build inputs
+    def _build_context(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if self.use_local:
+            parts = [
+                batch['static'], batch['movable'], batch['target_object'],
+                batch['robot_region'], batch['goal_sample_region']
+            ]
+        else:
+            parts = [
+                batch['robot'], batch['goal'], batch['movable'],
+                batch['static'], batch['target_object']
+            ]
+        if 'coord_grid' in batch:
+            parts.append(batch['coord_grid'])
+        return torch.cat(parts, dim=1)
+
+    def _normalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
+        norm_scale = torch.tensor([self._xy_norm, self._xy_norm, self._theta_norm], device=pose.device)
+        return torch.clamp(pose / norm_scale, -1, 1)
+
+    def _denormalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
+        norm_scale = torch.tensor([self._xy_norm, self._xy_norm, self._theta_norm], device=pose.device)
+        return pose * norm_scale
+
+    def training_step(self, batch, batch_idx):
         context = self._build_context(batch)
-        x_1 = self._build_target(batch)
-        x_0 = torch.randn_like(x_1)
-
-        # Sample from path
-        path_sample = self.path.sample(x_0=x_0, x_1=x_1)
-
-        # Build model input: [context, x_t]
-        model_input = torch.cat([context, path_sample.x_t], dim=1)
-
-        # Get prediction
-        prediction = self(model_input, path_sample.t)
-
-        # Compute loss
-        loss = self._compute_loss(
-            prediction=prediction,
-            target=path_sample.target,
-            x_t=path_sample.x_t,
-            t=path_sample.t,
-            x_1=x_1
-        )
-
-        # Handle NaN loss
-        if loss is None or torch.isnan(loss):
-            return None
-
-        # Log metrics
+        if batch['target_goal'].dim() > 2:
+            raise ValueError("Target seems to be an image! The model expects a vector.")
+        x_1 = self._normalize_pose(batch['target_goal']) 
+        x_0 = torch.randn_like(x_1) 
+        
+        # Get training state (x_t, t, target) from Path
+        sample = self.path.compute_loss_samples(x_0=x_0, x_1=x_1)
+        
+        # Predict
+        prediction = self.network(sample.x_t, sample.t, context)
+        loss = torch.nn.functional.mse_loss(prediction, sample.target)
+        
         self.train_loss(loss)
         self.log("train_loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
-
         return loss
 
-    def validation_step(
-        self,
-        batch: Dict[str, torch.Tensor],
-        batch_idx: int
-    ) -> Optional[torch.Tensor]:
-        """
-        Validation step: same as training but with logging.
-        """
+    def validation_step(self, batch, batch_idx):
         context = self._build_context(batch)
-        x_1 = self._build_target(batch)
+        x_1 = self._normalize_pose(batch['target_goal'])
         x_0 = torch.randn_like(x_1)
-
-        path_sample = self.path.sample(x_0=x_0, x_1=x_1)
-        model_input = torch.cat([context, path_sample.x_t], dim=1)
-
-        prediction = self(model_input, path_sample.t)
-
-        loss = self._compute_loss(
-            prediction=prediction,
-            target=path_sample.target,
-            x_t=path_sample.x_t,
-            t=path_sample.t,
-            x_1=x_1
-        )
-
-        if loss is None or torch.isnan(loss):
-            return None
-
+        
+        sample = self.path.compute_loss_samples(x_0=x_0, x_1=x_1)
+        prediction = self.network(sample.x_t, sample.t, context)
+        loss = torch.nn.functional.mse_loss(prediction, sample.target)
+        
         self.val_loss(loss)
         self.log("val_loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
-
-        # Save first batch for sample generation
         if batch_idx == 0:
-            target_object = batch.get('target_object')
             self._validation_context = context
-            self._validation_target = x_1
-            self._validation_target_object = target_object
-
+            self._validation_gt = x_1
         return loss
 
     def on_validation_epoch_end(self):
-        """Log best validation loss and generate samples."""
         self.val_loss_best(self.val_loss.compute())
         self.log("val_loss_best", self.val_loss_best, prog_bar=True)
-
-        # Generate validation samples
         if hasattr(self, '_validation_context'):
-            self._generate_validation_samples()
+            self._visualize_predictions()
 
-    def _generate_validation_samples(self):
-        """Generate and log samples during validation.
+    def _visualize_predictions(self):
+        if not hasattr(self.logger, 'experiment'): return
+        import wandb
+        import torchvision
+        
+        n_vis = min(8, self._validation_context.shape[0])
+        context = self._validation_context[:n_vis]
+        gt_norm = self._validation_gt[:n_vis]
+        
+        # Sample predictions
+        preds_flat = self.sample_pose(context, num_samples=4, denormalize=False) 
+        preds = preds_flat.view(n_vis, 4, 3)
 
-        Logs 8 images, each showing a different validation example.
-        Each image has 7 panels with different visualizations depending on mode.
+        log_dict = {}
 
-        Global mode (use_local=False):
-        - Context channels: 0=robot, 1=robot_goal, 2=movable, 3=static, 4=target_object
-        - Panels: Scene | TargetObj | GT | Pred1-4
+        for i in range(n_vis):
+            ctx = context[i]      # (5, H, W)
+            gt = gt_norm[i]       # (3,)
+            p_list = preds[i]     # (4, 3)
+            
+            # --- PREPARE PANELS ---
+            # We treat the input as [0, 1] for visualization if it looks good to you.
+            # Using .clamp(0, 1) to be safe.
+            static = ctx[0]
+            movable = ctx[1]
+            target_obj = ctx[2]
+            robot_reg = ctx[3]
+            goal_reg = ctx[4]
 
-        Local mode (use_local=True):
-        - Context channels: 0=static, 1=movable, 2=target_object, 3=goal_region
-        - Panels: Scene | TargetObj | GT | Pred1-4
+            # Panel 1: Scene (R=Static, G=Movable, B=TargetObj)
+            panel_scene = torch.stack([static, movable, target_obj], dim=0).clamp(0, 1)
+
+            # Panel 2: Reachability (R=RobotReg, G=GoalReg, B=TargetObj)
+            panel_reach = torch.stack([robot_reg, goal_reg, target_obj], dim=0).clamp(0, 1)
+
+            # --- DRAWING HELPER ---
+            def draw_pose_on_img(base_tensor, vector, color, alpha=1.0):
+                # 1. Convert to Numpy (H, W, 3) uint8
+                img_np = (base_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                img_np = np.ascontiguousarray(img_np)
+                
+                # 2. Draw
+                self._draw_pose_cv2(img_np, vector, color, alpha=alpha)
+                
+                # 3. Convert back and MOVE TO DEVICE (Fixes the crash)
+                return torch.from_numpy(img_np).permute(2, 0, 1).float().to(base_tensor.device) / 255.0
+
+            # Colors (RGB)
+            COLOR_GT = (0, 180, 0)      # Darker, bold Green
+            COLOR_PRED = (255, 0, 0)    # Red
+
+            # --- GENERATE PANELS ---
+            
+            # Panel 3: Ground Truth Only
+            panel_gt = draw_pose_on_img(panel_scene, gt, COLOR_GT)
+
+            # Panels 4-7: Prediction + Ghost GT
+            panels_preds = []
+            for j in range(4):
+                # Start with scene (numpy)
+                img_np = (panel_scene.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                img_np = np.ascontiguousarray(img_np)
+                
+                # Draw Ghost GT (Thinner, No Heading) - Shows context
+                self._draw_pose_cv2(img_np, gt, COLOR_GT, thickness=1, show_heading=False)
+                
+                # Draw Prediction (Bold, With Heading)
+                self._draw_pose_cv2(img_np, p_list[j], COLOR_PRED, thickness=2, show_heading=True)
+                
+                # Convert back AND MOVE TO DEVICE (Fixes the crash)
+                p_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float().to(panel_scene.device) / 255.0
+                panels_preds.append(p_tensor)
+
+            # --- STITCH GRID ---
+            # Row: Scene | Reach | GT | Pred1 | Pred2 | Pred3 | Pred4
+            row_tensors = [panel_scene, panel_reach, panel_gt] + panels_preds
+            row_stack = torch.stack(row_tensors)
+            
+            grid = torchvision.utils.make_grid(row_stack, nrow=7, padding=2, normalize=False)
+            
+            grid_np = grid.cpu().permute(1, 2, 0).numpy()
+            caption = f"Sample {i} | Scene | Reach | GT | Preds(Red) vs GT(Grn)"
+            log_dict[f'val_sample_{i}'] = wandb.Image(grid_np, caption=caption)
+
+        self.logger.experiment.log(log_dict)
+
+    def _draw_pose_cv2(self, img_np, pose_norm, color, thickness=2, alpha=1.0, show_heading=True):
         """
-        context = self._validation_context
-        target = self._validation_target
-
-        num_examples = min(8, context.size(0))
-        image_size = context.shape[-1]
-
-        # Log images if logger is available
-        if hasattr(self.logger, 'experiment'):
-            import wandb
-
-            def _to_display(x: torch.Tensor) -> torch.Tensor:
-                return torch.clamp((x + 1) / 2, 0, 1)
-
-            log_dict = {}
-            for i in range(num_examples):
-                ctx = context[i:i+1]  # (1, C, H, W)
-                gt_target = target[i:i+1]   # (1, 1, H, W) - ground truth target location
-                gt_location = _to_display(gt_target[0, 0:1])[0]
-
-                # Generate 4 predictions
-                with torch.no_grad():
-                    pred_1 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
-                    pred_2 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
-                    pred_3 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
-                    pred_4 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
-
-                if self.use_local:
-                    # Local mode channels: 0=static, 1=movable, 2=target_object, 3=robot_region, 4=goal_sample_region
-                    static = _to_display(ctx[0, 0:1])[0]
-                    movable = _to_display(ctx[0, 1:2])[0]
-                    target_obj = _to_display(ctx[0, 2:3])[0]
-                    robot_region = _to_display(ctx[0, 3:4])[0]
-                    goal_sample_region = _to_display(ctx[0, 4:5])[0]
-
-                    # Consistent colors: R=static/context, G=variable/pred, B=target_obj (always blue)
-
-                    # Image 1: Scene (R=static, G=movable, B=target_obj)
-                    img1 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img1[0, 0] = static
-                    img1[0, 1] = movable
-                    img1[0, 2] = target_obj
-
-                    # Image 2: Reachability (R=robot_region, G=goal_sample_region, B=target_obj)
-                    img2 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img2[0, 0] = robot_region
-                    img2[0, 1] = goal_sample_region
-                    img2[0, 2] = target_obj
-
-                    # Image 3: Ground truth (R=static, G=gt_location, B=target_obj)
-                    img3 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img3[0, 0] = static
-                    img3[0, 1] = gt_location
-                    img3[0, 2] = target_obj
-
-                    # Images 4-7: Predictions (R=static, G=prediction, B=target_obj)
-                    def make_pred_img(pred_loc):
-                        img = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                        img[0, 0] = static
-                        img[0, 1] = pred_loc
-                        img[0, 2] = target_obj
-                        return img
-
-                    caption = f"Epoch {self.current_epoch} | Scene(R=stat,G=mov,B=obj) | Reach(R=robot,G=goal,B=obj) | GT | Pred1-4"
-
-                else:
-                    # Global mode channels: 0=robot, 1=robot_goal, 2=movable, 3=static, 4=target_object
-                    robot = _to_display(ctx[0, 0:1])[0]
-                    robot_goal = _to_display(ctx[0, 1:2])[0]
-                    movable = _to_display(ctx[0, 2:3])[0]
-                    static = _to_display(ctx[0, 3:4])[0]
-                    target_obj = _to_display(ctx[0, 4:5])[0]
-
-                    # Image 1: Scene (robot=R, robot_goal=G, static+movable=B)
-                    img1 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img1[0, 0] = robot
-                    img1[0, 1] = robot_goal
-                    img1[0, 2] = torch.clamp(static + movable, 0, 1)
-
-                    # Image 2: Target object context (robot=R, robot_goal+target_obj=G, static+target_obj=B)
-                    img2 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img2[0, 0] = robot
-                    img2[0, 1] = torch.clamp(robot_goal + target_obj, 0, 1)
-                    img2[0, 2] = torch.clamp(static + target_obj, 0, 1)
-
-                    # Image 3: Ground truth (robot=R, robot_goal+gt_location=G, target_obj=B)
-                    img3 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img3[0, 0] = robot
-                    img3[0, 1] = torch.clamp(robot_goal + gt_location, 0, 1)
-                    img3[0, 2] = target_obj
-
-                    # Images 4-7: Predictions (robot=R, robot_goal+pred=G, static+target_obj=B)
-                    def make_pred_img(pred_loc):
-                        img = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                        img[0, 0] = robot
-                        img[0, 1] = torch.clamp(robot_goal + pred_loc, 0, 1)
-                        img[0, 2] = torch.clamp(static + target_obj, 0, 1)
-                        return img
-
-                    caption = f"Epoch {self.current_epoch} | Scene | TargetObj | GT | Pred1 | Pred2 | Pred3 | Pred4"
-
-                img4 = make_pred_img(pred_1)
-                img5 = make_pred_img(pred_2)
-                img6 = make_pred_img(pred_3)
-                img7 = make_pred_img(pred_4)
-
-                # Build row: scene | target_obj | ground_truth | pred1 | pred2 | pred3 | pred4
-                row = torch.cat([img1, img2, img3, img4, img5, img6, img7], dim=0)
-                grid = torchvision.utils.make_grid(row, nrow=7, normalize=True, padding=2)
-
-                # Convert to numpy and log
-                grid_np = grid.cpu().permute(1, 2, 0).numpy()
-                log_dict[f'val_sample_{i+1}'] = wandb.Image(grid_np, caption=caption)
-
-            self.logger.experiment.log(log_dict)
-
-    def sample(
-        self,
-        context: torch.Tensor,
-        num_samples: int = 1,
-        num_steps: int = 20,
-        show_progress: bool = False
-    ) -> torch.Tensor:
+        Draws translation (arrow) and orientation (heading line).
+        Includes a WHITE OUTLINE for contrast against blue/black/gray.
         """
-        Generate samples given context.
+        H, W, _ = img_np.shape
+        center_x, center_y = W // 2, H // 2
+        
+        # Scale: Normalized 1.0 -> Edge of image
+        # pose_norm is [-1, 1], so we multiply by W/2 to get pixels.
+        scale = W / 2.0
+        
+        # 1. Translation
+        dx = int(pose_norm[0].item() * scale)
+        dy = int(pose_norm[1].item() * scale)
+        end_x = max(0, min(W-1, center_x + dx))
+        end_y = max(0, min(H-1, center_y - dy)) # Flip Y for image coords
 
-        Args:
-            context: Context tensor, shape (B, C_context, H, W)
-            num_samples: Number of samples per context (currently must be 1)
-            num_steps: Number of sampling steps
-            show_progress: Whether to show progress bar
+        # 2. Heading (Whisker)
+        # Convert normalized theta back to raw radians for drawing
+        raw_theta = pose_norm[2].item() * self.theta_norm
+        
+        heading_len = 15 # pixels
+        head_dx = int(heading_len * math.cos(raw_theta))
+        head_dy = int(heading_len * math.sin(raw_theta)) 
+        
+        head_x = max(0, min(W-1, end_x + head_dx))
+        head_y = max(0, min(H-1, end_y - head_dy)) # Flip Y
 
-        Returns:
-            Generated samples, shape (B, C_target, H, W)
-        """
-        B, C, H, W = context.shape
+        # --- DRAWING ---
+        
+        # A. The Halo (White Outline) - Guarantees visibility
+        outline_color = (255, 255, 255)
+        outline_thick = thickness + 2
+        
+        # Arrow Shaft (Outline)
+        cv2.arrowedLine(img_np, (center_x, center_y), (end_x, end_y), outline_color, outline_thick, tipLength=0.2)
+        
+        if show_heading:
+            # Heading Whisker (Outline)
+            cv2.line(img_np, (end_x, end_y), (head_x, head_y), outline_color, outline_thick)
+            cv2.circle(img_np, (end_x, end_y), 4, outline_color, -1)
 
-        # Initialize from noise
-        x_init = torch.randn(B, self.target_channels, H, W, device=context.device)
+        # B. The Actual Color Line
+        
+        # Arrow Shaft (Color)
+        cv2.arrowedLine(img_np, (center_x, center_y), (end_x, end_y), color, thickness, tipLength=0.2)
+        
+        if show_heading:
+            # Heading Whisker (Color)
+            cv2.line(img_np, (end_x, end_y), (head_x, head_y), color, thickness)
+            cv2.circle(img_np, (end_x, end_y), 2, color, -1)
 
-        # Create model function that includes context
-        def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            model_input = torch.cat([context, x], dim=1)
-            return self(model_input, t)
-
-        # Sample using the configured sampler
-        return self.sampler.sample(
-            model=model_fn,
-            x_init=x_init,
-            num_steps=num_steps,
-            show_progress=show_progress
-        )
-
-    def sample_from_model(
-        self,
-        inp: torch.Tensor,
-        tgt_size: int = 1,
-        samples: int = 32,
-        num_steps: int = 20
-    ) -> torch.Tensor:
-        """
-        Sample generation interface for inference.
-
-        Args:
-            inp: Input context tensor (B, C_context, H, W)
-            tgt_size: Number of target channels (default 1 for goal-only)
-            samples: Number of samples to generate
-            num_steps: Number of sampling steps
-
-        Returns:
-            Generated samples, shape (samples, tgt_size, H, W)
-        """
-        # Repeat input for multiple samples
-        inp_repeated = inp.repeat(samples, 1, 1, 1)
-
-        # Initialize from different noise for each sample (enables diverse outputs)
-        x_init = torch.randn(samples, tgt_size, inp.shape[2], inp.shape[3], device=inp.device)
-
-        def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            model_input = torch.cat([inp_repeated, x], dim=1)
-            return self(model_input, t)
-
-        return self.sampler.sample(
-            model=model_fn,
-            x_init=x_init,
-            num_steps=num_steps,
-            show_progress=True
-        )
+    def sample_pose(self, context, num_samples=1, num_steps=20, denormalize=True, show_progress=False):
+        B = context.shape[0]
+        context_repeated = context.repeat_interleave(num_samples, dim=0)
+        total_samples = B * num_samples
+        x_init = torch.randn(total_samples, self.vector_dim, device=context.device)
+        def model_fn(x, t):
+            return self.network(x, t, context_repeated)
+        samples = self.sampler.sample(model_fn, x_init, num_steps, show_progress, device=context.device)
+        if denormalize: return self._denormalize_pose(samples)
+        return samples
 
     def configure_optimizers(self):
-        """Configure optimizer."""
-        optimizer = self.optimizer_partial(params=self.parameters())
-        return {
-            "optimizer": optimizer,
-            "gradient_clip_val": 1.0,
-        }
+        return self.optimizer_partial(params=self.parameters())

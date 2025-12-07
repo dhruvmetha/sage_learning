@@ -53,19 +53,29 @@ def main(cfg):
     if cfg.get("seed"):
         pl.seed_everything(cfg.seed)
 
-    # Print configuration summary
+# Print configuration summary
     print("=" * 60)
     print("Training Configuration")
     print("=" * 60)
     print(f"Model type: {cfg.model._target_}")
-    if hasattr(cfg.model, 'path'):
+    
+    # Safely check nested attributes
+    if 'path' in cfg.model and '_target_' in cfg.model.path:
         print(f"Path type: {cfg.model.path._target_}")
-    if hasattr(cfg.model, 'sampler'):
+    if 'sampler' in cfg.model and '_target_' in cfg.model.sampler:
         print(f"Sampler type: {cfg.model.sampler._target_}")
-    print(f"Batch size: {cfg.batch_size}")
-    print(f"Max epochs: {cfg.max_epochs}")
-    print(f"Learning rate: {cfg.base_lr}")
-    print(f"Image size: {cfg.image_size}")
+        
+    print(f"Batch size: {cfg.data.batch_size}")
+    print(f"Max epochs: {cfg.trainer.max_epochs}")
+    
+    # LR might be in model.optimizer.lr
+    lr = "Unknown"
+    if 'optimizer' in cfg.model and 'lr' in cfg.model.optimizer:
+        lr = cfg.model.optimizer.lr
+    print(f"Learning rate: {lr}")
+    
+    img_size = cfg.data.get('image_size', 224)
+    print(f"Image size: {img_size}")
     print("=" * 60)
 
     # Instantiate data module

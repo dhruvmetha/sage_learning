@@ -1,0 +1,57 @@
+defaults:
+  - _self_
+
+trainer:
+  _target_: lightning.pytorch.Trainer
+  max_epochs: 100
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  logger:
+    _target_: lightning.pytorch.loggers.WandbLogger
+    project: "sage_learning"
+    name: "flow_matching_test"
+
+model:
+  _target_: src.model.generative_module.UnifiedGenerativeModule
+  pose_stats_file: "${hydra:runtime.cwd}/config/dataset_stats.json"
+  crop_size_meters: 5.0
+  
+  # Network Injection
+  network:
+    _target_: src.model.networks.vector_denoiser.VectorDenoiserBackbone
+    vector_dim: 3
+    image_channels: 5
+    hidden_dim: 256
+    num_layers: 6
+  
+  # Logic Injection
+  path:
+    _target_: src.model.common.FlowMatchingPath
+    sigma_min: 1e-5
+  
+  sampler:
+    _target_: src.model.common.ODESampler
+    method: 'euler'
+  
+  # Optimizer Injection
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 3e-4
+    weight_decay: 1e-4
+
+  # Module Params
+  context_channels: 5
+  use_local: true
+  vector_dim: 3
+
+data:
+  _target_: src.data.mask_diffusion_data.MaskDiffusionDataModule
+  h5_file: "/common/users/shared/robot_learning/dm1487/namo/datasets/images/dec2/aug9_envs/1_push_train/h5/training_data.h5"
+  data_dir: null
+  batch_size: 32
+  num_workers: 4
+  use_local: true
+  image_size: 224
+  use_coord_grid: false
