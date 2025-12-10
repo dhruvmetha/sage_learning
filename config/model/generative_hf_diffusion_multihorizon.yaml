@@ -1,0 +1,55 @@
+# Multi-Horizon HuggingFace Diffusion Model Configuration
+# Predicts both goal_mask_a1 and goal_mask_a2 simultaneously
+#
+# Key differences from generative_hf_diffusion.yaml:
+# - in_ch: 9 (5 context + 2 coord_grid + 2 noisy_targets)
+# - out_ch: 2 (predict both goal masks)
+# - use_multihorizon: true (enables masked loss based on solution_depth)
+
+_target_: src.model.generative_module.GenerativeModule
+
+# Neural network backbone
+network:
+  _target_: src.model.dit.dit.DiT
+  img_size: ${image_size}
+  patch: 4
+  in_ch: 9      # 5 context (static,movable,tgt_obj,robot_region,goal_sample_region) + 2 coord_grid + 2 noisy_targets
+  out_ch: 2     # goal_mask_a1, goal_mask_a2
+  dim: 256
+  depth: 8
+  heads: 8
+
+# HuggingFace diffusion path
+path:
+  _target_: src.model.paths.hf_diffusion_path.HFDiffusionPath
+  num_train_timesteps: 1000
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+
+# HuggingFace DDIM sampler (deterministic, faster)
+sampler:
+  _target_: src.model.samplers.hf_diffusion_sampler.HFDiffusionSampler
+  sampler_type: ddim
+  num_train_timesteps: 1000
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+  eta: 0.0
+  clip_sample: false
+
+# Optimizer
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${base_lr}
+  weight_decay: 0.01
+
+# Auxiliary loss weight
+aux_loss_weight: 0.005
+
+# Channel configuration
+context_channels: 5
+target_channels: 2  # Now 2 channels for multi-horizon
+
+# Multi-horizon mode
+use_multihorizon: true  # Enables 2-channel target and masked loss
+use_local: true  # Multi-horizon always uses local masks

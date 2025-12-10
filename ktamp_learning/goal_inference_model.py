@@ -71,6 +71,11 @@ class GoalInferenceModel:
         if self.use_coord_grid:
             print(f"  Using coordinate grid (2 extra channels)")
 
+        # Check if model was trained with local (object-centered) masks
+        self.use_local = getattr(self.data_cfg, 'use_local', False)
+        if self.use_local:
+            print(f"  Using local (object-centered) masks")
+
         # Setup image transform
         self.transform = transforms.Compose([
             transforms.ToTensor(),
@@ -190,22 +195,30 @@ class GoalInferenceModel:
     def infer(self, json_message, xml_path, robot_goal, selected_object, samples=32):
         """
         Perform goal inference to get goal proposals.
-        
+
+        Automatically routes to the appropriate inference method based on whether
+        the model was trained with local (object-centered) or global masks.
+
         Args:
             json_message: Raw JSON message from planning system
             xml_path: Path to MuJoCo XML file for ImageConverter
             robot_goal: Robot goal position [x, y]
             selected_object: Name of the object to generate goals for
             samples: Number of samples to generate (default: 32)
-            
+
         Returns:
             List of goal dictionaries, each containing:
             - index: Sample index
-            - goal_center: [x, y] goal center in world coordinates
-            - final_quat: Quaternion for object rotation
+            - goal_center: [x, y] goal center in world coordinates (global only)
+            - final_quat: Quaternion for object rotation (global only)
             - x, y, theta: SE(2) pose components
             - goal_sample: Raw goal sample array
         """
+        # Auto-route to local inference if model was trained with use_local=True
+        if self.use_local:
+            return self._infer_local(json_message, xml_path, robot_goal, selected_object, samples)
+
+        # Global inference (original behavior)
         # Create ImageConverter and process data
         image_converter = ImageConverter(xml_path)
         inp_data = image_converter.process_datapoint(json_message, robot_goal)
@@ -296,6 +309,150 @@ class GoalInferenceModel:
                 'theta': goal_theta,
                 'goal_sample': goal_sample,
                 'input_channels': inp_for_goal  # Include input for visualization
+            })
+
+        return valid_goals
+
+    def _infer_local(self, json_message, xml_path, robot_goal, selected_object, samples=32):
+        """
+        Perform goal inference using local (object-centered) masks.
+
+        This is an internal method called by infer() when the model was trained
+        with use_local=True. It uses the same mask generation as training:
+        - 5 input channels: static, movable, target_object, robot_region, goal_sample_region
+        - All masks are cropped around the selected object (5m x 5m window)
+        - Predictions are converted from local pixel coordinates to world coordinates
+
+        Args:
+            json_message: Raw JSON message from planning system
+            xml_path: Path to MuJoCo XML file for ImageConverter
+            robot_goal: Robot goal position [x, y]
+            selected_object: Name of the object to generate goals for
+            samples: Number of samples to generate (default: 32)
+
+        Returns:
+            List of goal dictionaries, each containing:
+            - index: Sample index
+            - x, y, theta: SE(2) pose in world coordinates
+            - goal_sample: Raw goal sample array
+            - input_channels: Input tensor for visualization
+        """
+        # Create ImageConverter and generate local masks
+        image_converter = ImageConverter(xml_path)
+        local_data = image_converter.create_local_masks(
+            data_point=json_message,
+            selected_object=selected_object,
+            robot_goal_pos=robot_goal,
+            region_goals_sampled=None,  # Will use robot_goal as fallback
+            crop_size_meters=5.0,
+            highres_size=1024,
+            output_size=224
+        )
+
+        # Check if local masks were generated successfully
+        if 'local_static' not in local_data:
+            raise ValueError(f"Failed to generate local masks for object '{selected_object}'")
+
+        # Stack input channels in TRAINING ORDER:
+        # static, movable, target_object, robot_region, goal_sample_region
+        input_channels = [
+            local_data['local_static'],
+            local_data['local_movable'],
+            local_data['local_target_object'],
+            local_data['local_robot_region'],
+            local_data['local_goal_sample_region'],
+        ]
+
+        # Add coordinate grid if model was trained with it
+        if self.use_coord_grid:
+            orig_size = local_data['local_static'].shape[0]
+            ys, xs = np.meshgrid(np.linspace(0, 1, orig_size),
+                                 np.linspace(0, 1, orig_size),
+                                 indexing='ij')
+            coord_grid = np.stack([xs, ys], axis=-1).astype(np.float32)
+            input_channels.append(coord_grid)
+
+        # Concatenate and transform
+        inp_for_goal = np.concatenate(input_channels, axis=-1)
+        inp_for_goal = self.transform(inp_for_goal).unsqueeze(0).to(self.device)
+
+        # Generate goal samples
+        num_steps = self.num_steps if self.num_steps is not None else 20
+        with torch.no_grad():
+            goal_samples = (self.model.sample_from_model(inp_for_goal, samples=samples, num_steps=num_steps)
+                          .permute(0, 2, 3, 1).cpu().numpy() + 1) / 2
+
+        inp_for_goal_np = inp_for_goal.cpu().squeeze(0).numpy()
+
+        # Get metadata for coordinate conversion
+        object_center = local_data['object_center']
+        object_theta = local_data['object_theta']
+        crop_size = local_data['crop_size_meters']
+
+        # Get object angle from input mask for rotation calculation
+        # IMPORTANT: local_data masks are 224x224, but model operates on 64x64
+        # We need to resize the mask to match the model's output size
+        obj_mask_224 = local_data['local_target_object'][:, :, 0]
+        obj_mask_resized = cv2.resize(obj_mask_224, (self.data_cfg.image_size, self.data_cfg.image_size),
+                                       interpolation=cv2.INTER_AREA)
+        obj_mask = (obj_mask_resized > 0.5).astype(np.uint8)
+        _, _, obj_mask_center, obj_angle = find_rectangle_corners(obj_mask)
+        if obj_angle is None:
+            obj_angle = 0.0
+
+        # Process goal samples and extract SE(2) poses
+        valid_goals = []
+
+        for i, goal_sample in enumerate(goal_samples):
+            goal_mask = (goal_sample[:, :, 0].copy() > 0.5) * 1.0
+            goal_mask = goal_mask.astype(np.uint8)
+
+            # Skip if multiple disconnected regions (invalid prediction)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(goal_mask)
+            if num_labels > 2:
+                continue
+
+            # Find predicted goal center and angle
+            _, _, predicted_goal_center, goal_angle = find_rectangle_corners(goal_mask)
+            if predicted_goal_center is None:
+                continue
+
+            # Convert LOCAL pixel to world coordinates
+            # Note: predicted_goal_center is in model output space (data_cfg.image_size, e.g. 64x64)
+            world_x, world_y = image_converter.pixel_to_world_local(
+                px=predicted_goal_center[0],
+                py=predicted_goal_center[1],
+                object_center=object_center,
+                crop_size_meters=crop_size,
+                output_size=self.data_cfg.image_size  # Use model's image size, not 224!
+            )
+
+            # Compute theta from angle difference
+            # goal_angle and obj_angle are in degrees from find_rectangle_corners
+            angle_diff_deg = goal_angle - obj_angle if goal_angle is not None else 0.0
+
+            # Handle 180° ambiguity: rectangles look identical when rotated 180°
+            # Normalize angle_diff to [-90, 90] range
+            if angle_diff_deg > 90:
+                angle_diff_deg -= 180
+            elif angle_diff_deg < -90:
+                angle_diff_deg += 180
+
+            goal_theta = object_theta + np.radians(angle_diff_deg)
+
+            # Normalize theta to [-pi, pi]
+            while goal_theta > np.pi:
+                goal_theta -= 2 * np.pi
+            while goal_theta < -np.pi:
+                goal_theta += 2 * np.pi
+
+            valid_goals.append({
+                'index': i,
+                'x': world_x,
+                'y': world_y,
+                'theta': goal_theta,
+                'goal_sample': goal_sample,
+                'input_channels': inp_for_goal_np
             })
 
         return valid_goals
