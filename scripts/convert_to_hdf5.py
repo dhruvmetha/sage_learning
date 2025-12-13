@@ -40,6 +40,8 @@ MINIMAL_KEYS = [
     'local_robot_region',
     'local_goal_sample_region',
     'target_goal_pose_deltas_obj',
+    # Object pose metadata (needed for visualization)
+    'local_object_theta',
     # Metadata needed for training
     'xml_file',
 ]

@@ -55,3 +55,4 @@ data:
   use_local: true
   image_size: 224
   use_coord_grid: false
+  train_split: 0.9

@@ -45,6 +45,15 @@ class MaskDiffusionDataset(Dataset):
                 # Target Vector: (dx, dy, dtheta) in OBJECT frame
                 # Shape in file is usually (1, 3), we want (3,)
                 ret['target_goal'] = data['target_goal_pose_deltas_obj'][0]
+                # local_target_goal is already (224, 224), no indexing needed
+                ret['target_goal_mask'] = data['local_target_goal']
+                
+                # Object theta (orientation) - needed for visualization
+                # This is the current object's theta in world frame
+                if 'local_object_theta' in data:
+                    ret['object_theta'] = data['local_object_theta'][0]  # Shape (1,) -> scalar
+                else:
+                    ret['object_theta'] = np.float32(0.0)  # Fallback
 
             else:
                 # -----------------------------------------------------------
@@ -56,6 +65,8 @@ class MaskDiffusionDataset(Dataset):
                 ret['static'] = data['static_objects_image'] if 'static_objects_image' in data else data['static']
                 ret['target_object'] = data['target_object']
                 ret['target_goal'] = data['target_goal_pose_deltas_world'][0]
+                # target_goal mask is already (224, 224), no indexing needed
+                ret['target_goal_mask'] = data['target_goal']
 
             # -----------------------------------------------------------
             # Coordinate Grid (Optional)
@@ -78,6 +89,9 @@ class MaskDiffusionDataset(Dataset):
                     if k == "target_goal":
                         # Vectors: Just tensorify, don't image-transform
                         ret[k] = torch.tensor(v, dtype=torch.float32)
+                    elif k == "object_theta":
+                        # Scalar: Just tensorify
+                        ret[k] = torch.tensor(v, dtype=torch.float32)
                     else:
                         # Images: Apply transform (Resize, ToTensor, Normalize)
                         ret[k] = self.transform(v)
@@ -85,6 +99,8 @@ class MaskDiffusionDataset(Dataset):
                 # Minimal conversion if no transform provided
                 if not isinstance(ret['target_goal'], torch.Tensor):
                      ret['target_goal'] = torch.tensor(ret['target_goal'], dtype=torch.float32)
+                if 'object_theta' in ret and not isinstance(ret['object_theta'], torch.Tensor):
+                     ret['object_theta'] = torch.tensor(ret['object_theta'], dtype=torch.float32)
 
             return ret
 
@@ -130,6 +146,14 @@ class MaskDiffusionHDF5Dataset(Dataset):
             ret['robot_region'] = h5f['local_robot_region'][real_idx]
             ret['goal_sample_region'] = h5f['local_goal_sample_region'][real_idx]
             ret['target_goal'] = h5f['target_goal_pose_deltas_obj'][real_idx][0]
+            # local_target_goal is already (224, 224) per sample, no extra indexing needed
+            ret['target_goal_mask'] = h5f['local_target_goal'][real_idx]
+            
+            # Object theta (orientation) - needed for visualization
+            if 'local_object_theta' in h5f:
+                ret['object_theta'] = h5f['local_object_theta'][real_idx][0]  # Shape (1,) -> scalar
+            else:
+                ret['object_theta'] = np.float32(0.0)  # Fallback
         else:
             # Global Key Access
             ret['robot'] = h5f['robot_image'][real_idx]
@@ -138,6 +162,8 @@ class MaskDiffusionHDF5Dataset(Dataset):
             ret['static'] = h5f['static_objects_image'][real_idx]
             ret['target_object'] = h5f['target_object'][real_idx]
             ret['target_goal'] = h5f['target_goal_pose_deltas_world'][real_idx][0]
+            # target_goal mask is already (224, 224) per sample, no extra indexing needed
+            ret['target_goal_mask'] = h5f['target_goal'][real_idx]
 
         # Coordinate Grid
         if self.use_coord_grid:
@@ -153,11 +179,16 @@ class MaskDiffusionHDF5Dataset(Dataset):
             for k, v in ret.items():
                 if k == "target_goal":
                     ret[k] = torch.tensor(v, dtype=torch.float32)
+                elif k == "object_theta":
+                    # Scalar: Just tensorify
+                    ret[k] = torch.tensor(v, dtype=torch.float32)
                 else:
                     ret[k] = self.transform(v)
         else:
              if not isinstance(ret['target_goal'], torch.Tensor):
                  ret['target_goal'] = torch.tensor(ret['target_goal'], dtype=torch.float32)
+             if 'object_theta' in ret and not isinstance(ret['object_theta'], torch.Tensor):
+                 ret['object_theta'] = torch.tensor(ret['object_theta'], dtype=torch.float32)
         
         return ret
     
