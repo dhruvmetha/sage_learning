@@ -17,9 +17,9 @@
 #   python src/train_generative.py --config-name=train_hf_diffusion ckpt_path=/path/to/checkpoint.ckpt
 
 # Experiment name (used in output path)
-name: diffusion_2push
+name: diffusion_corrected_overlaps
 output_dir: /common/users/dm1487/namo_data/outputs/${name}
-data_dir: /common/users/dm1487/namo_data/h5_files/dec2/aug9_envs/2_push_train
+data_dir:  /common/users/dm1487/namo_data/h5_files/dec2/aug9_envs/1_push_train_corrected_overlaps
 
 # Resume from checkpoint (set to path to resume training, null to start fresh)
 ckpt_path: null

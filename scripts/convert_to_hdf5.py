@@ -26,6 +26,42 @@ def get_npz_keys(sample_file: str) -> list:
         return list(data.keys())
 
 
+def find_file_with_max_keys(npz_files: list, target_keys: list = None, sample_size: int = 100) -> str:
+    """Find an NPZ file that has the most keys (or all target keys).
+
+    For multi-horizon data, step_0 files have more goal masks than step_1 files.
+    This ensures we find a file with the full schema.
+
+    Args:
+        npz_files: List of NPZ file paths
+        target_keys: Optional list of keys we want to find
+        sample_size: Number of files to sample
+
+    Returns:
+        Path to NPZ file with most keys
+    """
+    # First, try to find a step_0 file (these have all goal horizons)
+    for f in npz_files[:sample_size]:
+        if '_step_0.' in f or '_step_0_' in f:
+            keys = get_npz_keys(f)
+            if target_keys is None or all(k in keys for k in target_keys if 'goal_mask' not in k):
+                return f
+
+    # Fallback: sample files and find one with most keys
+    best_file = npz_files[0]
+    best_key_count = 0
+
+    sample_indices = np.linspace(0, len(npz_files) - 1, min(sample_size, len(npz_files)), dtype=int)
+    for idx in sample_indices:
+        f = npz_files[idx]
+        keys = get_npz_keys(f)
+        if len(keys) > best_key_count:
+            best_key_count = len(keys)
+            best_file = f
+
+    return best_file
+
+
 def is_string_dtype(dtype) -> bool:
     """Check if dtype is a string type."""
     return dtype.kind in ('U', 'S', 'O')  # Unicode, byte string, or object
@@ -69,15 +105,22 @@ def convert_npz_to_hdf5(input_dir: str, output_file: str, compression: str = "gz
     if n_samples == 0:
         raise ValueError(f"No NPZ files found in {input_dir}")
 
-    # Get keys and shapes from first file
+    # Find a representative file with all keys (important for multi-horizon data)
     print("Analyzing data structure...")
-    keys = get_npz_keys(npz_files[0])
-    print(f"Keys found in NPZ: {keys}")
-
-    # Filter keys if minimal mode
     if minimal:
-        keys = [k for k in keys if k in MINIMAL_KEYS]
+        # In minimal mode, use MINIMAL_KEYS and find a file that has them
+        sample_file = find_file_with_max_keys(npz_files, target_keys=MINIMAL_KEYS)
+        print(f"Using sample file: {sample_file}")
+        available_keys = get_npz_keys(sample_file)
+        print(f"Keys in sample file: {available_keys}")
+        # Use MINIMAL_KEYS but only if they exist in at least one file
+        keys = [k for k in MINIMAL_KEYS if k in available_keys]
         print(f"Minimal mode: keeping only {keys}")
+    else:
+        sample_file = find_file_with_max_keys(npz_files)
+        print(f"Using sample file: {sample_file}")
+        keys = get_npz_keys(sample_file)
+        print(f"Keys found in NPZ: {keys}")
 
     # Get shapes for each key, separate string vs numeric fields
     shapes = {}
@@ -85,7 +128,7 @@ def convert_npz_to_hdf5(input_dir: str, output_file: str, compression: str = "gz
     string_keys = []
     numeric_keys = []
 
-    with np.load(npz_files[0]) as data:
+    with np.load(sample_file) as data:
         for key in keys:
             arr = data[key]
             shapes[key] = arr.shape
