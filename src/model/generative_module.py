@@ -67,6 +67,9 @@ class GenerativeModule(pl.LightningModule):
         target_channels: int = 1,
         use_local: bool = False,
         use_multihorizon: bool = False,
+        warmup_steps: int = 0,
+        decay_steps: int = 0,
+        end_lr: float = 0.0,
     ):
         super().__init__()
 
@@ -80,6 +83,11 @@ class GenerativeModule(pl.LightningModule):
         self.target_channels = target_channels
         self.use_local = use_local
         self.use_multihorizon = use_multihorizon
+
+        # LR schedule parameters
+        self.warmup_steps = warmup_steps
+        self.decay_steps = decay_steps
+        self.end_lr = end_lr
 
         # Loss function
         self.criterion = nn.MSELoss(reduction='none')  # Use 'none' for masked loss support
@@ -625,9 +633,43 @@ class GenerativeModule(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        """Configure optimizer."""
+        """Configure optimizer and LR scheduler."""
         optimizer = self.optimizer_partial(params=self.parameters())
+
+        # If no scheduler params, return optimizer only
+        if self.warmup_steps == 0 and self.decay_steps == 0:
+            return {
+                "optimizer": optimizer,
+                "gradient_clip_val": 1.0,
+            }
+
+        # Get base LR from optimizer
+        base_lr = optimizer.param_groups[0]["lr"]
+
+        def lr_lambda(step):
+            # Warmup phase
+            if step < self.warmup_steps:
+                return step / max(1, self.warmup_steps)
+
+            # Decay phase (cosine decay from base_lr to end_lr)
+            if self.decay_steps > 0:
+                decay_progress = min(1.0, (step - self.warmup_steps) / self.decay_steps)
+                # Cosine decay
+                lr_mult = self.end_lr / base_lr + (1 - self.end_lr / base_lr) * 0.5 * (
+                    1 + torch.cos(torch.tensor(decay_progress * 3.14159)).item()
+                )
+                return lr_mult
+
+            return 1.0
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
         return {
             "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
             "gradient_clip_val": 1.0,
         }

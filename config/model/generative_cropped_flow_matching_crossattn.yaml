@@ -1,0 +1,51 @@
+# Cropped Flow Matching Model with Cross-Attention Conditioning
+# Uses Facebook's flow_matching library + cross-attention for context
+# Install: pip install flow-matching torchdyn
+#
+# Key differences from generative_cropped_flow_matching.yaml:
+# - Context is encoded to spatial features (not pooled)
+# - Transformer uses cross-attention to attend to context features
+
+_target_: src.model.generative_module_cropped.GenerativeModuleCropped
+
+# Neural network backbone (DiTCroppedCrossAttn)
+network:
+  _target_: src.model.dit.dit_cropped_crossattn.DiTCroppedCrossAttn
+  crop_size: ${crop_size}
+  context_size: ${context_size}
+  patch: 4
+  in_ch: 1            # noisy target only
+  context_channels: 5  # static, movable, target_object, robot_region, goal_sample_region
+  out_ch: 1           # target_goal
+  dim: 256
+  depth: 8
+  heads: 8
+
+# Facebook's flow matching path (Conditional OT)
+path:
+  _target_: src.model.paths.fb_flow_matching_path.FBFlowMatchingPath
+  scheduler: condot
+  sigma_min: 0.0
+
+# Facebook's ODE sampler for inference
+sampler:
+  _target_: src.model.samplers.fb_ode_sampler.FBODESampler
+  method: midpoint  # or 'dopri5' for adaptive
+  atol: 1e-5
+  rtol: 1e-5
+
+# Optimizer
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${base_lr}
+  weight_decay: 0.01
+
+# Size configuration
+context_size: ${context_size}
+crop_size: ${crop_size}
+
+# LR schedule
+warmup_steps: ${warmup_steps}
+decay_steps: ${decay_steps}
+end_lr: ${end_lr}

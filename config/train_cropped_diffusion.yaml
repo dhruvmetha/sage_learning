@@ -1,25 +1,28 @@
-# Training Configuration for HuggingFace Diffusion
+# Training Configuration for Cropped HuggingFace Diffusion
 # Uses HuggingFace's diffusers library for DDPM/DDIM
 #
 # Install dependencies:
 #   pip install diffusers
 #
 # Usage:
-#   python src/train_generative.py --config-name=train_hf_diffusion
+#   python src/train_generative.py --config-name=train_cropped_diffusion
 #
 # For DDPM (stochastic) instead of DDIM:
-#   python src/train_generative.py --config-name=train_hf_diffusion model.sampler.sampler_type=ddpm
+#   python src/train_generative.py --config-name=train_cropped_diffusion model.sampler.sampler_type=ddpm
 #
 # For fewer inference steps (DDIM can handle 20-50 steps):
-#   python src/train_generative.py --config-name=train_hf_diffusion sampling_steps=50
+#   python src/train_generative.py --config-name=train_cropped_diffusion sampling_steps=50
 #
 # Resume training from a checkpoint:
-#   python src/train_generative.py --config-name=train_hf_diffusion ckpt_path=/path/to/checkpoint.ckpt
+#   python src/train_generative.py --config-name=train_cropped_diffusion ckpt_path=/path/to/checkpoint.ckpt
+#
+# Override sizes:
+#   python src/train_generative.py --config-name=train_cropped_diffusion crop_size=32
 
 # Experiment name (used in output path)
-name: diffusion_corrected_overlaps
+name: cropped_diffusion
 output_dir: /common/users/dm1487/namo_data/outputs/${name}
-data_dir:  /common/users/dm1487/namo_data/h5_files/dec2/aug9_envs/1_push_train_corrected_overlaps
+data_dir: /common/users/dm1487/namo_data/h5_files/dec2/aug9_envs/1_push_train_corrected_overlaps
 
 # Resume from checkpoint (set to path to resume training, null to start fresh)
 ckpt_path: null
@@ -34,8 +37,8 @@ hydra:
 
 defaults:
   - _self_
-  - data: mask_diffusion_data
-  - model: generative_hf_diffusion
+  - data: mask_diffusion_data_cropped
+  - model: generative_cropped_diffusion
   - trainer: multi_gpu
   - callbacks: default
 
@@ -58,19 +61,9 @@ end_lr: 0.000001
 warmup_steps: 1000
 decay_steps: 300000
 
-# Image size
-image_size: 64
-
-# Geometry conditioning: adds learned CNN encoder to extract geometric features
-# from context channels and combines with time embedding via AdaLN
-use_geometry_conditioning: false
-
-# Number of context channels for the network
-context_channels: 5
-
-# Use local (object-centered) masks instead of global
-# This controls both data loading and model context building
-use_local: true
+# Size configuration (replaces image_size for cropped model)
+context_size: 64  # Full context for geometry encoder
+crop_size: 24     # Center crop for target prediction
 
 # GPU (for legacy compatibility)
 gpu_id: 0

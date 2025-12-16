@@ -65,7 +65,13 @@ def main(cfg):
     print(f"Batch size: {cfg.batch_size}")
     print(f"Max epochs: {cfg.max_epochs}")
     print(f"Learning rate: {cfg.base_lr}")
-    print(f"Image size: {cfg.image_size}")
+    # Handle both regular (image_size) and cropped (context_size/crop_size) configs
+    if hasattr(cfg, 'image_size'):
+        print(f"Image size: {cfg.image_size}")
+    if hasattr(cfg, 'context_size'):
+        print(f"Context size: {cfg.context_size}")
+    if hasattr(cfg, 'crop_size'):
+        print(f"Crop size: {cfg.crop_size}")
     print("=" * 60)
 
     # Instantiate data module

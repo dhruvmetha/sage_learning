@@ -1,20 +1,22 @@
-# Multi-Horizon HuggingFace Diffusion Model Configuration
+# Cropped HuggingFace Diffusion Model with Cross-Attention - Multi-Horizon
 # Predicts both goal_mask_a1 and goal_mask_a2 simultaneously
 #
-# Key differences from generative_hf_diffusion.yaml:
-# - in_ch: 9 (5 context + 2 coord_grid + 2 noisy_targets)
+# Key differences from generative_cropped_diffusion_crossattn.yaml:
+# - in_ch: 2 (2 noisy targets instead of 1)
 # - out_ch: 2 (predict both goal masks)
 # - use_multihorizon: true (enables masked loss based on solution_depth)
 
-_target_: src.model.generative_module.GenerativeModule
+_target_: src.model.generative_module_cropped.GenerativeModuleCropped
 
-# Neural network backbone
+# Neural network backbone (DiTCroppedCrossAttn)
 network:
-  _target_: src.model.dit.dit.DiT
-  img_size: ${image_size}
+  _target_: src.model.dit.dit_cropped_crossattn.DiTCroppedCrossAttn
+  crop_size: ${crop_size}
+  context_size: ${context_size}
   patch: 4
-  in_ch: 9      # 5 context (static,movable,tgt_obj,robot_region,goal_sample_region) + 2 coord_grid + 2 noisy_targets
-  out_ch: 2     # goal_mask_a1, goal_mask_a2
+  in_ch: 2             # 2 noisy targets (a1 and a2)
+  context_channels: 5  # static, movable, target_object, robot_region, goal_sample_region
+  out_ch: 2            # target_goal_a1, target_goal_a2
   dim: 256
   depth: 8
   heads: 8
@@ -43,16 +45,13 @@ optimizer:
   lr: ${base_lr}
   weight_decay: 0.01
 
-# Auxiliary loss weight
-aux_loss_weight: 0.005
-
-# Channel configuration
-context_channels: 5
-target_channels: 2  # Now 2 channels for multi-horizon
+# Size configuration
+context_size: ${context_size}
+crop_size: ${crop_size}
 
 # Multi-horizon mode
-use_multihorizon: true  # Enables 2-channel target and masked loss
-use_local: true  # Multi-horizon always uses local masks
+use_multihorizon: true
+target_channels: 2
 
 # LR schedule
 warmup_steps: ${warmup_steps}

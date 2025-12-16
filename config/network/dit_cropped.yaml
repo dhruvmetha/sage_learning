@@ -1,0 +1,31 @@
+# DiT Cropped Network Configuration
+# Predicts 24x24 crop centered on target, conditioned on full 64x64 context
+
+_target_: src.model.dit.dit_cropped.DiTCropped
+
+# Cropped output size (center crop of target)
+crop_size: ${crop_size}
+
+# Full context size
+context_size: ${context_size}
+
+# Patch size for tokenization
+patch: 4
+
+# Input channels for noisy target (just the target being denoised)
+in_ch: 1
+
+# Context channels (static, movable, target_object, robot_region, goal_sample_region)
+context_channels: 5
+
+# Output channels
+out_ch: 1
+
+# Model dimension
+dim: 256
+
+# Number of transformer blocks
+depth: 8
+
+# Number of attention heads
+heads: 8

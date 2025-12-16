@@ -1,20 +1,21 @@
-# Multi-Horizon HuggingFace Diffusion Model Configuration
-# Predicts both goal_mask_a1 and goal_mask_a2 simultaneously
+# HuggingFace Diffusion Model with Cross-Attention Conditioning
+# Uses cross-attention instead of AdaLN for context conditioning
 #
 # Key differences from generative_hf_diffusion.yaml:
-# - in_ch: 9 (5 context + 2 coord_grid + 2 noisy_targets)
-# - out_ch: 2 (predict both goal masks)
-# - use_multihorizon: true (enables masked loss based on solution_depth)
+# - Context channels are extracted and encoded separately
+# - Transformer uses cross-attention to attend to context features
+# - Only coord_grid + noisy_target go through the main transformer
 
 _target_: src.model.generative_module.GenerativeModule
 
-# Neural network backbone
+# Neural network backbone (DiTCrossAttn)
 network:
-  _target_: src.model.dit.dit.DiT
+  _target_: src.model.dit.dit_crossattn.DiTCrossAttn
   img_size: ${image_size}
   patch: 4
-  in_ch: 9      # 5 context (static,movable,tgt_obj,robot_region,goal_sample_region) + 2 coord_grid + 2 noisy_targets
-  out_ch: 2     # goal_mask_a1, goal_mask_a2
+  in_ch: 8      # 5 context + 2 coord_grid + 1 noisy_target
+  context_channels: ${context_channels}
+  out_ch: 1     # target_goal
   dim: 256
   depth: 8
   heads: 8
@@ -47,12 +48,11 @@ optimizer:
 aux_loss_weight: 0.005
 
 # Channel configuration
-context_channels: 5
-target_channels: 2  # Now 2 channels for multi-horizon
+context_channels: ${context_channels}
+target_channels: 1
 
-# Multi-horizon mode
-use_multihorizon: true  # Enables 2-channel target and masked loss
-use_local: true  # Multi-horizon always uses local masks
+# Use local (object-centered) masks instead of global
+use_local: ${use_local}
 
 # LR schedule
 warmup_steps: ${warmup_steps}
