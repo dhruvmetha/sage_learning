@@ -270,6 +270,7 @@ class MultiHorizonDataModule(pl.LightningDataModule):
         pin_memory: bool = True,
         use_coord_grid: bool = False,
         train_split: float = 0.9,
+        use_h5: bool = True,
     ):
         super().__init__()
 
@@ -280,6 +281,7 @@ class MultiHorizonDataModule(pl.LightningDataModule):
         self.image_size = image_size
         self.use_coord_grid = use_coord_grid
         self.train_split = train_split
+        self.use_h5 = use_h5
 
         self.train_dataset = None
         self.val_dataset = None
@@ -357,7 +359,7 @@ class MultiHorizonDataModule(pl.LightningDataModule):
         print(f"[MultiHorizon] Starting setup with stage={stage}")
         print(f"[MultiHorizon] Data dir: {self.data_dir}")
 
-        h5_path = self._find_h5_file()
+        h5_path = self._find_h5_file() if self.use_h5 else None
 
         transform = transforms.Compose([
             transforms.ToTensor(),

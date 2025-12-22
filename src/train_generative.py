@@ -88,6 +88,12 @@ def main(cfg):
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
+    # Compile model for faster training (PyTorch 2.0+)
+    # Note: Disabled by default due to DDP compatibility issues
+    if cfg.get("compile_model", False):
+        print("Compiling model with torch.compile()...")
+        model = torch.compile(model)
+
     # Optionally load from a previous run (for fine-tuning)
     if cfg.get("run_path", None) is not None:
         run_path = Path(cfg.run_path)

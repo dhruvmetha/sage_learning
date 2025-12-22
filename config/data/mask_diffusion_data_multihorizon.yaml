@@ -9,3 +9,4 @@ pin_memory: true
 image_size: ${image_size}
 use_coord_grid: true
 train_split: 0.9
+use_h5: ${use_h5}

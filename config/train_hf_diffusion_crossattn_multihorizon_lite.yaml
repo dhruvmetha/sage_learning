@@ -1,0 +1,62 @@
+# Training Configuration for HuggingFace Diffusion with Cross-Attention - Multi-Horizon (LITE)
+# Lighter model for faster training on 64x64 mask prediction
+#
+# Usage:
+#   python src/train_generative.py --config-name=train_hf_diffusion_crossattn_multihorizon_lite
+
+# Experiment name (used in output path)
+name: hf_diffusion_crossattn_multihorizon_lite
+output_dir: /common/users/dm1487/namo_data/outputs/${name}
+data_dir: /common/users/dm1487/namo_data/h5_files/dec2/aug9_envs/2_push_train_corrected_overlaps_2
+
+# Resume from checkpoint (set to path to resume training, null to start fresh)
+ckpt_path: null
+
+# Hydra output directory structure
+hydra:
+  run:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+defaults:
+  - _self_
+  - data: mask_diffusion_data_multihorizon
+  - model: generative_hf_diffusion_crossattn_multihorizon_lite
+  - trainer: multi_gpu
+  - callbacks: default
+
+# Random seed
+seed: 42
+
+# Data loading
+num_workers: 0
+batch_size: 256
+
+# Training
+max_epochs: 1000
+check_val_every_n_epoch: 1
+
+# Learning rate schedule
+base_lr: 0.0004
+end_lr: 0.000001
+warmup_steps: 1000
+decay_steps: 300000
+
+# Image and channel configuration
+image_size: 64
+context_channels: 5
+
+# Data format (set to false to force NPZ even if H5 exists)
+use_h5: true
+
+# GPU (for legacy compatibility)
+gpu_id: 0
+
+# Sampling steps for inference (20 for faster validation)
+sampling_steps: 20
+
+# Paths
+paths:
+  output_dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}

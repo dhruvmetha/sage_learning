@@ -1,0 +1,60 @@
+# HuggingFace Diffusion Model with Cross-Attention (LITE)
+# Lighter model for 64x64 mask prediction - single horizon
+#
+# Changes from full version:
+# - num_train_timesteps: 1000 -> 500
+# - depth: 8 -> 6
+# - dim: 256 -> 192
+
+_target_: src.model.generative_module.GenerativeModule
+
+# Neural network backbone (DiTCrossAttn) - LITE
+network:
+  _target_: src.model.dit.dit_crossattn.DiTCrossAttn
+  img_size: ${image_size}
+  patch: 4
+  in_ch: 8      # 5 context + 2 coord_grid + 1 noisy_target
+  context_channels: ${context_channels}
+  out_ch: 1     # target_goal
+  dim: 128      # reduced from 256
+  depth: 2      # reduced from 8
+  heads: 2      # reduced from 8
+
+# HuggingFace diffusion path - fewer timesteps
+path:
+  _target_: src.model.paths.hf_diffusion_path.HFDiffusionPath
+  num_train_timesteps: 100  # reduced from 1000
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+
+# HuggingFace DDIM sampler
+sampler:
+  _target_: src.model.samplers.hf_diffusion_sampler.HFDiffusionSampler
+  sampler_type: ddim
+  num_train_timesteps: 100  # must match path
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+  eta: 0.0
+  clip_sample: false
+
+# Optimizer
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${base_lr}
+  weight_decay: 0.01
+
+# Auxiliary loss weight
+aux_loss_weight: 0.005
+
+# Channel configuration
+context_channels: ${context_channels}
+target_channels: 1
+
+# Use local (object-centered) masks instead of global
+use_local: ${use_local}
+
+# LR schedule
+warmup_steps: ${warmup_steps}
+decay_steps: ${decay_steps}
+end_lr: ${end_lr}

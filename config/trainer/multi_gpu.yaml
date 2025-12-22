@@ -38,7 +38,7 @@ gradient_clip_algorithm: norm
 check_val_every_n_epoch: ${check_val_every_n_epoch}
 
 # Logging (reduce frequency for multi-GPU to avoid log spam)
-log_every_n_steps: 10
+log_every_n_steps: 50
 enable_progress_bar: true
 
 # Sanity check before training

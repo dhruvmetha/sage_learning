@@ -327,6 +327,7 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         use_coord_grid: bool = False,
         use_local: bool = False,
         train_split: float = 1, # already separated testing data
+        use_h5: bool = True,
     ):
         super().__init__()
 
@@ -338,6 +339,7 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         self.use_coord_grid = use_coord_grid
         self.use_local = use_local
         self.train_split = train_split
+        self.use_h5 = use_h5
 
         self.train_dataset = None
         self.val_dataset = None
@@ -435,7 +437,7 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         print(f"[setup] Data dir: {self.data_dir}")
 
         # Check for HDF5 file first (much faster for large datasets)
-        h5_path = self._find_h5_file()
+        h5_path = self._find_h5_file() if self.use_h5 else None
 
         transform = transforms.Compose([
             transforms.ToTensor(),

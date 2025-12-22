@@ -60,26 +60,33 @@ class GoalInferenceModel:
         if sampler_method is not None:
             self._override_sampler(sampler_method)
 
-        print(f"✅ Goal model loaded successfully: {type(self.model).__name__}")
-        print(f"  Sampler: {type(self.model.sampler).__name__} (method: {self._get_sampler_method()})")
+        # Model loaded - sampler: {type(self.model.sampler).__name__} (method: {self._get_sampler_method()})
         
         # Use data config
         self.data_cfg = self.cfg.data
 
         # Check if model was trained with coord_grid
         self.use_coord_grid = getattr(self.data_cfg, 'use_coord_grid', False)
-        if self.use_coord_grid:
-            print(f"  Using coordinate grid (2 extra channels)")
 
         # Check if model was trained with local (object-centered) masks
-        self.use_local = getattr(self.data_cfg, 'use_local', False)
-        if self.use_local:
-            print(f"  Using local (object-centered) masks")
+        # Default to True since all recent models use local masks
+        self.use_local = getattr(self.data_cfg, 'use_local', True)
 
-        # Setup image transform
+        # Get image/context size - support both naming conventions
+        # - image_size: used by older models
+        # - context_size: used by newer cropped output models
+        self.context_size = getattr(self.data_cfg, 'context_size',
+                                    getattr(self.data_cfg, 'image_size', 64))
+
+        # For cropped output models, sample_from_model() pads output to context_size
+        # so we always use context_size for coordinate conversion
+        self.crop_size = getattr(self.data_cfg, 'crop_size',
+                                 getattr(self.cfg, 'crop_size', None))
+
+        # Setup image transform (resize to context_size)
         self.transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Resize((self.data_cfg.image_size, self.data_cfg.image_size)),
+            transforms.Resize((self.context_size, self.context_size)),
             transforms.Lambda(lambda x: x * 2 - 1),
         ])
         
@@ -161,7 +168,6 @@ class GoalInferenceModel:
         if method in flow_matching_methods:
             from src.model.samplers.fb_ode_sampler import FBODESampler
             self.model.sampler = FBODESampler(method=method)
-            print(f"  Overriding sampler to FBODESampler(method='{method}')")
 
         elif method in diffusion_methods:
             from src.model.samplers.hf_diffusion_sampler import HFDiffusionSampler
@@ -172,7 +178,6 @@ class GoalInferenceModel:
                 sampler_type=method,
                 num_train_timesteps=num_timesteps,
             )
-            print(f"  Overriding sampler to HFDiffusionSampler(sampler_type='{method}')")
 
         else:
             raise ValueError(
@@ -261,7 +266,7 @@ class GoalInferenceModel:
 
         # Process goal samples and extract SE(2) poses
         valid_goals = []
-        scale = image_converter.IMG_SIZE / self.data_cfg.image_size
+        scale = image_converter.IMG_SIZE / self.context_size
         
         # Get object angle for rotation calculation
         _, _, selected_obj_center, obj_angle = find_rectangle_corners(
@@ -390,10 +395,10 @@ class GoalInferenceModel:
         crop_size = local_data['crop_size_meters']
 
         # Get object angle from input mask for rotation calculation
-        # IMPORTANT: local_data masks are 224x224, but model operates on 64x64
-        # We need to resize the mask to match the model's output size
+        # IMPORTANT: local_data masks are 224x224, but model operates on context_size
+        # We need to resize the mask to match the model's context size for angle detection
         obj_mask_224 = local_data['local_target_object'][:, :, 0]
-        obj_mask_resized = cv2.resize(obj_mask_224, (self.data_cfg.image_size, self.data_cfg.image_size),
+        obj_mask_resized = cv2.resize(obj_mask_224, (self.context_size, self.context_size),
                                        interpolation=cv2.INTER_AREA)
         obj_mask = (obj_mask_resized > 0.5).astype(np.uint8)
         _, _, obj_mask_center, obj_angle = find_rectangle_corners(obj_mask)
@@ -401,6 +406,8 @@ class GoalInferenceModel:
             obj_angle = 0.0
 
         # Process goal samples and extract SE(2) poses
+        # Note: For cropped output models, sample_from_model() already pads the output
+        # from crop_size to context_size, so predictions are in context_size coordinates
         valid_goals = []
 
         for i, goal_sample in enumerate(goal_samples):
@@ -418,13 +425,13 @@ class GoalInferenceModel:
                 continue
 
             # Convert LOCAL pixel to world coordinates
-            # Note: predicted_goal_center is in model output space (data_cfg.image_size, e.g. 64x64)
+            # Note: predicted_goal_center is in context_size space (model pads cropped output)
             world_x, world_y = image_converter.pixel_to_world_local(
                 px=predicted_goal_center[0],
                 py=predicted_goal_center[1],
                 object_center=object_center,
                 crop_size_meters=crop_size,
-                output_size=self.data_cfg.image_size  # Use model's image size, not 224!
+                output_size=self.context_size  # Use context size for world conversion
             )
 
             # Compute theta from angle difference
