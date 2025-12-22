@@ -1,15 +1,20 @@
-# Facebook Flow Matching Model Configuration
-# Uses Facebook's flow_matching library for both path and sampler
+# Facebook Flow Matching Model with Cross-Attention Conditioning
+# Uses Facebook's flow_matching library + cross-attention for context
 # Install: pip install flow-matching torchdyn
+#
+# Key differences from generative_fb_flow_matching.yaml:
+# - Context channels are extracted and encoded separately
+# - Transformer uses cross-attention to attend to context features
 
 _target_: src.model.generative_module.GenerativeModule
 
-# Neural network backbone
+# Neural network backbone (DiTCrossAttn)
 network:
-  _target_: src.model.dit.dit.DiT
+  _target_: src.model.dit.dit_crossattn.DiTCrossAttn
   img_size: ${image_size}
   patch: 4
-  in_ch: 7      # 4 context (static,mov,tgt_obj,goal_region) + 2 coord_grid + 1 noisy_target (local mode)
+  in_ch: 8      # 5 context + 2 coord_grid + 1 noisy_target
+  context_channels: ${context_channels}
   out_ch: 1     # target_goal
   dim: 256
   depth: 8
@@ -39,13 +44,11 @@ optimizer:
 aux_loss_weight: 0.005
 
 # Channel configuration
-# Global: 5 context (robot,goal,mov,stat,tgt_obj)
-# Local: 4 context (static,movable,target_object,goal_region)
-context_channels: 5
+context_channels: ${context_channels}
 target_channels: 1
 
 # Use local (object-centered) masks instead of global
-use_local: ${use_local}  # inherited from top-level config
+use_local: ${use_local}
 
 # LR schedule
 warmup_steps: ${warmup_steps}

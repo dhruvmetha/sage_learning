@@ -1,21 +1,21 @@
-# HuggingFace Diffusion Model Configuration
+# Cropped HuggingFace Diffusion Model Configuration
 # Uses HuggingFace's diffusers library for DDPM/DDIM
 # Install: pip install diffusers
 
-_target_: src.model.generative_module.GenerativeModule
+_target_: src.model.generative_module_cropped.GenerativeModuleCropped
 
-# Neural network backbone
+# Neural network backbone (DiTCropped)
 network:
-  _target_: src.model.dit.dit.DiT
-  img_size: ${image_size}
+  _target_: src.model.dit.dit_cropped.DiTCropped
+  crop_size: ${crop_size}
+  context_size: ${context_size}
   patch: 4
-  in_ch: 8      # 5 context (static,movable,tgt_obj,robot_region,goal_sample_region) + 2 coord_grid + 1 noisy_target
-  out_ch: 1     # target_goal
+  in_ch: 1            # noisy target only
+  context_channels: 5  # static, movable, target_object, robot_region, goal_sample_region
+  out_ch: 1           # target_goal
   dim: 256
   depth: 8
   heads: 8
-  use_geometry_conditioning: ${use_geometry_conditioning}
-  context_channels: ${context_channels}
 
 # HuggingFace diffusion path
 path:
@@ -42,17 +42,9 @@ optimizer:
   lr: ${base_lr}
   weight_decay: 0.01
 
-# Auxiliary loss weight
-aux_loss_weight: 0.005
-
-# Channel configuration
-# Global: 5 context (robot,goal,mov,stat,tgt_obj)
-# Local: 5 context (static,movable,target_object,robot_region,goal_sample_region)
-context_channels: ${context_channels}
-target_channels: 1
-
-# Use local (object-centered) masks instead of global
-use_local: ${use_local}  # inherited from top-level config
+# Size configuration
+context_size: ${context_size}
+crop_size: ${crop_size}
 
 # LR schedule
 warmup_steps: ${warmup_steps}

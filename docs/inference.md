@@ -215,6 +215,60 @@ for obj in objects_to_check:
     all_goals[obj] = model.infer(json_message, xml_path, robot_goal, obj, samples=16)
 ```
 
+## Local vs Global Inference
+
+The model automatically detects whether to use **local** (object-centered) or **global** (full-scene) inference based on the training config (`data.use_local`).
+
+### Auto-Detection
+
+When loading a model, the inference mode is automatically determined:
+
+```python
+model = GoalInferenceModel("outputs/local_model/")
+# Prints: "Using local (object-centered) masks" if trained with use_local=True
+```
+
+### Global Inference (use_local=False)
+
+- Full scene rendered in 224×224 image
+- Pixel (112, 112) = world center
+- Input channels: robot, goal, movable, static, target_object
+
+### Local Inference (use_local=True)
+
+- 5m×5m crop centered on target object
+- Pixel (112, 112) = object center
+- Input channels: static, movable, target_object, robot_region, goal_sample_region
+- Higher resolution for local manipulation details
+
+### Coordinate Conversion
+
+Both modes return world coordinates. The conversion differs internally:
+
+| Mode | Formula |
+|------|---------|
+| Global | `world = (px - 112) / scale + world_center` |
+| Local | `world = object_center + (px - 112) * 0.0223` |
+
+Where local resolution = 5.0m / 224px = 0.0223 m/px
+
+### Training a Local Model
+
+```yaml
+# In data config
+data:
+  use_local: true
+  # ... other settings
+```
+
+### Verifying Mode
+
+```python
+model = GoalInferenceModel("outputs/model_path/")
+print(f"Using local: {model.use_local}")
+print(f"Using coord_grid: {model.use_coord_grid}")
+```
+
 ## Troubleshooting
 
 ### Empty Results

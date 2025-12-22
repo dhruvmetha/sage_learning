@@ -1,0 +1,55 @@
+# Cropped HuggingFace Diffusion Model with Cross-Attention Conditioning
+# Uses cross-attention instead of AdaLN for context conditioning
+#
+# Key differences from generative_cropped_diffusion.yaml:
+# - Context is encoded to spatial features (not pooled)
+# - Transformer uses cross-attention to attend to context features
+# - Time conditioning still uses scale/shift modulation
+
+_target_: src.model.generative_module_cropped.GenerativeModuleCropped
+
+# Neural network backbone (DiTCroppedCrossAttn)
+network:
+  _target_: src.model.dit.dit_cropped_crossattn.DiTCroppedCrossAttn
+  crop_size: ${crop_size}
+  context_size: ${context_size}
+  patch: 4
+  in_ch: 1            # noisy target only
+  context_channels: 5  # static, movable, target_object, robot_region, goal_sample_region
+  out_ch: 1           # target_goal
+  dim: 256
+  depth: 8
+  heads: 8
+
+# HuggingFace diffusion path
+path:
+  _target_: src.model.paths.hf_diffusion_path.HFDiffusionPath
+  num_train_timesteps: 1000
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+
+# HuggingFace DDIM sampler (deterministic, faster)
+sampler:
+  _target_: src.model.samplers.hf_diffusion_sampler.HFDiffusionSampler
+  sampler_type: ddim
+  num_train_timesteps: 1000
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+  eta: 0.0
+  clip_sample: false
+
+# Optimizer
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: ${base_lr}
+  weight_decay: 0.01
+
+# Size configuration
+context_size: ${context_size}
+crop_size: ${crop_size}
+
+# LR schedule
+warmup_steps: ${warmup_steps}
+decay_steps: ${decay_steps}
+end_lr: ${end_lr}

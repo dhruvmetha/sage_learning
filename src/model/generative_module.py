@@ -51,7 +51,9 @@ class GenerativeModule(pl.LightningModule):
         optimizer: Optimizer partial function
         aux_loss_weight: Weight for auxiliary losses (e.g., dice loss)
         context_channels: Number of input context channels (default 5: robot, goal, movable, static, target_object)
-        target_channels: Number of output target channels (default 1: target_goal only)
+        target_channels: Number of output target channels (default 1: target_goal only, 2 for multi-horizon)
+        use_local: Use local (object-centered) masks instead of global
+        use_multihorizon: Enable multi-horizon prediction (2 output channels with masked loss)
     """
 
     def __init__(
@@ -64,6 +66,10 @@ class GenerativeModule(pl.LightningModule):
         context_channels: int = 5,
         target_channels: int = 1,
         use_local: bool = False,
+        use_multihorizon: bool = False,
+        warmup_steps: int = 0,
+        decay_steps: int = 0,
+        end_lr: float = 0.0,
     ):
         super().__init__()
 
@@ -76,9 +82,16 @@ class GenerativeModule(pl.LightningModule):
         self.context_channels = context_channels
         self.target_channels = target_channels
         self.use_local = use_local
+        self.use_multihorizon = use_multihorizon
+
+        # LR schedule parameters
+        self.warmup_steps = warmup_steps
+        self.decay_steps = decay_steps
+        self.end_lr = end_lr
 
         # Loss function
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.MSELoss(reduction='none')  # Use 'none' for masked loss support
+        self.criterion_mean = nn.MSELoss()  # For backward compatibility
 
         # Metrics
         self.train_loss = MeanMetric()
@@ -142,8 +155,54 @@ class GenerativeModule(pl.LightningModule):
     def _build_target(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Build target tensor from batch, clamped to [-1, 1].
+
+        For multi-horizon mode, returns [B, 2, H, W] from 'target_goals'.
+        For single-horizon mode, returns [B, 1, H, W] from 'target_goal'.
         """
-        return torch.clamp(batch['target_goal'], -1, 1)
+        if self.use_multihorizon:
+            # Multi-horizon: target_goals is [B, 2, H, W]
+            return torch.clamp(batch['target_goals'], -1, 1)
+        else:
+            # Single-horizon: target_goal is [B, 1, H, W]
+            return torch.clamp(batch['target_goal'], -1, 1)
+
+    def _compute_multihorizon_loss(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        solution_depth: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute masked loss for multi-horizon prediction.
+
+        Channel 1 (goal_mask_a1) is always supervised.
+        Channel 2 (goal_mask_a2) is only supervised when solution_depth >= 2.
+
+        Args:
+            prediction: Model output [B, 2, H, W]
+            target: Ground truth [B, 2, H, W]
+            solution_depth: [B] tensor with solution depth (1 or 2)
+
+        Returns:
+            Combined loss for both channels
+        """
+        B, _, H, W = prediction.shape
+
+        # Channel 1 loss: always computed
+        loss_ch1 = self.criterion(prediction[:, 0:1], target[:, 0:1]).mean()
+
+        # Channel 2 loss: only compute where solution_depth >= 2
+        # Create mask [B, 1, 1, 1] for broadcasting
+        mask = (solution_depth >= 2).float().view(B, 1, 1, 1)
+
+        # Compute per-element loss for channel 2
+        loss_ch2_elements = self.criterion(prediction[:, 1:2], target[:, 1:2])  # [B, 1, H, W]
+
+        # Apply mask and compute mean only over valid samples
+        num_valid = mask.sum() + 1e-8  # Avoid division by zero
+        loss_ch2 = (loss_ch2_elements * mask).sum() / (num_valid * H * W)
+
+        return loss_ch1 + loss_ch2
 
     def _compute_loss(
         self,
@@ -151,10 +210,11 @@ class GenerativeModule(pl.LightningModule):
         target: torch.Tensor,
         x_t: torch.Tensor,
         t: torch.Tensor,
-        x_1: torch.Tensor
+        x_1: torch.Tensor,
+        solution_depth: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute loss with optional auxiliary losses.
+        Compute loss with optional auxiliary losses and multi-horizon masking.
 
         Args:
             prediction: Model output (noise or velocity)
@@ -162,12 +222,16 @@ class GenerativeModule(pl.LightningModule):
             x_t: Current interpolated/noised point
             t: Time values
             x_1: Original data (for auxiliary losses)
+            solution_depth: [B] tensor with solution depth (1 or 2) for multi-horizon masking
 
         Returns:
             Total loss
         """
-        # Primary loss: MSE between prediction and target
-        primary_loss = self.criterion(prediction, target)
+        if self.use_multihorizon and solution_depth is not None:
+            primary_loss = self._compute_multihorizon_loss(prediction, target, solution_depth)
+        else:
+            # Single-horizon: standard MSE loss
+            primary_loss = self.criterion_mean(prediction, target)
 
         if self.aux_loss_weight > 0:
             # Auxiliary loss: Dice loss on reconstructed x_1
@@ -226,6 +290,11 @@ class GenerativeModule(pl.LightningModule):
         x_1 = self._build_target(batch)
         x_0 = torch.randn_like(x_1)
 
+        # Get solution_depth for multi-horizon masking
+        solution_depth = batch.get('solution_depth', None)
+        if solution_depth is not None:
+            solution_depth = torch.tensor(solution_depth, device=x_1.device) if not isinstance(solution_depth, torch.Tensor) else solution_depth
+
         # Sample from path
         path_sample = self.path.sample(x_0=x_0, x_1=x_1)
 
@@ -241,7 +310,8 @@ class GenerativeModule(pl.LightningModule):
             target=path_sample.target,
             x_t=path_sample.x_t,
             t=path_sample.t,
-            x_1=x_1
+            x_1=x_1,
+            solution_depth=solution_depth,
         )
 
         # Handle NaN loss
@@ -266,6 +336,11 @@ class GenerativeModule(pl.LightningModule):
         x_1 = self._build_target(batch)
         x_0 = torch.randn_like(x_1)
 
+        # Get solution_depth for multi-horizon masking
+        solution_depth = batch.get('solution_depth', None)
+        if solution_depth is not None:
+            solution_depth = torch.tensor(solution_depth, device=x_1.device) if not isinstance(solution_depth, torch.Tensor) else solution_depth
+
         path_sample = self.path.sample(x_0=x_0, x_1=x_1)
         model_input = torch.cat([context, path_sample.x_t], dim=1)
 
@@ -276,7 +351,8 @@ class GenerativeModule(pl.LightningModule):
             target=path_sample.target,
             x_t=path_sample.x_t,
             t=path_sample.t,
-            x_1=x_1
+            x_1=x_1,
+            solution_depth=solution_depth,
         )
 
         if loss is None or torch.isnan(loss):
@@ -291,6 +367,7 @@ class GenerativeModule(pl.LightningModule):
             self._validation_context = context
             self._validation_target = x_1
             self._validation_target_object = target_object
+            self._validation_solution_depth = solution_depth
 
         return loss
 
@@ -302,6 +379,13 @@ class GenerativeModule(pl.LightningModule):
         # Generate validation samples
         if hasattr(self, '_validation_context'):
             self._generate_validation_samples()
+
+        # Clear validation tensors to free GPU memory
+        self._validation_context = None
+        self._validation_target = None
+        self._validation_target_object = None
+        self._validation_solution_depth = None
+        torch.cuda.empty_cache()
 
     def _generate_validation_samples(self):
         """Generate and log samples during validation.
@@ -316,9 +400,15 @@ class GenerativeModule(pl.LightningModule):
         Local mode (use_local=True):
         - Context channels: 0=static, 1=movable, 2=target_object, 3=goal_region
         - Panels: Scene | TargetObj | GT | Pred1-4
+
+        Multi-horizon mode (use_multihorizon=True):
+        - Shows both goal_mask_a1 and goal_mask_a2 predictions
+        - GT shows both channels
+        - Layout: Scene | Reach | GT_a1 | GT_a2 | Pred_a1 | Pred_a2 | Pred_a1 | Pred_a2
         """
         context = self._validation_context
         target = self._validation_target
+        solution_depth = self._validation_solution_depth
 
         num_examples = min(8, context.size(0))
         image_size = context.shape[-1]
@@ -333,15 +423,35 @@ class GenerativeModule(pl.LightningModule):
             log_dict = {}
             for i in range(num_examples):
                 ctx = context[i:i+1]  # (1, C, H, W)
-                gt_target = target[i:i+1]   # (1, 1, H, W) - ground truth target location
-                gt_location = _to_display(gt_target[0, 0:1])[0]
 
-                # Generate 4 predictions
+                # Handle multi-horizon vs single-horizon target
+                if self.use_multihorizon:
+                    # target is [B, 2, H, W], get both channels
+                    gt_a1 = _to_display(target[i:i+1, 0:1])[0, 0]  # (H, W)
+                    gt_a2 = _to_display(target[i:i+1, 1:2])[0, 0]  # (H, W)
+                    # Get solution depth for this sample (for caption)
+                    sample_depth = int(solution_depth[i].item()) if solution_depth is not None else 0
+                else:
+                    # target is [B, 1, H, W]
+                    gt_a1 = _to_display(target[i:i+1])[0, 0]  # (H, W)
+                    gt_a2 = None
+                    sample_depth = 1
+
+                # Generate predictions
                 with torch.no_grad():
-                    pred_1 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
-                    pred_2 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
-                    pred_3 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
-                    pred_4 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
+                    if self.use_multihorizon:
+                        # Generate 2 samples, each with both channels
+                        sample1 = self.sample(ctx, num_steps=20)[0]  # (2, H, W)
+                        sample2 = self.sample(ctx, num_steps=20)[0]  # (2, H, W)
+                        pred_a1_1 = _to_display(sample1[0:1])[0]  # (H, W)
+                        pred_a2_1 = _to_display(sample1[1:2])[0]  # (H, W)
+                        pred_a1_2 = _to_display(sample2[0:1])[0]  # (H, W)
+                        pred_a2_2 = _to_display(sample2[1:2])[0]  # (H, W)
+                    else:
+                        pred_a1_1 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
+                        pred_a1_2 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
+                        pred_a1_3 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
+                        pred_a1_4 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
 
                 if self.use_local:
                     # Local mode channels: 0=static, 1=movable, 2=target_object, 3=robot_region, 4=goal_sample_region
@@ -365,13 +475,7 @@ class GenerativeModule(pl.LightningModule):
                     img2[0, 1] = goal_sample_region
                     img2[0, 2] = target_obj
 
-                    # Image 3: Ground truth (R=static, G=gt_location, B=target_obj)
-                    img3 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img3[0, 0] = static
-                    img3[0, 1] = gt_location
-                    img3[0, 2] = target_obj
-
-                    # Images 4-7: Predictions (R=static, G=prediction, B=target_obj)
+                    # Helper to make prediction/GT images
                     def make_pred_img(pred_loc):
                         img = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
                         img[0, 0] = static
@@ -379,7 +483,30 @@ class GenerativeModule(pl.LightningModule):
                         img[0, 2] = target_obj
                         return img
 
-                    caption = f"Epoch {self.current_epoch} | Scene(R=stat,G=mov,B=obj) | Reach(R=robot,G=goal,B=obj) | GT | Pred1-4"
+                    if self.use_multihorizon:
+                        # Multi-horizon: Show GT_a1, GT_a2, then 2 samples with both channels
+                        # Layout: Scene | Reach | GT_a1 | GT_a2 | Pred_a1 | Pred_a2 | Pred_a1 | Pred_a2
+                        img3 = make_pred_img(gt_a1)  # GT_a1
+                        img4 = make_pred_img(gt_a2)  # GT_a2
+                        img5 = make_pred_img(pred_a1_1)  # Sample1 a1
+                        img6 = make_pred_img(pred_a2_1)  # Sample1 a2
+                        img7 = make_pred_img(pred_a1_2)  # Sample2 a1
+                        img8 = make_pred_img(pred_a2_2)  # Sample2 a2
+
+                        row = torch.cat([img1, img2, img3, img4, img5, img6, img7, img8], dim=0)
+                        nrow = 8
+                        caption = f"Epoch {self.current_epoch} depth={sample_depth} | Scene | Reach | GT_a1 | GT_a2 | S1_a1 | S1_a2 | S2_a1 | S2_a2"
+                    else:
+                        # Single-horizon: original layout
+                        img3 = make_pred_img(gt_a1)
+                        img4 = make_pred_img(pred_a1_1)
+                        img5 = make_pred_img(pred_a1_2)
+                        img6 = make_pred_img(pred_a1_3)
+                        img7 = make_pred_img(pred_a1_4)
+
+                        row = torch.cat([img1, img2, img3, img4, img5, img6, img7], dim=0)
+                        nrow = 7
+                        caption = f"Epoch {self.current_epoch} | Scene | Reach | GT | Pred1-4"
 
                 else:
                     # Global mode channels: 0=robot, 1=robot_goal, 2=movable, 3=static, 4=target_object
@@ -404,7 +531,7 @@ class GenerativeModule(pl.LightningModule):
                     # Image 3: Ground truth (robot=R, robot_goal+gt_location=G, target_obj=B)
                     img3 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
                     img3[0, 0] = robot
-                    img3[0, 1] = torch.clamp(robot_goal + gt_location, 0, 1)
+                    img3[0, 1] = torch.clamp(robot_goal + gt_a1, 0, 1)
                     img3[0, 2] = target_obj
 
                     # Images 4-7: Predictions (robot=R, robot_goal+pred=G, static+target_obj=B)
@@ -415,16 +542,16 @@ class GenerativeModule(pl.LightningModule):
                         img[0, 2] = torch.clamp(static + target_obj, 0, 1)
                         return img
 
+                    img4 = make_pred_img(pred_a1_1)
+                    img5 = make_pred_img(pred_a1_2)
+                    img6 = make_pred_img(pred_a1_3)
+                    img7 = make_pred_img(pred_a1_4)
+
+                    row = torch.cat([img1, img2, img3, img4, img5, img6, img7], dim=0)
+                    nrow = 7
                     caption = f"Epoch {self.current_epoch} | Scene | TargetObj | GT | Pred1 | Pred2 | Pred3 | Pred4"
 
-                img4 = make_pred_img(pred_1)
-                img5 = make_pred_img(pred_2)
-                img6 = make_pred_img(pred_3)
-                img7 = make_pred_img(pred_4)
-
-                # Build row: scene | target_obj | ground_truth | pred1 | pred2 | pred3 | pred4
-                row = torch.cat([img1, img2, img3, img4, img5, img6, img7], dim=0)
-                grid = torchvision.utils.make_grid(row, nrow=7, normalize=True, padding=2)
+                grid = torchvision.utils.make_grid(row, nrow=nrow, normalize=True, padding=2)
 
                 # Convert to numpy and log
                 grid_np = grid.cpu().permute(1, 2, 0).numpy()
@@ -506,9 +633,43 @@ class GenerativeModule(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        """Configure optimizer."""
+        """Configure optimizer and LR scheduler."""
         optimizer = self.optimizer_partial(params=self.parameters())
+
+        # If no scheduler params, return optimizer only
+        if self.warmup_steps == 0 and self.decay_steps == 0:
+            return {
+                "optimizer": optimizer,
+                "gradient_clip_val": 1.0,
+            }
+
+        # Get base LR from optimizer
+        base_lr = optimizer.param_groups[0]["lr"]
+
+        def lr_lambda(step):
+            # Warmup phase
+            if step < self.warmup_steps:
+                return step / max(1, self.warmup_steps)
+
+            # Decay phase (cosine decay from base_lr to end_lr)
+            if self.decay_steps > 0:
+                decay_progress = min(1.0, (step - self.warmup_steps) / self.decay_steps)
+                # Cosine decay
+                lr_mult = self.end_lr / base_lr + (1 - self.end_lr / base_lr) * 0.5 * (
+                    1 + torch.cos(torch.tensor(decay_progress * 3.14159)).item()
+                )
+                return lr_mult
+
+            return 1.0
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
         return {
             "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
             "gradient_clip_val": 1.0,
         }

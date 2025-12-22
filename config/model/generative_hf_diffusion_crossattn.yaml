@@ -1,21 +1,24 @@
-# HuggingFace Diffusion Model Configuration
-# Uses HuggingFace's diffusers library for DDPM/DDIM
-# Install: pip install diffusers
+# HuggingFace Diffusion Model with Cross-Attention Conditioning
+# Uses cross-attention instead of AdaLN for context conditioning
+#
+# Key differences from generative_hf_diffusion.yaml:
+# - Context channels are extracted and encoded separately
+# - Transformer uses cross-attention to attend to context features
+# - Only coord_grid + noisy_target go through the main transformer
 
 _target_: src.model.generative_module.GenerativeModule
 
-# Neural network backbone
+# Neural network backbone (DiTCrossAttn)
 network:
-  _target_: src.model.dit.dit.DiT
+  _target_: src.model.dit.dit_crossattn.DiTCrossAttn
   img_size: ${image_size}
   patch: 4
-  in_ch: 8      # 5 context (static,movable,tgt_obj,robot_region,goal_sample_region) + 2 coord_grid + 1 noisy_target
+  in_ch: 8      # 5 context + 2 coord_grid + 1 noisy_target
+  context_channels: ${context_channels}
   out_ch: 1     # target_goal
   dim: 256
   depth: 8
   heads: 8
-  use_geometry_conditioning: ${use_geometry_conditioning}
-  context_channels: ${context_channels}
 
 # HuggingFace diffusion path
 path:
@@ -25,7 +28,6 @@ path:
   prediction_type: epsilon
 
 # HuggingFace DDIM sampler (deterministic, faster)
-# Change to hf_ddpm for stochastic sampling
 sampler:
   _target_: src.model.samplers.hf_diffusion_sampler.HFDiffusionSampler
   sampler_type: ddim
@@ -46,13 +48,11 @@ optimizer:
 aux_loss_weight: 0.005
 
 # Channel configuration
-# Global: 5 context (robot,goal,mov,stat,tgt_obj)
-# Local: 5 context (static,movable,target_object,robot_region,goal_sample_region)
 context_channels: ${context_channels}
 target_channels: 1
 
 # Use local (object-centered) masks instead of global
-use_local: ${use_local}  # inherited from top-level config
+use_local: ${use_local}
 
 # LR schedule
 warmup_steps: ${warmup_steps}

@@ -1,0 +1,18 @@
+# Data Module for Cropped Target Prediction
+# Context at full resolution, target center-cropped
+
+_target_: src.data.mask_diffusion_data_cropped.MaskDiffusionCroppedDataModule
+
+data_dir: ${data_dir}
+batch_size: ${batch_size}
+num_workers: ${num_workers}
+pin_memory: true
+
+# Context size (full resolution for geometry encoding)
+context_size: ${context_size}
+
+# Crop size for target (center crop)
+crop_size: ${crop_size}
+
+# Train/val split
+train_split: 0.9

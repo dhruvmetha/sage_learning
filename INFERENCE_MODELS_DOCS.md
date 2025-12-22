@@ -200,11 +200,55 @@ if goal_spread < 0.1:
 - Single-channel output: target_goal mask in SE(2) space
 
 ### Input Channels
-- robot: Robot position (channel 1)
-- goal: Robot goal position (channel 2)
-- movable: All movable objects (channel 3)
-- static: Walls/static obstacles (channel 4)
-- target_object: The selected object mask (channel 5)
+
+The model supports two input representations, automatically selected based on training config:
+
+**Global Mode (use_local=False):**
+| Channel | Name | Description |
+|---------|------|-------------|
+| 1 | robot | Robot position circle |
+| 2 | goal | Robot goal position circle |
+| 3 | movable | All movable objects |
+| 4 | static | Walls/static obstacles |
+| 5 | target_object | The selected object mask |
+
+**Local Mode (use_local=True):**
+| Channel | Name | Description |
+|---------|------|-------------|
+| 1 | local_static | Static obstacles (5m crop) |
+| 2 | local_movable | Movable objects (5m crop) |
+| 3 | local_target_object | Target object (5m crop) |
+| 4 | local_robot_region | BFS reachability from robot |
+| 5 | local_goal_sample_region | BFS reachability from goal |
+
+### Local vs Global Inference
+
+The model automatically detects which mode to use from its training config:
+
+```python
+model = GoalInferenceModel("outputs/model_path/")
+# Auto-detects use_local from config.yaml
+
+# Check mode
+print(f"Using local masks: {model.use_local}")
+```
+
+**Key Differences:**
+
+| Aspect | Global | Local |
+|--------|--------|-------|
+| Coverage | Full scene | 5m×5m around object |
+| Center pixel | World center | Object center |
+| Resolution | Varies with world size | Fixed: 0.0223 m/px |
+| Best for | Small environments | Large environments |
+
+**Coordinate Conversion:**
+
+Both modes return world coordinates. Local mode uses:
+```python
+world_x = object_center[0] + (pixel_x - 112) * (5.0 / 224)
+world_y = object_center[1] + (pixel_y - 112) * (5.0 / 224)
+```
 
 ## Troubleshooting
 

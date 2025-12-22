@@ -1,16 +1,18 @@
-# Facebook Flow Matching Model Configuration
+# Cropped Flow Matching Model Configuration
 # Uses Facebook's flow_matching library for both path and sampler
 # Install: pip install flow-matching torchdyn
 
-_target_: src.model.generative_module.GenerativeModule
+_target_: src.model.generative_module_cropped.GenerativeModuleCropped
 
-# Neural network backbone
+# Neural network backbone (DiTCropped)
 network:
-  _target_: src.model.dit.dit.DiT
-  img_size: ${image_size}
+  _target_: src.model.dit.dit_cropped.DiTCropped
+  crop_size: ${crop_size}
+  context_size: ${context_size}
   patch: 4
-  in_ch: 7      # 4 context (static,mov,tgt_obj,goal_region) + 2 coord_grid + 1 noisy_target (local mode)
-  out_ch: 1     # target_goal
+  in_ch: 1            # noisy target only
+  context_channels: 5  # static, movable, target_object, robot_region, goal_sample_region
+  out_ch: 1           # target_goal
   dim: 256
   depth: 8
   heads: 8
@@ -35,17 +37,9 @@ optimizer:
   lr: ${base_lr}
   weight_decay: 0.01
 
-# Auxiliary loss weight (dice loss on reconstructed output)
-aux_loss_weight: 0.005
-
-# Channel configuration
-# Global: 5 context (robot,goal,mov,stat,tgt_obj)
-# Local: 4 context (static,movable,target_object,goal_region)
-context_channels: 5
-target_channels: 1
-
-# Use local (object-centered) masks instead of global
-use_local: ${use_local}  # inherited from top-level config
+# Size configuration
+context_size: ${context_size}
+crop_size: ${crop_size}
 
 # LR schedule
 warmup_steps: ${warmup_steps}

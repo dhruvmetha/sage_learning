@@ -1,0 +1,74 @@
+# Multi-Horizon Training Configuration for HuggingFace Diffusion
+# Predicts both goal_mask_a1 and goal_mask_a2 simultaneously
+#
+# Key differences from train_hf_diffusion.yaml:
+# - Uses mask_diffusion_data_multihorizon data loader
+# - Uses generative_hf_diffusion_multihorizon model (2 output channels)
+# - Masked loss: channel 2 only supervised when solution_depth >= 2
+#
+# Usage:
+#   python src/train_generative.py --config-name=train_hf_diffusion_multihorizon
+#
+# With custom data directory:
+#   python src/train_generative.py --config-name=train_hf_diffusion_multihorizon \
+#       data_dir=/path/to/2_push_train
+#
+# Resume training:
+#   python src/train_generative.py --config-name=train_hf_diffusion_multihorizon \
+#       ckpt_path=/path/to/checkpoint.ckpt
+
+# Experiment name (used in output path)
+name: diffusion_multihorizon
+output_dir: /common/users/dm1487/namo_data/outputs/${name}
+data_dir: /common/users/dm1487/namo_data/h5_files/dec2/aug9_envs/2_push_train_corrected_overlaps_2
+
+# Resume from checkpoint (set to path to resume training, null to start fresh)
+ckpt_path: null
+
+# Hydra output directory structure
+hydra:
+  run:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+defaults:
+  - _self_
+  - data: mask_diffusion_data_multihorizon
+  - model: generative_hf_diffusion_multihorizon
+  - trainer: multi_gpu
+  - callbacks: default
+
+# Random seed
+seed: 42
+
+# Data loading
+num_workers: 0
+batch_size: 64
+
+# Training
+max_epochs: 1000
+check_val_every_n_epoch: 1
+
+# Learning rate schedule
+base_lr: 0.0001
+end_lr: 0.000001
+warmup_steps: 1000
+decay_steps: 300000
+
+# Image size
+image_size: 64
+
+# Multi-horizon always uses local masks
+use_local: true
+
+# GPU (for legacy compatibility)
+gpu_id: 0
+
+# Sampling steps for inference
+sampling_steps: 50
+
+# Paths
+paths:
+  output_dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}

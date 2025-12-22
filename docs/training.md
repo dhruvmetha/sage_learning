@@ -42,12 +42,33 @@ python src/train_generative.py --config-name=train_hf_diffusion
 python src/train_generative.py --config-name=train_hf_diffusion model.sampler.sampler_type=ddpm
 ```
 
+### Multi-Horizon Diffusion (2-Push Prediction)
+```bash
+# Predicts both goal_mask_a1 (next action) and goal_mask_a2 (second action)
+python src/train_generative.py --config-name=train_hf_diffusion_multihorizon
+
+# With custom data directory
+python src/train_generative.py --config-name=train_hf_diffusion_multihorizon \
+    data_dir=/path/to/2_push_train
+
+# Resume from checkpoint
+python src/train_generative.py --config-name=train_hf_diffusion_multihorizon \
+    ckpt_path=/path/to/checkpoint.ckpt
+```
+
+**Key features:**
+- Always predicts 2 output channels: `goal_mask_a1` and `goal_mask_a2`
+- Uses masked loss: channel 2 only supervised when `solution_depth >= 2`
+- For 1-push samples, `goal_mask_a2` target is zeros (no gradient)
+- For 2-push samples, both channels receive gradients
+
 ## Training Configurations
 
-| Config | Objective | Library | Sampling Steps |
-|--------|-----------|---------|----------------|
-| `train_fb_flow_matching.yaml` | Flow Matching | Facebook | ~20 |
-| `train_hf_diffusion.yaml` | DDPM/DDIM | HuggingFace | ~50 |
+| Config | Objective | Library | Output Channels |
+|--------|-----------|---------|-----------------|
+| `train_fb_flow_matching.yaml` | Flow Matching | Facebook | 1 (single-horizon) |
+| `train_hf_diffusion.yaml` | DDPM/DDIM | HuggingFace | 1 (single-horizon) |
+| `train_hf_diffusion_multihorizon.yaml` | DDPM/DDIM | HuggingFace | 2 (multi-horizon) |
 
 ### Default Settings
 ```yaml
@@ -119,6 +140,29 @@ sampler:
   eta: 0.0  # 0.0 = deterministic DDIM, 1.0 = DDPM-like
 ```
 
+### Multi-Horizon Diffusion (`model=generative_hf_diffusion_multihorizon`)
+```yaml
+_target_: src.model.generative_module.GenerativeModule
+network:
+  _target_: src.model.dit.dit.DiT
+  in_ch: 9      # 5 context + 2 coord_grid + 2 noisy_targets
+  out_ch: 2     # goal_mask_a1, goal_mask_a2
+path:
+  _target_: src.model.paths.hf_diffusion_path.HFDiffusionPath
+  # Same as single-horizon
+sampler:
+  _target_: src.model.samplers.hf_diffusion_sampler.HFDiffusionSampler
+  # Same as single-horizon
+target_channels: 2
+use_multihorizon: true  # Enables masked loss based on solution_depth
+use_local: true
+```
+
+**Masked Loss Logic:**
+- Channel 1 (`goal_mask_a1`): Always receives gradients
+- Channel 2 (`goal_mask_a2`): Only receives gradients when `solution_depth >= 2`
+- This allows training on mixed 1-push and 2-push data without the model learning to predict zeros for channel 2
+
 ## Common Overrides
 
 ```bash
@@ -176,9 +220,73 @@ Saved in `outputs/<run_name>/checkpoints/`:
 - `last.ckpt`: Latest checkpoint
 - `epochXXX-val_lossX.XXXX.ckpt`: Best checkpoints by validation loss
 
+## Local vs Global Training
+
+Models can be trained with either **global** (full-scene) or **local** (object-centered) masks.
+
+### Global Training (Default)
+
+- Full scene in 224×224 image
+- Good for small environments
+- Input channels: robot, goal, movable, static, target_object
+
+```yaml
+data:
+  use_local: false  # Default
+```
+
+### Local Training
+
+- 5m×5m crop centered on target object
+- Better for large environments (higher effective resolution)
+- Input channels: static, movable, target_object, robot_region, goal_sample_region
+
+```yaml
+data:
+  use_local: true
+```
+
+```bash
+# Train with local masks
+python src/train_generative.py --config-name=train_fb_flow_matching data.use_local=true
+
+# Or use a config that has it enabled
+python src/train_generative.py --config-name=train_hf_diffusion_multihorizon
+```
+
+### Data Generation for Local Training
+
+Generate local masks with `--local-only`:
+
+```bash
+python -m namo.visualization.mask_generation.batch_collection \
+    --input-dir /path/to/pkl/files \
+    --output-dir /path/to/npz \
+    --local-only \
+    --workers 48
+```
+
+This generates:
+- `local_static`, `local_movable`, `local_target_object`
+- `local_robot_region`, `local_goal_sample_region`
+- `local_goal_mask_a1` (target output)
+- Metadata: `local_object_center`, `local_crop_size_meters`, `local_resolution`
+
+### Inference Auto-Detection
+
+At inference time, the model automatically detects `use_local` from its config:
+
+```python
+model = GoalInferenceModel("outputs/local_model/")
+# Prints: "Using local (object-centered) masks"
+# infer() automatically routes to local coordinate conversion
+```
+
 ## Data Format
 
 Each .npz file should contain:
+
+### Global Data (use_local=False)
 
 | Key | Shape | Description |
 |-----|-------|-------------|
@@ -190,6 +298,31 @@ Each .npz file should contain:
 | `target_goal` | (224, 224) | Ground truth goal mask |
 
 Legacy keys (`robot`, `goal`, `movable`, `static`) are also supported.
+
+### Local Data (use_local=True)
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `local_static` | (224, 224) | Static obstacles (cropped) |
+| `local_movable` | (224, 224) | Movable objects (cropped) |
+| `local_target_object` | (224, 224) | Target object (cropped) |
+| `local_robot_region` | (224, 224) | BFS reachability from robot |
+| `local_goal_sample_region` | (224, 224) | BFS reachability from goal |
+| `local_goal_mask_a1` | (224, 224) | Target goal position (cropped) |
+| `local_object_center` | (2,) | Object world coordinates |
+| `local_crop_size_meters` | (1,) | Crop size (default: 5.0) |
+
+### Multi-Horizon Data (for 2-push training)
+
+Additional keys required for `train_hf_diffusion_multihorizon`:
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `local_goal_mask_a1` | (224, 224) | Next action's goal position (local crop) |
+| `local_goal_mask_a2` | (224, 224) | Second action's goal position (local crop) |
+| `solution_depth` | scalar | Number of remaining actions (1 or 2) |
+
+For 1-push samples, `local_goal_mask_a2` can be missing or zeros.
 
 ## Troubleshooting
 

@@ -65,7 +65,13 @@ def main(cfg):
     print(f"Batch size: {cfg.batch_size}")
     print(f"Max epochs: {cfg.max_epochs}")
     print(f"Learning rate: {cfg.base_lr}")
-    print(f"Image size: {cfg.image_size}")
+    # Handle both regular (image_size) and cropped (context_size/crop_size) configs
+    if hasattr(cfg, 'image_size'):
+        print(f"Image size: {cfg.image_size}")
+    if hasattr(cfg, 'context_size'):
+        print(f"Context size: {cfg.context_size}")
+    if hasattr(cfg, 'crop_size'):
+        print(f"Crop size: {cfg.crop_size}")
     print("=" * 60)
 
     # Instantiate data module
@@ -81,6 +87,12 @@ def main(cfg):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+
+    # Compile model for faster training (PyTorch 2.0+)
+    # Note: Disabled by default due to DDP compatibility issues
+    if cfg.get("compile_model", False):
+        print("Compiling model with torch.compile()...")
+        model = torch.compile(model)
 
     # Optionally load from a previous run (for fine-tuning)
     if cfg.get("run_path", None) is not None:

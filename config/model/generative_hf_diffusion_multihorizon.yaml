@@ -1,6 +1,10 @@
-# HuggingFace Diffusion Model Configuration
-# Uses HuggingFace's diffusers library for DDPM/DDIM
-# Install: pip install diffusers
+# Multi-Horizon HuggingFace Diffusion Model Configuration
+# Predicts both goal_mask_a1 and goal_mask_a2 simultaneously
+#
+# Key differences from generative_hf_diffusion.yaml:
+# - in_ch: 9 (5 context + 2 coord_grid + 2 noisy_targets)
+# - out_ch: 2 (predict both goal masks)
+# - use_multihorizon: true (enables masked loss based on solution_depth)
 
 _target_: src.model.generative_module.GenerativeModule
 
@@ -9,13 +13,11 @@ network:
   _target_: src.model.dit.dit.DiT
   img_size: ${image_size}
   patch: 4
-  in_ch: 8      # 5 context (static,movable,tgt_obj,robot_region,goal_sample_region) + 2 coord_grid + 1 noisy_target
-  out_ch: 1     # target_goal
+  in_ch: 9      # 5 context (static,movable,tgt_obj,robot_region,goal_sample_region) + 2 coord_grid + 2 noisy_targets
+  out_ch: 2     # goal_mask_a1, goal_mask_a2
   dim: 256
   depth: 8
   heads: 8
-  use_geometry_conditioning: ${use_geometry_conditioning}
-  context_channels: ${context_channels}
 
 # HuggingFace diffusion path
 path:
@@ -25,7 +27,6 @@ path:
   prediction_type: epsilon
 
 # HuggingFace DDIM sampler (deterministic, faster)
-# Change to hf_ddpm for stochastic sampling
 sampler:
   _target_: src.model.samplers.hf_diffusion_sampler.HFDiffusionSampler
   sampler_type: ddim
@@ -46,13 +47,12 @@ optimizer:
 aux_loss_weight: 0.005
 
 # Channel configuration
-# Global: 5 context (robot,goal,mov,stat,tgt_obj)
-# Local: 5 context (static,movable,target_object,robot_region,goal_sample_region)
-context_channels: ${context_channels}
-target_channels: 1
+context_channels: 5
+target_channels: 2  # Now 2 channels for multi-horizon
 
-# Use local (object-centered) masks instead of global
-use_local: ${use_local}  # inherited from top-level config
+# Multi-horizon mode
+use_multihorizon: true  # Enables 2-channel target and masked loss
+use_local: true  # Multi-horizon always uses local masks
 
 # LR schedule
 warmup_steps: ${warmup_steps}
