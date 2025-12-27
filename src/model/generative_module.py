@@ -21,10 +21,10 @@ class UnifiedGenerativeModule(pl.LightningModule):
         optimizer: Any,
         context_channels: int = 5,
         vector_dim: int = 3,
-        use_local: bool = False,
+        use_local: bool = True,
         pose_stats_file: Optional[str] = None,
-        xy_norm: float = 1.0,
-        theta_norm: float = math.pi,
+        norm_mode: str = "mean_std",  # "max_abs" or "mean_std"
+        overfit_mode: bool = False, # If True, compute stats per batch
         crop_size_meters: float = 2.0,
     ):
         super().__init__()
@@ -36,18 +36,26 @@ class UnifiedGenerativeModule(pl.LightningModule):
         self.context_channels = context_channels
         self.vector_dim = vector_dim
         self.use_local = use_local
+        self.norm_mode = norm_mode
+        self.overfit_mode = overfit_mode
 
-        if pose_stats_file is not None:
+        self.register_buffer('xy_norm', torch.tensor(1.0))
+        self.register_buffer('theta_norm', torch.tensor(math.pi))
+        self.register_buffer('mean', torch.zeros(3))
+        self.register_buffer('std', torch.ones(3))
+
+        # 2. Load Global Stats (only if not overfitting)
+        if pose_stats_file is not None and not overfit_mode:
             stats = self._load_pose_stats(pose_stats_file)
-            self.xy_norm = stats.get('xy_norm', xy_norm)
-            self.theta_norm = stats.get('dtheta_norm', theta_norm)
-            print(f"Loaded stats from {pose_stats_file}: xy={self.xy_norm}, theta={self.theta_norm}")
-        else:
-            self.xy_norm = xy_norm
-            self.theta_norm = theta_norm
+            self.norm_mode = stats.get('mode', self.norm_mode)
 
-        self.register_buffer('_xy_norm', torch.tensor(self.xy_norm))
-        self.register_buffer('_theta_norm', torch.tensor(self.theta_norm))
+            if self.norm_mode == "max_abs":
+                self.xy_norm.fill_(stats['xy_norm'])
+                self.theta_norm.fill_(stats['theta_norm'])
+            else:
+                self.mean.copy_(torch.tensor(stats['mean']))
+                self.std.copy_(torch.tensor(stats['std']))
+
         self.train_loss = MeanMetric()
         self.val_loss = MeanMetric()
         self.val_loss_best = MinMetric()
@@ -77,29 +85,142 @@ class UnifiedGenerativeModule(pl.LightningModule):
         return torch.cat(parts, dim=1)
 
     def _normalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
-        norm_scale = torch.tensor([self._xy_norm, self._xy_norm, self._theta_norm], device=pose.device)
-        return torch.clamp(pose / norm_scale, -1, 1)
+        if self.overfit_mode:
+            # We use .detach() to ensure we don't try to backprop through the stats themselves
+            txm = pose[:, 0:1].mean().detach()
+            tym = pose[:, 1:2].mean().detach()
+            
+            # Robust std computation
+            std_val = pose[:, 0:2].std()
+            if torch.isnan(std_val) or std_val < 1e-6:
+                ts = torch.tensor(1.0, device=pose.device)
+            else:
+                ts = std_val.detach()
+
+            thm = 0.0
+            ths = math.pi
+            
+            # Store in buffers so _denormalize_pose can find them later
+            self.mean[0] = txm
+            self.mean[1] = tym
+            self.mean[2] = 0.0
+            
+            self.std[0] = ts
+            self.std[1] = ts
+            self.std[2] = math.pi
+            
+            return (pose - self.mean) / self.std
+
+        if self.norm_mode == "max_abs":
+            # Scale to [-1, 1] using global max
+            norm_scale = torch.tensor([self.xy_norm, self.xy_norm, self.theta_norm], device=pose.device)
+            return torch.clamp(pose / norm_scale, -1, 1)
+        else:
+            # Standardize using global Mean/Std
+            return (pose - self.mean) / self.std
 
     def _denormalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
-        norm_scale = torch.tensor([self._xy_norm, self._xy_norm, self._theta_norm], device=pose.device)
-        return pose * norm_scale
+        """Inverse of normalization. Works for all modes."""
+        if self.norm_mode == "max_abs" and not self.overfit_mode:
+            norm_scale = torch.tensor([self.xy_norm, self.xy_norm, self.theta_norm], device=pose.device)
+            return pose * norm_scale
+        else:
+            # Works for both global Mean-Std and Overfit Batch-Std
+            return (pose * self.std) + self.mean
 
     def training_step(self, batch, batch_idx):
         context = self._build_context(batch)
         if batch['target_goal'].dim() > 2:
             raise ValueError("Target seems to be an image! The model expects a vector.")
         x_1 = self._normalize_pose(batch['target_goal']) 
-        x_0 = torch.randn_like(x_1) 
         
-        # Get training state (x_t, t, target) from Path
-        sample = self.path.compute_loss_samples(x_0=x_0, x_1=x_1)
+        if self.overfit_mode:
+            # DETERMINISTIC overfitting: Fixed noise, ALL timesteps in EVERY batch
+            # We expand the batch to include multiple timesteps per sample
+            # This prevents catastrophic forgetting between epochs
+            B = x_1.shape[0]
+            num_timesteps = 10  # Number of timesteps per sample
+            
+            # Generate fixed noise (same every iteration)
+            generator = torch.Generator(device=x_1.device)
+            generator.manual_seed(42)
+            x_0 = torch.randn(x_1.shape, generator=generator, device=x_1.device, dtype=x_1.dtype)
+            
+            # Expand batch: each sample gets num_timesteps copies at different t values
+            # x_1: (B, 3) -> (B * num_timesteps, 3)
+            # context: (B, C, H, W) -> (B * num_timesteps, C, H, W)
+            x_1_expanded = x_1.repeat_interleave(num_timesteps, dim=0)  # (B*T, 3)
+            x_0_expanded = x_0.repeat_interleave(num_timesteps, dim=0)  # (B*T, 3)
+            context = context.repeat_interleave(num_timesteps, dim=0)   # (B*T, C, H, W)
+            
+            # Create timesteps: each sample sees [0.05, 0.15, ..., 0.95]
+            t_values = torch.linspace(0.05, 0.95, num_timesteps, device=x_1.device)
+            t = t_values.repeat(B)  # (B*T,) - pattern: [0.05,0.15,...,0.95, 0.05,0.15,...,0.95, ...]
+            
+            t_expand = t.view(-1, 1)
+            x_t = (1 - t_expand) * x_0_expanded + t_expand * x_1_expanded
+            target_v = x_1_expanded - x_0_expanded
+            
+            # Import TrainingState
+            from .common import TrainingState
+            sample = TrainingState(x_t=x_t, t=t, target=target_v)
+            
+            # Save fixed noise for sampling consistency (original batch size)
+            if not hasattr(self, '_fixed_x0'):
+                self._fixed_x0 = x_0.clone()
+                self._fixed_x1 = x_1.clone()
+                self._fixed_target_v = (x_1 - x_0).clone()
+        else:
+            x_0 = torch.randn_like(x_1)
+            # Get training state (x_t, t, target) from Path
+            sample = self.path.compute_loss_samples(x_0=x_0, x_1=x_1)
         
         # Predict
         prediction = self.network(sample.x_t, sample.t, context)
-        loss = torch.nn.functional.mse_loss(prediction, sample.target)
-        
+
+        pred_xy = prediction[:, 0:2]
+        target_xy = sample.target[:, 0:2]
+        pred_theta_norm = prediction[:, 2]
+        target_theta_norm = sample.target[:, 2]
+        loss_xy = torch.nn.functional.mse_loss(pred_xy, target_xy)
+
+        # For Flow Matching, the target is a velocity in Euclidean space.
+        # Even for angles, we are transporting in the tangent space (or Euclidean embedding).
+        # Cosine loss is incorrect for velocity matching because velocity magnitude matters.
+        # We use MSE for theta velocity as well.
+        loss_theta = torch.nn.functional.mse_loss(pred_theta_norm, target_theta_norm)
+
+        loss = loss_xy + (2.0 * loss_theta)
+
+        # Log step-level loss for debugging (shows variance in generative training)
+        self.log("train_loss_step", loss, on_step=True, on_epoch=False, prog_bar=True)
         self.train_loss(loss)
-        self.log("train_loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train_loss_epoch", self.train_loss, on_step=False, on_epoch=True, prog_bar=False)
+
+        # saving to visualize training examples when overfitting
+        # Note: In overfit_mode, we save the ORIGINAL batch data (not expanded)
+        if self.overfit_mode and (not hasattr(self, "_train_context") or batch_idx == 0):
+            # Re-build original context from batch (not the expanded one)
+            original_context = self._build_context(batch)
+            self._train_context = original_context.detach().clone()
+            
+            # Save the ORIGINAL normalized poses (before expansion)
+            # x_1 here is the non-expanded version from _normalize_pose(batch['target_goal'])
+            # We need to use _fixed_x1 which was saved from x_1 before expansion
+            self._train_gt_poses = self._fixed_x1.detach().clone()
+            
+            # Save the normalization stats used for this batch (critical for correct denormalization later)
+            self._train_norm_mean = self.mean.detach().clone()
+            self._train_norm_std = self.std.detach().clone()
+            
+            if 'target_goal_mask' in batch:
+                self._train_gt_images = batch['target_goal_mask'].detach().clone()
+            else:
+                self._train_gt_images = torch.zeros_like(batch['static'])
+            if 'object_theta' in batch:
+                self._train_object_theta = batch['object_theta'].detach().clone()
+            else:
+                self._train_object_theta = torch.zeros(batch['target_goal'].shape[0], device=batch['target_goal'].device)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -109,7 +230,19 @@ class UnifiedGenerativeModule(pl.LightningModule):
         
         sample = self.path.compute_loss_samples(x_0=x_0, x_1=x_1)
         prediction = self.network(sample.x_t, sample.t, context)
-        loss = torch.nn.functional.mse_loss(prediction, sample.target)
+        pred_xy = prediction[:, 0:2]
+        target_xy = sample.target[:, 0:2]
+        pred_theta_norm = prediction[:, 2]
+        target_theta_norm = sample.target[:, 2]
+        loss_xy = torch.nn.functional.mse_loss(pred_xy, target_xy)
+
+        # For Flow Matching, the target is a velocity in Euclidean space.
+        # Even for angles, we are transporting in the tangent space (or Euclidean embedding).
+        # Cosine loss is incorrect for velocity matching because velocity magnitude matters.
+        # We use MSE for theta velocity as well.
+        loss_theta = torch.nn.functional.mse_loss(pred_theta_norm, target_theta_norm)
+
+        loss = loss_xy + (2.0 * loss_theta)
         
         self.val_loss(loss)
         self.log("val_loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
@@ -130,10 +263,59 @@ class UnifiedGenerativeModule(pl.LightningModule):
         return loss
 
     def on_validation_epoch_end(self):
-        self.val_loss_best(self.val_loss.compute())
-        self.log("val_loss_best", self.val_loss_best, prog_bar=True)
-        if hasattr(self, '_validation_context'):
+        if not self.overfit_mode:
+            self.val_loss_best(self.val_loss.compute())
+            self.log("val_loss_best", self.val_loss_best, prog_bar=True)
+            if hasattr(self, '_validation_context'):
+                self._visualize_predictions()
+
+    def on_train_epoch_end(self):
+        if self.overfit_mode and hasattr(self, '_train_context'):
             self._visualize_predictions()
+
+    def _get_transformed_mask_cv2(self, current_mask_tensor, pose_norm, object_theta_rad):
+            """
+            Uses the internal _denormalize_pose to ensure pixel-perfect 
+            alignment regardless of normalization mode.
+            """
+            mask_np = (current_mask_tensor.cpu().numpy() * 255).astype(np.uint8)
+            H, W = mask_np.shape
+            pixels_per_meter = W / self.crop_size_meters
+            
+            # 1. DENORMALIZE using the shared model logic
+            # Un-normalize back to raw meters/radians
+            real_pose = self._denormalize_pose(pose_norm.unsqueeze(0)).squeeze(0)
+            
+            dx_obj_meters = real_pose[0].item()
+            dy_obj_meters = real_pose[1].item()
+            dtheta_change = real_pose[2].item()
+
+            # 2. Find current geometry
+            contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours: return torch.zeros_like(current_mask_tensor)
+            cnt = max(contours, key=cv2.contourArea).squeeze()
+            M = cv2.moments(cnt)
+            if M['m00'] == 0: return torch.zeros_like(current_mask_tensor)
+            curr_obj_cx, curr_obj_cy = M['m10'] / M['m00'], M['m01'] / M['m00']
+            
+            # 3. Rotate delta to world/image frame
+            c_theta, s_theta = np.cos(object_theta_rad), np.sin(object_theta_rad)
+            dx_world = dx_obj_meters * c_theta - dy_obj_meters * s_theta
+            dy_world = dx_obj_meters * s_theta + dy_obj_meters * c_theta
+            
+            # 4. Translation and Rotation
+            new_obj_cx = curr_obj_cx + (dx_world * pixels_per_meter)
+            new_obj_cy = curr_obj_cy + (dy_world * pixels_per_meter) # No Y-flip per data gen
+            
+            pts_centered = (cnt - np.array([curr_obj_cx, curr_obj_cy])).astype(np.float32)
+            cr, sr = np.cos(dtheta_change), np.sin(dtheta_change)
+            R = np.array(((cr, -sr), (sr, cr)))
+            
+            pts_final = (R @ pts_centered.T).T + np.array([new_obj_cx, new_obj_cy])
+            
+            new_mask = np.zeros_like(mask_np)
+            cv2.fillPoly(new_mask, [pts_final.astype(np.int32)], 255)
+            return torch.from_numpy(new_mask).float().to(self.device) / 255.0
 
     def _visualize_predictions(self):
         """
@@ -150,103 +332,20 @@ class UnifiedGenerativeModule(pl.LightningModule):
             """Convert from [-1, 1] to [0, 1] and ensure 2D (H, W)."""
             return torch.clamp((x + 1) / 2, 0, 1).squeeze()
 
-        def _get_transformed_mask_cv2(current_mask_tensor, pose_norm, object_theta_rad):
-            """
-            Fixed SE(2) transformation logic.
-            
-            CRITICAL: The pose delta (dx, dy, dtheta) is in the OBJECT's local frame,
-            not world frame. The data generation computes:
-                delta_obj = R(-theta) @ delta_world
-            where theta is the current object's orientation.
-            
-            To visualize correctly, we must:
-            1. Use the provided object theta
-            2. Rotate the object-frame delta back to world frame: delta_world = R(+theta) @ delta_obj
-            3. Apply the world-frame delta in image coordinates (no Y-flip since 
-               generate_local_episode_masks uses: py = (y - center_y) * scale + img_center)
-               
-            Args:
-                current_mask_tensor: The mask of the current object (H, W), values in [0, 1]
-                pose_norm: Normalized pose delta (3,) = (dx_norm, dy_norm, dtheta_norm)
-                object_theta_rad: The current object's orientation in radians
-            """
-            # 1. Prepare Data
-            mask_np = (current_mask_tensor.cpu().numpy() * 255).astype(np.uint8)
-            H, W = mask_np.shape
-            
-            # 2. Decode Scaling (Meters to Pixels)
-            xy_norm = self._xy_norm.item()
-            theta_norm = self._theta_norm.item()
-            crop_size = self.crop_size_meters
-            pixels_per_meter = W / crop_size
-            
-            # 3. Denormalize Pose Delta (still in object frame)
-            dx_obj_meters = pose_norm[0].item() * xy_norm
-            dy_obj_meters = pose_norm[1].item() * xy_norm
-            dtheta_rad = pose_norm[2].item() * theta_norm
-
-            # 4. Find the Current Object's Geometry
-            contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                return torch.zeros_like(current_mask_tensor)
-            
-            cnt = max(contours, key=cv2.contourArea).squeeze()
-            if cnt.ndim != 2: 
-                return torch.zeros_like(current_mask_tensor)
-
-            # 5. Get object centroid from the mask
-            M = cv2.moments(cnt)
-            if M['m00'] == 0:
-                return torch.zeros_like(current_mask_tensor)
-            curr_obj_cx = M['m10'] / M['m00']
-            curr_obj_cy = M['m01'] / M['m00']
-            
-            # Use the provided object theta
-            curr_theta_rad = object_theta_rad
-            
-            # 6. Convert object-frame delta to world/image-frame delta
-            # The data generation used: delta_obj = R(-theta) @ delta_world
-            # So we need: delta_world = R(+theta) @ delta_obj
-            c_theta = np.cos(curr_theta_rad)
-            s_theta = np.sin(curr_theta_rad)
-            
-            # Rotate (dx_obj, dy_obj) by +theta to get world frame
-            dx_world_meters = dx_obj_meters * c_theta - dy_obj_meters * s_theta
-            dy_world_meters = dx_obj_meters * s_theta + dy_obj_meters * c_theta
-            
-            # Convert to pixels
-            dx_px = dx_world_meters * pixels_per_meter
-            dy_px = dy_world_meters * pixels_per_meter
-
-            # 7. Apply Transformation
-            # Step A: Center the points around the object's CURRENT centroid
-            pts_centered = (cnt - np.array([curr_obj_cx, curr_obj_cy])).astype(np.float32)
-            
-            # Step B: Rotate by dtheta (the change in orientation)
-            c, s = np.cos(dtheta_rad), np.sin(dtheta_rad)
-            R = np.array(((c, -s), (s, c)))
-            pts_rotated = (R @ pts_centered.T).T
-            
-            # Step C: Translate the centroid to the NEW position
-            # In this image coordinate system: +dx_world is right, +dy_world is DOWN
-            # (no Y-flip needed since generate_local_episode_masks doesn't flip Y)
-            new_obj_cx = curr_obj_cx + dx_px
-            new_obj_cy = curr_obj_cy + dy_px 
-            
-            # Step D: Un-center points to the new centroid
-            pts_final = (pts_rotated + np.array([new_obj_cx, new_obj_cy])).astype(np.int32)
-            
-            # 8. Draw
-            new_mask = np.zeros_like(mask_np)
-            cv2.fillPoly(new_mask, [pts_final], 255)
-            
-            return torch.from_numpy(new_mask).float().to(current_mask_tensor.device) / 255.0
-
-        # --- MAIN LOOP ---
-        context = self._validation_context
-        gt_images = self._validation_gt_images 
-        gt_poses = self._validation_gt_poses
-        object_thetas = self._validation_object_theta
+        if self.overfit_mode:
+            context = self._train_context
+            gt_images = self._train_gt_images
+            gt_poses = self._train_gt_poses
+            object_thetas = self._train_object_theta
+            # Restore the normalization stats that were used when these poses were normalized
+            saved_mean, saved_std = self.mean.clone(), self.std.clone()
+            self.mean.copy_(self._train_norm_mean)
+            self.std.copy_(self._train_norm_std)
+        else:
+            context = self._validation_context
+            gt_images = self._validation_gt_images
+            gt_poses = self._validation_gt_poses
+            object_thetas = self._validation_object_theta
 
         num_examples = min(8, context.size(0))
         image_size = context.shape[-1]
@@ -274,13 +373,34 @@ class UnifiedGenerativeModule(pl.LightningModule):
 
             # Generate "Ghost" Masks using Pose Deltas
             # Pass object_theta to correctly transform object-frame delta to world frame
-            gt_pose_mask = _get_transformed_mask_cv2(target_obj_curr, gt_pose_delta, obj_theta)
+            gt_pose_mask = self._get_transformed_mask_cv2(target_obj_curr, gt_pose_delta, obj_theta)
+            
+            # DEBUG: Log denormalized pose values to verify correctness
+            if i == 0 and self.current_epoch % 20 == 0:
+                denorm_pose = self._denormalize_pose(gt_pose_delta.unsqueeze(0)).squeeze(0)
+                print(f"[DEBUG Viz] Epoch {self.current_epoch}, Sample 0:")
+                print(f"  Normalized pose: {gt_pose_delta.cpu().numpy()}")
+                print(f"  Denormalized pose: {denorm_pose.cpu().numpy()}")
+                print(f"  Mean: {self.mean.cpu().numpy()}, Std: {self.std.cpu().numpy()}")
             
             # Generate Predictions
             with torch.no_grad():
-                # sample_pose returns (num_samples, 3) for B=1 input
-                # So p_list is (4, 3) - 4 pose samples, each with (dx, dy, dtheta)
-                p_list = self.sample_pose(ctx.unsqueeze(0), num_samples=4, denormalize=False)
+                if self.overfit_mode and hasattr(self, '_fixed_x0'):
+                    # DIRECT velocity test: x_1 = x_0 + v
+                    # This directly tests if the model learned the correct velocity
+                    # without relying on ODE integration across unseen timesteps
+                    x_0_i = self._fixed_x0[i:i+1]  # (1, 3)
+                    # Query model at t=0.5 (middle of training range)
+                    t_test = torch.tensor([0.5], device=ctx.device)
+                    x_t_test = 0.5 * x_0_i + 0.5 * gt_pose_delta.unsqueeze(0)
+                    pred_v = self.network(x_t_test, t_test, ctx.unsqueeze(0))
+                    # Reconstruct x_1 from x_0 + predicted velocity
+                    pred_x1 = x_0_i + pred_v  # (1, 3)
+                    # Repeat for 4 samples (they should all be identical in overfit mode)
+                    p_list = pred_x1.repeat(4, 1)
+                else:
+                    # Normal ODE sampling for non-overfit mode
+                    p_list = self.sample_pose(ctx.unsqueeze(0), num_samples=4, denormalize=False, sample_idx=i)
 
             # --- PANEL 1: LOCAL SCENE ---
             # Req: RobotRegion(Red), GoalRegion(Green), Target(Cyan), Walls(Black)
@@ -309,7 +429,7 @@ class UnifiedGenerativeModule(pl.LightningModule):
             # Req: Walls(Red), GT_Pose(Blue), Pred_Pose(Green)
             preds_imgs = []
             for j in range(4):
-                pred_pose_mask = _get_transformed_mask_cv2(target_obj_curr, p_list[j], obj_theta)
+                pred_pose_mask = self._get_transformed_mask_cv2(target_obj_curr, p_list[j], obj_theta)
                 
                 p_img = torch.zeros(3, image_size, image_size, device=ctx.device)
                 p_img[0] = static_walls     # Red
@@ -329,13 +449,41 @@ class UnifiedGenerativeModule(pl.LightningModule):
             caption = f"Ex {i} | Scene | GT Analysis (Org=Img, Blu=Pose) | Preds (Grn) vs GT (Blu)"
             log_dict[f'val_sample_{i}'] = wandb.Image(grid_np, caption=caption)
 
+        # Restore original stats if we swapped them for overfit visualization
+        if self.overfit_mode:
+            self.mean.copy_(saved_mean)
+            self.std.copy_(saved_std)
+
         self.logger.experiment.log(log_dict)
 
-    def sample_pose(self, context, num_samples=1, num_steps=20, denormalize=True, show_progress=False):
+    def sample_pose(self, context, num_samples=1, num_steps=20, denormalize=True, show_progress=False, sample_idx=None):
+        """
+        Sample poses using the learned velocity field.
+        
+        Args:
+            context: (B, C, H, W) context images
+            num_samples: number of samples per context
+            num_steps: ODE integration steps
+            denormalize: whether to denormalize output
+            show_progress: show tqdm progress bar
+            sample_idx: if in overfit_mode, use fixed noise for this sample index
+        """
         B = context.shape[0]
         context_repeated = context.repeat_interleave(num_samples, dim=0)
         total_samples = B * num_samples
-        x_init = torch.randn(total_samples, self.vector_dim, device=context.device)
+        
+        if self.overfit_mode and hasattr(self, '_fixed_x0') and sample_idx is not None:
+            # Use the SAME fixed noise as training for deterministic comparison
+            x_init = self._fixed_x0[sample_idx:sample_idx+1].repeat(num_samples, 1)
+        elif self.overfit_mode:
+            # Use consistent fixed noise even without sample_idx
+            generator = torch.Generator(device=context.device)
+            generator.manual_seed(42)
+            x_init = torch.randn(total_samples, self.vector_dim, generator=generator, 
+                                device=context.device, dtype=context.dtype)
+        else:
+            x_init = torch.randn(total_samples, self.vector_dim, device=context.device)
+            
         def model_fn(x, t):
             return self.network(x, t, context_repeated)
         samples = self.sampler.sample(model_fn, x_init, num_steps, show_progress, device=context.device)

@@ -1,21 +1,26 @@
 defaults:
   - _self_
 
+wandb_name: "${now:%Y-%m-%d_%H-%M-%S}"
+
 trainer:
   _target_: lightning.pytorch.Trainer
-  max_epochs: 100
+  max_epochs: 1000
   accelerator: gpu
-  devices: 1
-  strategy: auto
+  devices: auto
+  strategy: ddp
+  gradient_clip_val: 1.0
   logger:
     _target_: lightning.pytorch.loggers.WandbLogger
     project: "sage_learning"
-    name: "flow_matching_test"
+    name: "${wandb_name}"
 
 model:
   _target_: src.model.generative_module.UnifiedGenerativeModule
   pose_stats_file: "${hydra:runtime.cwd}/config/dataset_stats.json"
   crop_size_meters: 5.0
+  overfit_mode: false
+  norm_mode: mean_std
   
   # Network Injection
   network:

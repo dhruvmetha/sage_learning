@@ -27,12 +27,21 @@ class FlowMatchingPath(BasePath):
         self.sigma_min = sigma_min
 
     def compute_loss_samples(self, x_0: torch.Tensor, x_1: torch.Tensor) -> TrainingState:
+        """
+        Conditional Flow Matching with linear interpolation path.
+        
+        Path: psi_t(x) = (1-t) * x_0 + t * x_1
+        Velocity: v_t = d(psi_t)/dt = x_1 - x_0
+        
+        The network learns to predict v_t given x_t and t.
+        """
         B = x_0.shape[0]
         device = x_0.device
         t = torch.rand((B,), device=device)
         t_expand = t.view(B, 1)
         x_t = (1 - t_expand) * x_0 + t_expand * x_1
-        target_v = x_1 - (1 - self.sigma_min) * x_0
+        # Correct velocity for linear interpolation CFM
+        target_v = x_1 - x_0
         return TrainingState(x_t=x_t, t=t, target=target_v)
 
 class ODESampler(BaseSampler):

@@ -3,9 +3,10 @@ import numpy as np
 import json
 import argparse
 from pathlib import Path
+import math
 
-def compute_stats(h5_path, output_path, use_local=True):
-    print(f"Opening {h5_path}...")
+def compute_stats(h5_path, output_path, use_local=True, mode="mean_std"):
+    print(f"Opening {h5_path} (Mode: {mode})...")
     
     with h5py.File(h5_path, 'r') as f:
         # 1. Select the correct key based on mode
@@ -15,55 +16,58 @@ def compute_stats(h5_path, output_path, use_local=True):
             raise ValueError(f"Key '{key}' not found in HDF5 file.")
             
         print(f"Reading {key}...")
-        # Load data (Shape: N x 1 x 3 or N x 3)
         data = f[key][:] 
         
-        # Squeeze if necessary (N, 1, 3) -> (N, 3)
         if data.ndim == 3:
             data = data.squeeze(1)
-            
-        # 2. Compute XY Norm
-        # We want the maximum absolute value to ensure everything fits in [-1, 1]
-        # We add a small 5% buffer to be safe against outliers in test sets
-        max_x = np.max(np.abs(data[:, 0]))
-        max_y = np.max(np.abs(data[:, 1]))
-        xy_norm = float(max(max_x, max_y)) * 1.05
-        
-        # 3. Compute Theta Norm
-        # Usually Pi, but let's check the data
-        max_theta = np.max(np.abs(data[:, 2]))
-        theta_norm = float(max_theta)
-        
-        # If theta is roughly Pi (within 10%), just use Pi to keep it standard
-        if abs(theta_norm - np.pi) < 0.3:
-            theta_norm = float(np.pi)
-        else:
-            theta_norm = theta_norm * 1.05 # Add buffer if it's weird data
 
-    stats = {
-        "xy_norm": xy_norm,
-        "dtheta_norm": theta_norm,
-        "n_samples": len(data)
-    }
-    
-    print("="*40)
-    print(f"Stats computed:")
-    print(f"XY Norm (Max abs + 5%): {xy_norm:.4f} m")
-    print(f"Theta Norm:             {theta_norm:.4f} rad")
-    print("="*40)
-    
-    # Save
+        stats = {"mode": mode, "n_samples": len(data)}
+
+        if mode == "max_abs":
+            # Shared XY Norm to preserve aspect ratio
+            max_xy = np.max(np.abs(data[:, 0:2]))
+            xy_norm = float(max_xy)
+            
+            theta_norm = math.pi
+
+            stats.update({"xy_norm": xy_norm, "theta_norm": theta_norm})
+
+        elif mode == "mean_std":
+            x_mean = float(np.mean(data[:, 0:1]))
+            y_mean = float(np.mean(data[:, 1:2]))
+            shared_std = float(np.std(data[:, 0:2])) + 1e-6
+
+            theta_mean = 0
+            theta_std = math.pi
+
+            stats.update({
+                "mean": [x_mean, y_mean, theta_mean],
+                "std":  [shared_std, shared_std, theta_std]
+            })
+
+    # Save logic
     out = Path(output_path)
+    if out.is_dir():
+        out = out / f"stats_{mode}.json"
+    
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, 'w') as f:
         json.dump(stats, f, indent=4)
+    
+    print("="*40)
+    print(f"Stats computed for {mode}:")
+    for k, v in stats.items():
+        if k != "n_samples":
+            print(f"  {k}: {v}")
+    print("="*40)
     print(f"Saved to {out}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--h5_file", type=str, required=True, help="Path to absolute H5 file")
-    parser.add_argument("--output", type=str, default="config/stats/dataset_stats.json")
+    parser.add_argument("--output", type=str, default="config/stats/", help="Output directory or file")
+    parser.add_argument("--mode", type=str, choices=["max_abs", "mean_std"], default="mean_std")
     parser.add_argument("--global_mode", action="store_true", help="Use global keys instead of local")
     args = parser.parse_args()
     
-    compute_stats(args.h5_file, args.output, use_local=not args.global_mode)
+    compute_stats(args.h5_file, args.output, use_local=not args.global_mode, mode=args.mode)

@@ -29,6 +29,12 @@ import hydra
 import lightning.pytorch as pl
 import torch
 
+try:
+    import cv2
+    cv2.setNumThreads(0)
+except ImportError:
+    pass
+
 # Configure default dtype
 torch.set_default_dtype(torch.float32)
 

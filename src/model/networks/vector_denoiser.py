@@ -20,39 +20,61 @@ class EnvironmentEncoder(nn.Module):
     def __init__(self, in_channels=3, out_dim=512):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 3, 2, 1), nn.BatchNorm2d(32), nn.SiLU(),
-            nn.Conv2d(32, 64, 3, 2, 1), nn.BatchNorm2d(64), nn.SiLU(),
-            nn.Conv2d(64, 128, 3, 2, 1), nn.BatchNorm2d(128), nn.SiLU(),
-            nn.Conv2d(128, 256, 3, 2, 1), nn.BatchNorm2d(256), nn.SiLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Conv2d(in_channels, 32, 3, 2, 1), nn.GroupNorm(8, 32), nn.SiLU(),
+            nn.Conv2d(32, 64, 3, 2, 1), nn.GroupNorm(8, 64), nn.SiLU(),
+            nn.Conv2d(64, 128, 3, 2, 1), nn.GroupNorm(8, 128), nn.SiLU(),
+            nn.Conv2d(128, 256, 3, 2, 1), nn.GroupNorm(8, 256), nn.SiLU(),
+            
+            # --- THE FIX ---
+            # Instead of LazyLinear, we use Adaptive Pooling to a 4x4 grid.
+            # This ensures the output is ALWAYS (256 * 4 * 4) = 4096, 
+            # regardless of input image size.
+            # It preserves spatial data (unlike 1x1 pooling) but fixes the crash.
+            nn.AdaptiveAvgPool2d((4, 4)), 
+            
             nn.Flatten(),
-            nn.Linear(256, out_dim)
+            
+            # 256 channels * 4 * 4 grid = 4096 input features
+            nn.Linear(4096, out_dim), 
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim)
         )
+
     def forward(self, x):
         return self.net(x)
 
 class FiLMBlock(nn.Module):
+    """
+    Kept the name 'FiLMBlock' for compatibility, but internally 
+    this is now a Concatenation Block for stronger signal.
+    """
     def __init__(self, hidden_dim, cond_dim):
         super().__init__()
-        self.cond_proj = nn.Linear(cond_dim, hidden_dim * 2)
-        self.mlp = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim + cond_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
 
     def forward(self, x, condition):
-        emb = self.cond_proj(condition)
-        scale, shift = torch.chunk(emb, 2, dim=-1)
-        x_modulated = x * (1 + scale) + shift
-        return x + self.mlp(x_modulated)
+        # Concatenation forces the network to look at the condition
+        combined = torch.cat([x, condition], dim=-1)
+        return x + self.mlp(combined)
 
 class VectorDenoiserBackbone(nn.Module):
     def __init__(self, vector_dim=3, image_channels=3, hidden_dim=256, cond_dim=512, num_layers=6):
         super().__init__()
         self.encoder = EnvironmentEncoder(image_channels, cond_dim)
+        
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
         )
+        
         self.input_proj = nn.Linear(vector_dim, hidden_dim)
+        
         self.layers = nn.ModuleList([FiLMBlock(hidden_dim, cond_dim) for _ in range(num_layers)])
+        
         self.final_layer = nn.Linear(hidden_dim, vector_dim)
 
     def forward(self, x, t, images):
