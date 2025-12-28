@@ -65,6 +65,10 @@ decay_steps: 300000
 context_size: 64  # Full context for geometry encoder
 crop_size: 24     # Center crop for target prediction
 
+# Weighted sampling: upsample regions with fewer training solutions
+# Set to true to help model learn rare/hard regions better
+weighted_sampling: false
+
 # GPU (for legacy compatibility)
 gpu_id: 0
 

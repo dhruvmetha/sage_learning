@@ -229,7 +229,17 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
         train_split: float = 1.0,
+        use_h5: bool = True,
+        weighted_sampling: Union[bool, str] = False,
     ):
+        """
+        Args:
+            use_h5: If True, look for H5 file. If False, use NPZ files only.
+            weighted_sampling: Sampling strategy. Options:
+                - False / "none": Uniform sampling (default)
+                - True / "inverse_solutions": Weight = 1/solutions_found (upsample rare regions)
+                - "solution_depth": Balance depths equally (1-push and 2-push appear equally in batches)
+        """
         super().__init__()
 
         self.data_dir = data_dir
@@ -239,9 +249,18 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.train_split = train_split
+        self.use_h5 = use_h5
+        # Normalize weighted_sampling to string
+        if weighted_sampling is True:
+            self.weighted_sampling = "inverse_solutions"
+        elif weighted_sampling is False:
+            self.weighted_sampling = "none"
+        else:
+            self.weighted_sampling = weighted_sampling
 
         self.train_dataset = None
         self.val_dataset = None
+        self.train_sampler = None
 
     def _normalized_roots(self) -> List[Path]:
         if isinstance(self.data_dir, (list, tuple)):
@@ -286,32 +305,145 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
 
     def _find_h5_file(self) -> Optional[str]:
         roots = self._normalized_roots()
+        print(f"[setup] Looking for H5 files in {len(roots)} root(s)...", flush=True)
         for root in roots:
+            # Check for adjacent h5 file (e.g., data_dir.h5)
             h5_path = root.parent / f"{root.name}.h5"
+            print(f"[setup]   Checking: {h5_path} ... ", end="", flush=True)
             if h5_path.exists():
+                print("FOUND", flush=True)
                 return str(h5_path)
+            print("not found", flush=True)
+
+            # Check for data.h5 inside directory
             h5_path = root / "data.h5"
+            print(f"[setup]   Checking: {h5_path} ... ", end="", flush=True)
             if h5_path.exists():
+                print("FOUND", flush=True)
                 return str(h5_path)
+            print("not found", flush=True)
+
+            # Check for any .h5 file in directory
+            print(f"[setup]   Checking: {root}/*.h5 ... ", end="", flush=True)
             h5_files = list(root.glob("*.h5"))
             if h5_files:
+                print(f"FOUND {len(h5_files)} file(s): {h5_files[0].name}", flush=True)
                 return str(h5_files[0])
+            print("not found", flush=True)
+
+        print("[setup] No H5 file found, will use NPZ files", flush=True)
         return None
+
+    def _create_weighted_sampler(
+        self,
+        indices: List[int],
+        strategy: str,
+        solutions_found: Optional[np.ndarray] = None,
+        solution_depth: Optional[np.ndarray] = None,
+    ):
+        """Create a WeightedRandomSampler based on the specified strategy.
+
+        Args:
+            indices: Training indices
+            strategy: One of "inverse_solutions" or "solution_depth"
+            solutions_found: Array of solutions_found values (for inverse_solutions)
+            solution_depth: Array of solution_depth values (for solution_depth)
+        """
+        from torch.utils.data import WeightedRandomSampler
+
+        if strategy == "inverse_solutions":
+            if solutions_found is None:
+                print("[setup] WARNING: inverse_solutions strategy requires solutions_found field, falling back to uniform", flush=True)
+                return None
+            # Get solutions_found for train indices only
+            print(f"[setup] Processing solutions_found for {len(indices)} samples...", flush=True)
+            values = np.array([solutions_found[i] for i in indices])
+            print(f"[setup] Clipping values...", flush=True)
+            values = np.clip(values, 1, None)  # At least 1 to avoid div by zero
+            # Weight = 1 / solutions_found (inverse frequency)
+            print(f"[setup] Computing weights...", flush=True)
+            weights = 1.0 / values.astype(np.float64)
+            field_name = "solutions_found"
+
+        elif strategy == "solution_depth":
+            if solution_depth is None:
+                print("[setup] WARNING: solution_depth strategy requires solution_depth field, falling back to uniform", flush=True)
+                return None
+            # Get solution_depth for train indices only
+            values = np.array([solution_depth[i] for i in indices])
+            values = np.clip(values, 1, None)  # At least 1
+            # Inverse class frequency: weight = 1 / count(depth == d)
+            # This balances so each depth contributes equally to batches
+            unique_depths, counts = np.unique(values, return_counts=True)
+            depth_to_weight = {d: 1.0 / c for d, c in zip(unique_depths, counts)}
+            weights = np.array([depth_to_weight[d] for d in values])
+            field_name = "solution_depth"
+
+        else:
+            print(f"[setup] WARNING: Unknown weighted sampling strategy '{strategy}', falling back to uniform")
+            return None
+
+        # Normalize weights
+        print(f"[setup] Normalizing weights...", flush=True)
+        weights = weights / weights.sum() * len(weights)
+
+        # Stats
+        unique_vals, counts = np.unique(values, return_counts=True)
+        print(f"[setup] Weighted sampling enabled (strategy: {strategy}):", flush=True)
+        print(f"  {field_name} distribution: {dict(zip(unique_vals.tolist(), counts.tolist()))}", flush=True)
+        print(f"  weight range: [{weights.min():.3f}, {weights.max():.3f}]", flush=True)
+
+        return WeightedRandomSampler(
+            weights=weights.tolist(),
+            num_samples=len(weights),
+            replacement=True
+        )
 
     def setup(self, stage: Optional[str] = None):
         if self.train_dataset is not None:
             return
 
-        print(f"[setup] Context size: {self.context_size}, Crop size: {self.crop_size}")
+        # Get rank for distributed training (stagger H5 file access)
+        import os
+        import time
+        rank = int(os.environ.get('LOCAL_RANK', 0))
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
 
-        h5_path = self._find_h5_file()
+        print(f"[setup] Rank {rank}/{world_size}: Context size: {self.context_size}, Crop size: {self.crop_size}", flush=True)
+        print(f"[setup] Rank {rank}: use_h5: {self.use_h5}", flush=True)
+
+        h5_path = self._find_h5_file() if self.use_h5 else None
 
         if h5_path and HAS_H5PY:
-            print(f"[setup] Using HDF5: {h5_path}")
+            print(f"[setup] Rank {rank}: Using HDF5: {h5_path}", flush=True)
+
+            # Stagger H5 file access to avoid race condition
+            if world_size > 1:
+                time.sleep(rank * 0.5)  # 0.5 second delay per rank
+                print(f"[setup] Rank {rank}: Opening H5 file (staggered)...", flush=True)
+            else:
+                print(f"[setup] Opening H5 file...", flush=True)
 
             with h5py.File(h5_path, 'r') as h5f:
+                print(f"[setup] H5 file opened, reading n_samples...", flush=True)
                 n_samples = h5f.attrs.get('n_samples', len(h5f[list(h5f.keys())[0]]))
+                print(f"[setup] n_samples: {n_samples}", flush=True)
 
+                # Load fields for weighted sampling
+                all_solutions_found = None
+                all_solution_depth = None
+                if self.weighted_sampling != "none":
+                    print(f"[setup] Loading weighted sampling fields...", flush=True)
+                    if 'solutions_found' in h5f:
+                        print(f"[setup] Loading solutions_found...", flush=True)
+                        all_solutions_found = h5f['solutions_found'][:].flatten()
+                        print(f"[setup] Loaded solutions_found: {len(all_solutions_found)} values", flush=True)
+                    if 'solution_depth' in h5f:
+                        print(f"[setup] Loading solution_depth...", flush=True)
+                        all_solution_depth = h5f['solution_depth'][:].flatten()
+                        print(f"[setup] Loaded solution_depth: {len(all_solution_depth)} values", flush=True)
+
+            print(f"[setup] Shuffling indices...", flush=True)
             rng = random.Random(0)
             all_indices = list(range(n_samples))
             rng.shuffle(all_indices)
@@ -325,19 +457,32 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
                 train_indices = all_indices[:split_idx]
                 val_indices = all_indices[split_idx:]
 
-            print(f"[setup] Train: {len(train_indices)}, Val: {len(val_indices)}")
+            print(f"[setup] Train: {len(train_indices)}, Val: {len(val_indices)}", flush=True)
 
             if stage == "fit" or stage is None:
+                print(f"[setup] Creating train dataset...", flush=True)
                 self.train_dataset = MaskDiffusionCroppedHDF5Dataset(
                     h5_path, train_indices,
                     context_size=self.context_size, crop_size=self.crop_size
                 )
+                print(f"[setup] Creating val dataset...", flush=True)
                 self.val_dataset = MaskDiffusionCroppedHDF5Dataset(
                     h5_path, val_indices,
                     context_size=self.context_size, crop_size=self.crop_size
                 )
+
+                # Create weighted sampler if enabled
+                if self.weighted_sampling != "none":
+                    print(f"[setup] Creating weighted sampler (strategy: {self.weighted_sampling})...", flush=True)
+                    self.train_sampler = self._create_weighted_sampler(
+                        train_indices,
+                        strategy=self.weighted_sampling,
+                        solutions_found=all_solutions_found,
+                        solution_depth=all_solution_depth,
+                    )
+                    print(f"[setup] Weighted sampler created.", flush=True)
         else:
-            print("[setup] Using NPZ files")
+            print("[setup] Using NPZ files", flush=True)
             all_datafiles = self._collect_npz_files()
             if not all_datafiles:
                 raise RuntimeError(f"No .npz files found under {self.data_dir}")
@@ -371,6 +516,16 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
         print("[setup] Complete!")
 
     def train_dataloader(self):
+        # Use weighted sampler if available, otherwise shuffle
+        if self.train_sampler is not None:
+            return DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                sampler=self.train_sampler,  # sampler replaces shuffle
+                persistent_workers=True if self.num_workers > 0 else False,
+            )
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
