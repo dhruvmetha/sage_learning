@@ -16,3 +16,13 @@ crop_size: ${crop_size}
 
 # Train/val split
 train_split: 0.9
+
+# Use HDF5 file if available (faster loading)
+use_h5: ${use_h5}
+
+# Weighted sampling strategy (requires HDF5 with appropriate fields)
+# Options:
+#   - "none" or false: Uniform sampling (default)
+#   - "inverse_solutions": Weight = 1/solutions_found (upsample rare regions)
+#   - "solution_depth": Balance depths equally (1-push and 2-push appear equally in batches)
+weighted_sampling: ${weighted_sampling}

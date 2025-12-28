@@ -80,6 +80,10 @@ MINIMAL_KEYS = [
     # Metadata needed for training
     'xml_file',
     'solution_depth',  # How many actions remain
+    # Solution counts for sample weighting
+    'solutions_found',  # Number of solutions recorded for this region
+    'solutions_total',  # Total solutions found during search
+    'pushes_total',     # Total push attempts for this region
 ]
 
 
