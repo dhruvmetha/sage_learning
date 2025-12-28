@@ -5,10 +5,10 @@
 #   python src/train_generative.py --config-name=train_cropped_diffusion_crossattn
 
 # Experiment name (used in output path)
-name: cropped_diffusion_crossattn_2push
+name: cropped_diffusion_crossattn_balanced_solutions
 output_dir: /common/users/dm1487/namo_data/outputs/${name}
-data_dir: /common/users/dm1487/namo_data/h5_files/dec2/aug9_envs/2_push_train_corrected_overlaps_2
-
+# data_dir: /common/users/dm1487/namo_data/h5_files/dec2/aug9_envs/2_push_train_corrected_overlaps_2
+data_dir: /common/users/dm1487/namo_data/h5_files/dec25/aug9_envs/1_push_train
 # Resume from checkpoint (set to path to resume training, null to start fresh)
 ckpt_path: null
 
@@ -24,7 +24,7 @@ defaults:
   - _self_
   - data: mask_diffusion_data_cropped
   - model: generative_cropped_diffusion_crossattn
-  - trainer: multi_gpu
+  - trainer: single_gpu
   - callbacks: default
 
 # Random seed
@@ -33,6 +33,10 @@ seed: 42
 # Data loading
 num_workers: 0
 batch_size: 64
+use_h5: true
+
+# Weighted sampling strategy: "none", "inverse_solutions", or "solution_depth"
+weighted_sampling: inverse_solutions
 
 # Training
 max_epochs: 1000
