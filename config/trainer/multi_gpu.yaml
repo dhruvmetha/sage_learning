@@ -20,7 +20,7 @@ devices: auto  # Use all available GPUs, or set to specific number (e.g., 4)
 strategy:
   _target_: lightning.pytorch.strategies.DDPStrategy
   find_unused_parameters: false  # Set to true if model has unused params
-  static_graph: true  # Optimization for models with static computation graphs
+  static_graph: false  # Disabled - can cause hangs with some configurations
   gradient_as_bucket_view: false  # Avoids stride mismatch warnings with ConvTranspose2d
 
 # Training duration
