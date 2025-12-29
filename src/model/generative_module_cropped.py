@@ -336,6 +336,7 @@ class GenerativeModuleCropped(pl.LightningModule):
         context: torch.Tensor,
         samples: int = 32,
         num_steps: int = 20,
+        seed: int = None,
     ) -> torch.Tensor:
         """
         Generate multiple samples for inference.
@@ -344,6 +345,7 @@ class GenerativeModuleCropped(pl.LightningModule):
             context: Context tensor (1, 5, context_size, context_size)
             samples: Number of samples to generate
             num_steps: Sampling steps
+            seed: Random seed for reproducible noise (None for random)
 
         Returns:
             Generated samples (samples, C, context_size, context_size)
@@ -354,7 +356,11 @@ class GenerativeModuleCropped(pl.LightningModule):
         # Repeat context for multiple samples
         context_repeated = context.repeat(samples, 1, 1, 1)
 
-        x_init = torch.randn(samples, self.target_channels, self.crop_size, self.crop_size, device=context.device)
+        if seed is not None:
+            generator = torch.Generator(device=context.device).manual_seed(seed)
+            x_init = torch.randn(samples, self.target_channels, self.crop_size, self.crop_size, device=context.device, generator=generator)
+        else:
+            x_init = torch.randn(samples, self.target_channels, self.crop_size, self.crop_size, device=context.device)
 
         def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             return self(x, t, context_repeated)

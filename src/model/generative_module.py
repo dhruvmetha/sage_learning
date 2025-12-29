@@ -601,7 +601,8 @@ class GenerativeModule(pl.LightningModule):
         inp: torch.Tensor,
         tgt_size: int = 1,
         samples: int = 32,
-        num_steps: int = 20
+        num_steps: int = 20,
+        seed: int = None
     ) -> torch.Tensor:
         """
         Sample generation interface for inference.
@@ -611,6 +612,7 @@ class GenerativeModule(pl.LightningModule):
             tgt_size: Number of target channels (default 1 for goal-only)
             samples: Number of samples to generate
             num_steps: Number of sampling steps
+            seed: Random seed for reproducible noise (None for random)
 
         Returns:
             Generated samples, shape (samples, tgt_size, H, W)
@@ -619,7 +621,11 @@ class GenerativeModule(pl.LightningModule):
         inp_repeated = inp.repeat(samples, 1, 1, 1)
 
         # Initialize from different noise for each sample (enables diverse outputs)
-        x_init = torch.randn(samples, tgt_size, inp.shape[2], inp.shape[3], device=inp.device)
+        if seed is not None:
+            generator = torch.Generator(device=inp.device).manual_seed(seed)
+            x_init = torch.randn(samples, tgt_size, inp.shape[2], inp.shape[3], device=inp.device, generator=generator)
+        else:
+            x_init = torch.randn(samples, tgt_size, inp.shape[2], inp.shape[3], device=inp.device)
 
         def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             model_input = torch.cat([inp_repeated, x], dim=1)
