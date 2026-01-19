@@ -208,7 +208,9 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         pin_memory: bool = True,
         use_coord_grid: bool = False,
         use_local: bool = True, # Default to True per instructions
-        train_split: float = 0.9,
+        train_split: float = 0.8,
+        val_split: float = 0.1,
+        test_split: float = 0.1,
     ):
         super().__init__()
         self.save_hyperparameters() # Handled by Lightning
@@ -222,6 +224,17 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
         self.use_coord_grid = use_coord_grid
         self.use_local = use_local
         self.train_split = train_split
+        self.val_split = val_split
+        self.test_split = test_split
+        
+        # Backward compatibility: if splits sum > 1.0, cap val_split and zero test_split
+        # This handles old configs that only specified train_split
+        total = train_split + val_split + test_split
+        if total > 1.0:
+            # Assume old 2-way split: val_split = 1 - train_split, test_split = 0
+            self.val_split = 1.0 - train_split
+            self.test_split = 0.0
+            total = 1.0
 
         self.train_dataset = None
         self.val_dataset = None
@@ -288,24 +301,39 @@ class MaskDiffusionDataModule(pl.LightningDataModule):
             indices = list(range(n_samples))
             random.Random(42).shuffle(indices)
             
-            split = int(n_samples * self.train_split)
-            train_idx, val_idx = indices[:split], indices[split:]
+            # 3-way split: train / val / test
+            train_end = int(n_samples * self.train_split)
+            val_end = int(n_samples * (self.train_split + self.val_split))
+            
+            train_idx = indices[:train_end]
+            val_idx = indices[train_end:val_end]
+            test_idx = indices[val_end:]
+            
+            print(f"Dataset split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
             
             self.train_dataset = MaskDiffusionHDF5Dataset(h5_path, train_idx, transform, self.use_coord_grid, self.use_local)
             self.val_dataset = MaskDiffusionHDF5Dataset(h5_path, val_idx, transform, self.use_coord_grid, self.use_local)
-            self.test_dataset = MaskDiffusionHDF5Dataset(h5_path, val_idx, transform, self.use_coord_grid, self.use_local)
+            self.test_dataset = MaskDiffusionHDF5Dataset(h5_path, test_idx, transform, self.use_coord_grid, self.use_local)
 
         else:
             print("Using NPZ files")
             files = self._collect_files()
             random.Random(42).shuffle(files)
             
-            split = int(len(files) * self.train_split)
-            train_files, val_files = files[:split], files[split:]
+            # 3-way split: train / val / test
+            n_files = len(files)
+            train_end = int(n_files * self.train_split)
+            val_end = int(n_files * (self.train_split + self.val_split))
+            
+            train_files = files[:train_end]
+            val_files = files[train_end:val_end]
+            test_files = files[val_end:]
+            
+            print(f"Dataset split: train={len(train_files)}, val={len(val_files)}, test={len(test_files)}")
             
             self.train_dataset = MaskDiffusionDataset(train_files, transform, self.use_coord_grid, self.use_local)
             self.val_dataset = MaskDiffusionDataset(val_files, transform, self.use_coord_grid, self.use_local)
-            self.test_dataset = MaskDiffusionDataset(val_files, transform, self.use_coord_grid, self.use_local)
+            self.test_dataset = MaskDiffusionDataset(test_files, transform, self.use_coord_grid, self.use_local)
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, 

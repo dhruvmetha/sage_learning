@@ -11,6 +11,7 @@ import cv2
 # UPDATED IMPORTS to match your structure
 from .networks.vector_denoiser import VectorDenoiserBackbone
 from .common import BasePath, BaseSampler
+from .base import BasePath as DiffusionBasePath, BaseSampler as DiffusionBaseSampler
 
 class UnifiedGenerativeModule(pl.LightningModule):
     def __init__(
@@ -60,6 +61,48 @@ class UnifiedGenerativeModule(pl.LightningModule):
         self.val_loss = MeanMetric()
         self.val_loss_best = MinMetric()
         self.save_hyperparameters(ignore=["network", "path", "sampler", "optimizer"])
+        self._sampler_time_scaling_synced = False
+
+    def _sync_sampler_time_scaling(self) -> None:
+        """Ensure sampler timestep scaling matches how the path trained the network.
+
+        Vector diffusion training via `VectorHFDiffusionPath` always feeds normalized
+        timesteps `t ∈ [0, 1]` into the network. However, `HFDiffusionSampler` defaults
+        to passing integer timesteps unless `normalize_t=True`. If these differ, W&B
+        validation samples (and any manual sampling via `sample_pose`) will look wrong.
+        """
+        if self._sampler_time_scaling_synced:
+            return
+        self._sampler_time_scaling_synced = True
+
+        desired_normalize_t = None
+
+        # VectorHFDiffusionPath always uses normalized t ∈ [0, 1].
+        try:
+            from .paths.vector_hf_diffusion_path import VectorHFDiffusionPath
+
+            if isinstance(self.path, VectorHFDiffusionPath):
+                desired_normalize_t = True
+        except Exception:
+            pass
+
+        # Generic HF diffusion path can be configured either way.
+        if desired_normalize_t is None and hasattr(self.path, "normalize_t"):
+            desired_normalize_t = bool(getattr(self.path, "normalize_t"))
+
+        if desired_normalize_t is None or not hasattr(self.sampler, "normalize_t"):
+            return
+
+        current = bool(getattr(self.sampler, "normalize_t"))
+        if current == desired_normalize_t:
+            return
+
+        setattr(self.sampler, "normalize_t", desired_normalize_t)
+        if getattr(getattr(self, "trainer", None), "is_global_zero", True):
+            print(
+                f"[UnifiedGenerativeModule] Set sampler.normalize_t={desired_normalize_t} "
+                "to match training-time path timestep scaling."
+            )
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         return self.network(x, t, context)
@@ -468,6 +511,7 @@ class UnifiedGenerativeModule(pl.LightningModule):
             show_progress: show tqdm progress bar
             sample_idx: if in overfit_mode, use fixed noise for this sample index
         """
+        self._sync_sampler_time_scaling()
         B = context.shape[0]
         context_repeated = context.repeat_interleave(num_samples, dim=0)
         total_samples = B * num_samples
@@ -489,6 +533,142 @@ class UnifiedGenerativeModule(pl.LightningModule):
         samples = self.sampler.sample(model_fn, x_init, num_steps, show_progress, device=context.device)
         if denormalize: return self._denormalize_pose(samples)
         return samples
+
+    def configure_optimizers(self):
+        return self.optimizer_partial(params=self.parameters())
+
+
+class GenerativeModule(pl.LightningModule):
+    """Image-to-image diffusion module (global or local masks)."""
+
+    def __init__(
+        self,
+        network: nn.Module,
+        path: DiffusionBasePath,
+        sampler: DiffusionBaseSampler,
+        optimizer: Any,
+        context_channels: int = 5,
+        target_channels: int = 1,
+        use_local: bool = True,
+        aux_loss_weight: float = 0.0,
+    ):
+        super().__init__()
+        self.network = network
+        self.path = path
+        self.sampler = sampler
+        self.optimizer_partial = optimizer
+        self.context_channels = context_channels
+        self.target_channels = target_channels
+        self.use_local = use_local
+        self.aux_loss_weight = aux_loss_weight
+
+        self.train_loss = MeanMetric()
+        self.val_loss = MeanMetric()
+        self.val_loss_best = MinMetric()
+        self.save_hyperparameters(ignore=["network", "path", "sampler", "optimizer"])
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.network(x, t)
+
+    def _build_context(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if self.use_local:
+            parts = [
+                batch["static"],
+                batch["movable"],
+                batch["target_object"],
+                batch.get("robot_region", torch.zeros_like(batch["static"])),
+                batch.get("goal_sample_region", torch.zeros_like(batch["static"])),
+            ]
+        else:
+            parts = [
+                batch["robot"],
+                batch["goal"],
+                batch["movable"],
+                batch["static"],
+                batch["target_object"],
+            ]
+        if "coord_grid" in batch:
+            parts.append(batch["coord_grid"])
+        return torch.cat(parts, dim=1)
+
+    def _get_target(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        target = batch["target_goal_mask"]
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        return target
+
+    def training_step(self, batch, batch_idx):
+        context = self._build_context(batch)
+        x_1 = self._get_target(batch)
+        x_0 = torch.randn_like(x_1)
+
+        sample = self.path.sample(x_0=x_0, x_1=x_1)
+        model_in = torch.cat([context, sample.x_t], dim=1)
+        prediction = self.network(model_in, sample.t)
+
+        loss = torch.nn.functional.mse_loss(prediction, sample.target)
+
+        if self.aux_loss_weight > 0:
+            pred_x1 = self.path.get_x1_from_prediction(sample.x_t, sample.t, prediction)
+            aux_loss = torch.nn.functional.mse_loss(pred_x1, x_1)
+            loss = loss + self.aux_loss_weight * aux_loss
+
+        self.train_loss(loss)
+        self.log("train_loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=False)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        context = self._build_context(batch)
+        x_1 = self._get_target(batch)
+        x_0 = torch.randn_like(x_1)
+
+        sample = self.path.sample(x_0=x_0, x_1=x_1)
+        model_in = torch.cat([context, sample.x_t], dim=1)
+        prediction = self.network(model_in, sample.t)
+
+        loss = torch.nn.functional.mse_loss(prediction, sample.target)
+
+        if self.aux_loss_weight > 0:
+            pred_x1 = self.path.get_x1_from_prediction(sample.x_t, sample.t, prediction)
+            aux_loss = torch.nn.functional.mse_loss(pred_x1, x_1)
+            loss = loss + self.aux_loss_weight * aux_loss
+
+        self.val_loss(loss)
+        self.log("val_loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    def on_validation_epoch_end(self):
+        self.val_loss_best(self.val_loss.compute())
+        self.log("val_loss_best", self.val_loss_best, prog_bar=True)
+
+    @torch.no_grad()
+    def sample_from_model(
+        self,
+        context: torch.Tensor,
+        samples: int = 1,
+        num_steps: Optional[int] = None,
+    ) -> torch.Tensor:
+        batch = context.shape[0]
+        context_rep = context.repeat_interleave(samples, dim=0)
+        x_init = torch.randn(
+            batch * samples,
+            self.target_channels,
+            context.shape[-1],
+            context.shape[-1],
+            device=context.device,
+            dtype=context.dtype,
+        )
+
+        def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            model_in = torch.cat([context_rep, x], dim=1)
+            return self.network(model_in, t)
+
+        return self.sampler.sample(
+            model_fn,
+            x_init,
+            num_steps=num_steps,
+            device=context.device,
+        )
 
     def configure_optimizers(self):
         return self.optimizer_partial(params=self.parameters())

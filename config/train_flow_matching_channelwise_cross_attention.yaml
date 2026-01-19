@@ -31,32 +31,31 @@ model:
   crop_size_meters: 5.0
   overfit_mode: false
   norm_mode: mean_std
-  
-  # Network Injection
+
   network:
-    _target_: src.model.networks.vector_denoiser.VectorDenoiserBackbone
+    _target_: src.model.networks.channelwise_cross_attention_vector_denoiser.ChannelwiseCrossAttentionVectorDenoiserBackbone
     vector_dim: 3
     image_channels: 5
     hidden_dim: 256
     num_layers: 6
-  
-  # Logic Injection
+    num_heads: 8
+    token_grid: 8
+    mlp_ratio: 4.0
+
   path:
     _target_: src.model.common.FlowMatchingPath
     sigma_min: 1e-5
-  
+
   sampler:
     _target_: src.model.common.ODESampler
     method: 'euler'
-  
-  # Optimizer Injection
+
   optimizer:
     _target_: torch.optim.AdamW
     _partial_: true
     lr: 3e-4
     weight_decay: 1e-4
 
-  # Module Params
   context_channels: 5
   use_local: true
   vector_dim: 3

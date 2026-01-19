@@ -59,6 +59,7 @@ class HFDiffusionSampler(BaseSampler):
             - 'v_prediction': Velocity prediction
             - 'sample': Direct sample prediction
         clip_sample: Whether to clip samples to [-1, 1]
+        normalize_t: Whether to normalize timesteps to [0, 1] before the model
         eta: DDIM eta parameter (0 = deterministic, only for DDIM)
     """
 
@@ -72,6 +73,7 @@ class HFDiffusionSampler(BaseSampler):
         prediction_type: Literal["epsilon", "v_prediction", "sample"] = "epsilon",
         clip_sample: bool = False,
         eta: float = 0.0,
+        normalize_t: bool = False,
     ):
         if not _check_diffusers():
             raise ImportError(
@@ -85,6 +87,7 @@ class HFDiffusionSampler(BaseSampler):
         self.num_train_timesteps = num_train_timesteps
         self.clip_sample = clip_sample
         self.eta = eta
+        self.normalize_t = normalize_t
 
         # Create the appropriate scheduler
         scheduler_kwargs = dict(
@@ -137,12 +140,11 @@ class HFDiffusionSampler(BaseSampler):
             iterator = tqdm(timesteps, desc=f"{self.sampler_type.upper()} Sampling")
 
         for t in iterator:
-            # Normalize timestep to [0, 1] for model input
-            t_normalized = torch.full(
-                (x.shape[0],),
-                t.item() / self.num_train_timesteps,
-                device=device
-            )
+            if self.normalize_t:
+                t_value = t.item() / self.num_train_timesteps
+            else:
+                t_value = float(t.item())
+            t_normalized = torch.full((x.shape[0],), t_value, device=device)
 
             # Predict noise/velocity
             with torch.no_grad():
@@ -190,11 +192,11 @@ class HFDiffusionSampler(BaseSampler):
         trajectory = [x.clone()]
 
         for step_idx, t in enumerate(timesteps):
-            t_normalized = torch.full(
-                (x.shape[0],),
-                t.item() / self.num_train_timesteps,
-                device=device
-            )
+            if self.normalize_t:
+                t_value = t.item() / self.num_train_timesteps
+            else:
+                t_value = float(t.item())
+            t_normalized = torch.full((x.shape[0],), t_value, device=device)
 
             with torch.no_grad():
                 model_output = model(x, t_normalized)

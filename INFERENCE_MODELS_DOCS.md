@@ -2,20 +2,31 @@
 
 ## Overview
 
-This package provides a specialized inference model for robotic manipulation goal prediction:
+This package provides specialized inference models for robotic manipulation goal prediction:
 
-- **`GoalInferenceModel`**: Generates goal poses in SE(2) space for a selected object
+- **`GoalInferenceModel`** (Legacy): Generates goal poses via mask diffusion - extracts SE(2) pose from predicted masks
+- **`GoalVectorInferenceModel`** (Current): Generates goal poses via vector prediction - directly predicts SE(2) deltas in object frame
 
-The model provides a clean, reusable interface for predicting where to push a known object.
+The models provide clean, reusable interfaces for predicting where to push a known object.
 
 ## Architecture
 
+### Legacy Mask Prediction
 ```
 json_message + xml_path + robot_goal + selected_object
                     ↓
           [GoalInferenceModel]
                     ↓
-              goal_proposals (x, y, theta)
+         mask → OpenCV → goal_proposals (x, y, theta)
+```
+
+### Vector Prediction (Current)
+```
+json_message + xml_path + robot_goal + selected_object
+                    ↓
+        [GoalVectorInferenceModel]
+                    ↓
+    SE2 delta (object frame) → rotation → goal_proposals (x, y, theta)
 ```
 
 ## Installation
@@ -68,6 +79,43 @@ List of goal dictionaries with:
 - `x`, `y`, `theta`: SE(2) pose components
 - `goal_sample`: Raw diffusion output array
 
+### GoalVectorInferenceModel (Recommended)
+
+#### Constructor
+```python
+GoalVectorInferenceModel(model_path: str, device: str = "cuda", sampler_method: str = None, num_steps: int = None)
+```
+
+**Parameters:**
+- `model_path`: Path to trained vector model (e.g., `"outputs/flow_matching/2025-01-15_..."`)
+- `device`: PyTorch device ("cuda" or "cpu")
+- `sampler_method`: ODE sampler method - "euler", "midpoint", "rk4", "dopri5" (default: from training config)
+- `num_steps`: Number of ODE integration steps (default: 20)
+
+#### infer() Method
+```python
+infer(json_message: dict, xml_path: str, robot_goal: list, selected_object: str, 
+      samples: int = 32, region_goals_sampled: list = None) -> list
+```
+
+**Parameters:**
+- `json_message`: Environment state data (see Input Format below)
+- `xml_path`: Relative path to MuJoCo XML file
+- `robot_goal`: Target position as `[x, y]` coordinates
+- `selected_object`: Name of object to generate goals for
+- `samples`: Number of samples to generate
+- `region_goals_sampled`: Optional list of `(x, y, theta)` goal samples for context
+
+**Returns:**
+List of goal dictionaries with:
+- `index`: Sample index
+- `goal_center`: World coordinates `[x, y]`
+- `final_quat`: Quaternion for object rotation `[w, x, y, z]`
+- `x`, `y`, `theta`: SE(2) pose components in world frame
+- `delta_local`: `(dx, dy, dtheta)` in object's local frame
+- `delta_world`: `(dx, dy, dtheta)` in world frame
+- `input_context`: Input tensor used (for debugging)
+
 ## Input Format
 
 ### JSON Message Structure
@@ -94,7 +142,43 @@ json_message = {
 
 ## Usage Examples
 
-### Basic Goal Generation
+### Basic Goal Generation (Vector Model - Recommended)
+```python
+from ktamp_learning import GoalVectorInferenceModel
+
+# Initialize model
+goal_model = GoalVectorInferenceModel("outputs/flow_matching/2025-01-15_...")
+
+# Prepare environment data
+json_message = {
+    "xml_path": "custom_walled_envs/jun22/env_001.xml",
+    "robot_goal": [1.5, 2.0],
+    "robot": {"position": [0.0, 0.0, 0.1]},
+    "objects": {
+        "box1": {
+            "position": [1.2, 1.8, 0.05],
+            "quaternion": [1.0, 0.0, 0.0, 0.0]
+        }
+    }
+}
+
+# Generate goals for a known object
+goals = goal_model.infer(
+    json_message=json_message,
+    xml_path="custom_walled_envs/jun22/env_001.xml",
+    robot_goal=[1.5, 2.0],
+    selected_object="box1",
+    samples=32
+)
+
+# Analyze results
+print(f"Generated {len(goals)} goal proposals:")
+for goal in goals[:5]:
+    print(f"  World: ({goal['x']:.3f}, {goal['y']:.3f}, θ={goal['theta']:.3f})")
+    print(f"  Local delta: {goal['delta_local']}")
+```
+
+### Legacy Goal Generation (Mask Model)
 ```python
 from ktamp_learning import GoalInferenceModel
 
@@ -131,9 +215,9 @@ for goal in goals[:5]:  # Show first 5
 
 ### Multiple Objects Comparison
 ```python
-from ktamp_learning import GoalInferenceModel
+from ktamp_learning import GoalVectorInferenceModel
 
-goal_model = GoalInferenceModel("outputs/goal_model_path")
+goal_model = GoalVectorInferenceModel("outputs/flow_matching/...")
 
 # Generate goals for different objects
 goals_box = goal_model.infer(json_message, xml_path, robot_goal, "box1")

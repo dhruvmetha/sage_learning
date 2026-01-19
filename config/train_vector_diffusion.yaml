@@ -26,37 +26,40 @@ trainer:
       auto_insert_metric_name: false
 
 model:
-  _target_: src.model.generative_module.UnifiedGenerativeModule
+  _target_: src.model.vector_diffusion_module.VectorDiffusionModule
   pose_stats_file: "${hydra:runtime.cwd}/config/stats_mean_std.json"
   crop_size_meters: 5.0
   overfit_mode: false
   norm_mode: mean_std
-  
-  # Network Injection
+
   network:
     _target_: src.model.networks.vector_denoiser.VectorDenoiserBackbone
     vector_dim: 3
     image_channels: 5
     hidden_dim: 256
     num_layers: 6
-  
-  # Logic Injection
+
   path:
-    _target_: src.model.common.FlowMatchingPath
-    sigma_min: 1e-5
-  
+    _target_: src.model.paths.vector_hf_diffusion_path.VectorHFDiffusionPath
+    num_train_timesteps: 1000
+    beta_schedule: squaredcos_cap_v2
+    prediction_type: epsilon
+
   sampler:
-    _target_: src.model.common.ODESampler
-    method: 'euler'
-  
-  # Optimizer Injection
+    _target_: src.model.samplers.hf_diffusion_sampler.HFDiffusionSampler
+    sampler_type: ddim
+    num_train_timesteps: 1000
+    beta_schedule: squaredcos_cap_v2
+    prediction_type: epsilon
+    eta: 0.0
+    clip_sample: false
+
   optimizer:
     _target_: torch.optim.AdamW
     _partial_: true
     lr: 3e-4
     weight_decay: 1e-4
 
-  # Module Params
   context_channels: 5
   use_local: true
   vector_dim: 3

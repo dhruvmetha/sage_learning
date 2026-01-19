@@ -50,6 +50,13 @@ class GoalInferenceModel:
         """
         self.device = device
         self.model_path = Path(model_path)
+        self.checkpoint_override = None
+        if self.model_path.is_file() and self.model_path.suffix == ".ckpt":
+            self.checkpoint_override = self.model_path
+            if self.model_path.parent.name == "checkpoints":
+                self.model_path = self.model_path.parent.parent
+            else:
+                self.model_path = self.model_path.parent
         self.sampler_method = sampler_method
         self.num_steps = num_steps
 
@@ -66,15 +73,34 @@ class GoalInferenceModel:
         # Use data config
         self.data_cfg = self.cfg.data
 
+        # Determine local/cropped settings
+        self.context_size = getattr(self.data_cfg, "context_size", None)
+        self.crop_size = getattr(self.data_cfg, "crop_size", None)
+        if self.context_size is None:
+            self.context_size = getattr(self.cfg.model, "context_size", None)
+        if self.crop_size is None:
+            self.crop_size = getattr(self.cfg.model, "crop_size", None)
+
+        self.use_local = getattr(self.cfg.model, "use_local", False)
+        if self.context_size is not None or self.crop_size is not None:
+            self.use_local = True
+
+        self.image_size = getattr(self.data_cfg, "image_size", None)
+        if self.image_size is None:
+            self.image_size = self.context_size or 224
+
+        self.crop_size_meters = getattr(self.cfg.model, "crop_size_meters", 5.0)
+
         # Check if model was trained with coord_grid
         self.use_coord_grid = getattr(self.data_cfg, 'use_coord_grid', False)
         if self.use_coord_grid:
             print(f"  Using coordinate grid (2 extra channels)")
 
-        # Setup image transform
-        self.transform = transforms.Compose([
+        # Setup image transforms
+        context_size = self.context_size or self.image_size
+        self.context_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Resize((self.data_cfg.image_size, self.data_cfg.image_size)),
+            transforms.Resize((context_size, context_size)),
             transforms.Lambda(lambda x: x * 2 - 1),
         ])
         
@@ -112,26 +138,29 @@ class GoalInferenceModel:
             self._remap_targets_recursive(cfg.model)
         
         # Find checkpoint
-        checkpoint_dir = self.model_path / "checkpoints"
-        if not checkpoint_dir.exists():
-            raise FileNotFoundError(f"Checkpoints directory not found at {checkpoint_dir}")
-            
-        checkpoint_files = list(checkpoint_dir.glob("*.ckpt"))
         checkpoint_path = None
-        
-        # Look for epoch checkpoint first, then last.ckpt
-        for checkpoint_file in checkpoint_files:
-            if "epoch" in checkpoint_file.name:
-                checkpoint_path = checkpoint_file
-                break
-        
-        if checkpoint_path is None:
-            # Fallback to last.ckpt
-            last_ckpt = checkpoint_dir / "last.ckpt"
-            if last_ckpt.exists():
-                checkpoint_path = last_ckpt
-            else:
-                raise FileNotFoundError(f"No suitable checkpoint found in {checkpoint_dir}")
+        if self.checkpoint_override is not None:
+            checkpoint_path = self.checkpoint_override
+        else:
+            checkpoint_dir = self.model_path / "checkpoints"
+            if not checkpoint_dir.exists():
+                raise FileNotFoundError(f"Checkpoints directory not found at {checkpoint_dir}")
+
+            checkpoint_files = list(checkpoint_dir.glob("*.ckpt"))
+
+            # Look for epoch checkpoint first, then last.ckpt
+            for checkpoint_file in checkpoint_files:
+                if "epoch" in checkpoint_file.name:
+                    checkpoint_path = checkpoint_file
+                    break
+
+            if checkpoint_path is None:
+                # Fallback to last.ckpt
+                last_ckpt = checkpoint_dir / "last.ckpt"
+                if last_ckpt.exists():
+                    checkpoint_path = last_ckpt
+                else:
+                    raise FileNotFoundError(f"No suitable checkpoint found in {checkpoint_dir}")
         
         # Load model
         model = hydra.utils.instantiate(cfg.model)
@@ -162,10 +191,30 @@ class GoalInferenceModel:
             from src.model.samplers.hf_diffusion_sampler import HFDiffusionSampler
             # Get diffusion params from config if available
             sampler_cfg = self.cfg.model.get("sampler", {})
-            num_timesteps = sampler_cfg.get("num_train_timesteps", 1000)
+            path_cfg = self.cfg.model.get("path", {})
+            num_timesteps = sampler_cfg.get("num_train_timesteps", path_cfg.get("num_train_timesteps", 1000))
+            beta_schedule = sampler_cfg.get("beta_schedule", path_cfg.get("beta_schedule", "squaredcos_cap_v2"))
+            beta_start = sampler_cfg.get("beta_start", path_cfg.get("beta_start", 0.0001))
+            beta_end = sampler_cfg.get("beta_end", path_cfg.get("beta_end", 0.02))
+            prediction_type = sampler_cfg.get("prediction_type", path_cfg.get("prediction_type", "epsilon"))
+            clip_sample = sampler_cfg.get(
+                "inference_clip_sample",
+                sampler_cfg.get("clip_sample", path_cfg.get("clip_sample", False)),
+            )
+            if not clip_sample:
+                clip_sample = True
+            eta = sampler_cfg.get("eta", 0.0)
+            normalize_t = sampler_cfg.get("normalize_t", path_cfg.get("normalize_t", False))
             self.model.sampler = HFDiffusionSampler(
                 sampler_type=method,
                 num_train_timesteps=num_timesteps,
+                beta_schedule=beta_schedule,
+                beta_start=beta_start,
+                beta_end=beta_end,
+                prediction_type=prediction_type,
+                clip_sample=clip_sample,
+                eta=eta,
+                normalize_t=normalize_t,
             )
             print(f"  Overriding sampler to HFDiffusionSampler(sampler_type='{method}')")
 
@@ -208,35 +257,92 @@ class GoalInferenceModel:
         """
         # Create ImageConverter and process data
         image_converter = ImageConverter(xml_path)
-        inp_data = image_converter.process_datapoint(json_message, robot_goal)
 
-        # Create object mask for the selected object
-        try:
-            selected_object_mask = image_converter.create_object_mask(selected_object)
-        except Exception as e:
-            raise ValueError(f"Error creating object mask for '{selected_object}': {e}")
-        
-        # Prepare input for goal model (stack scene context + selected object mask)
-        input_channels = [
-            inp_data['robot_image'],
-            inp_data['goal_image'],
-            inp_data['movable_objects_image'],
-            inp_data['static_objects_image'],
-            selected_object_mask                   # Selected object mask (channel 5)
-        ]
+        if self.use_local:
+            context_size = self.context_size or self.image_size
+            local_masks = image_converter.create_local_masks(
+                json_message,
+                selected_object,
+                robot_goal,
+                crop_size_meters=self.crop_size_meters,
+                output_size=context_size,
+            )
 
-        # Add coordinate grid if model was trained with it (matches training exactly)
-        if self.use_coord_grid:
-            # Use original image size (before transform resizes to data_cfg.image_size)
-            orig_size = inp_data['robot_image'].shape[0]
-            ys, xs = np.meshgrid(np.linspace(0, 1, orig_size),
-                                 np.linspace(0, 1, orig_size),
-                                 indexing='ij')
-            coord_grid = np.stack([xs, ys], axis=-1).astype(np.float32)
-            input_channels.append(coord_grid)
+            input_channels = [
+                local_masks["local_static"],
+                local_masks["local_movable"],
+                local_masks["local_target_object"],
+                local_masks.get("local_robot_region", np.zeros_like(local_masks["local_static"])),
+                local_masks.get(
+                    "local_goal_sample_region",
+                    local_masks.get("local_goal_region", np.zeros_like(local_masks["local_static"])),
+                ),
+            ]
 
-        inp_for_goal = np.concatenate(input_channels, axis=-1)
-        inp_for_goal = self.transform(inp_for_goal).unsqueeze(0).to(self.device)
+            if self.use_coord_grid:
+                orig_size = input_channels[0].shape[0]
+                ys, xs = np.meshgrid(
+                    np.linspace(0, 1, orig_size),
+                    np.linspace(0, 1, orig_size),
+                    indexing="ij",
+                )
+                coord_grid = np.stack([xs, ys], axis=-1).astype(np.float32)
+                input_channels.append(coord_grid)
+
+            inp_for_goal = np.concatenate(input_channels, axis=-1)
+            inp_for_goal = self.context_transform(inp_for_goal).unsqueeze(0).to(self.device)
+
+            object_center = local_masks.get("object_center", None)
+            object_theta = local_masks.get("object_theta", None)
+            crop_size_meters = local_masks.get("crop_size_meters", self.crop_size_meters)
+            output_size = self.crop_size or context_size
+
+            if object_theta is not None:
+                obj_angle = np.degrees(object_theta)
+            else:
+                obj_angle = 0.0
+
+            selected_object_mask = local_masks["local_target_object"]
+            if object_center is None:
+                _, _, _, obj_angle_mask = find_rectangle_corners(
+                    (selected_object_mask[:, :, 0] > 0.5).astype(np.uint8)
+                )
+                if obj_angle_mask is not None:
+                    obj_angle = obj_angle_mask
+        else:
+            inp_data = image_converter.process_datapoint(json_message, robot_goal)
+
+            try:
+                selected_object_mask = image_converter.create_object_mask(selected_object)
+            except Exception as e:
+                raise ValueError(f"Error creating object mask for '{selected_object}': {e}")
+
+            input_channels = [
+                inp_data['robot_image'],
+                inp_data['goal_image'],
+                inp_data['movable_objects_image'],
+                inp_data['static_objects_image'],
+                selected_object_mask
+            ]
+
+            if self.use_coord_grid:
+                orig_size = inp_data['robot_image'].shape[0]
+                ys, xs = np.meshgrid(np.linspace(0, 1, orig_size),
+                                     np.linspace(0, 1, orig_size),
+                                     indexing='ij')
+                coord_grid = np.stack([xs, ys], axis=-1).astype(np.float32)
+                input_channels.append(coord_grid)
+
+            inp_for_goal = np.concatenate(input_channels, axis=-1)
+            inp_for_goal = self.context_transform(inp_for_goal).unsqueeze(0).to(self.device)
+
+            scale = image_converter.IMG_SIZE / self.image_size
+
+            _, _, selected_obj_center, obj_angle = find_rectangle_corners(
+                (selected_object_mask[:, :, 0] > 0.5).astype(np.uint8))
+
+            if selected_obj_center is None:
+                obj_angle = inp_data.get('obj2angle', {}).get(selected_object, 0)
 
         # Generate goal samples
         num_steps = self.num_steps if self.num_steps is not None else 20
@@ -248,15 +354,6 @@ class GoalInferenceModel:
 
         # Process goal samples and extract SE(2) poses
         valid_goals = []
-        scale = image_converter.IMG_SIZE / self.data_cfg.image_size
-        
-        # Get object angle for rotation calculation
-        _, _, selected_obj_center, obj_angle = find_rectangle_corners(
-            (selected_object_mask[:, :, 0] > 0.5).astype(np.uint8))
-        
-        if selected_obj_center is None:
-            # Fallback: use stored angle from obj2angle if available in inp_data
-            obj_angle = inp_data.get('obj2angle', {}).get(selected_object, 0)
             
         for i, goal_sample in enumerate(goal_samples):
             goal_mask = (goal_sample[:, :, 0].copy() > 0.5) * 1.0
@@ -270,17 +367,27 @@ class GoalInferenceModel:
             if predicted_goal_center is None:
                 continue
                 
-            # Scale to original image coordinates
-            predicted_goal_center = (int(predicted_goal_center[0] * scale), 
-                                   int(predicted_goal_center[1] * scale))
-            
-            # Convert to world coordinates
-            goal_center = list(image_converter.pixel_to_world(
-                predicted_goal_center[0], predicted_goal_center[1]))
-            
-            # Calculate final quaternion
-            final_quat = image_converter.rotate_relative_to_world(
-                selected_object, goal_angle - obj_angle)
+            if self.use_local:
+                if object_center is None:
+                    continue
+                goal_center = list(image_converter.pixel_to_world_local(
+                    int(predicted_goal_center[0]),
+                    int(predicted_goal_center[1]),
+                    object_center,
+                    crop_size_meters=crop_size_meters,
+                    output_size=output_size,
+                ))
+                final_quat = image_converter.rotate_relative_to_world(
+                    selected_object, goal_angle - obj_angle)
+            else:
+                predicted_goal_center = (int(predicted_goal_center[0] * scale),
+                                       int(predicted_goal_center[1] * scale))
+
+                goal_center = list(image_converter.pixel_to_world(
+                    predicted_goal_center[0], predicted_goal_center[1]))
+
+                final_quat = image_converter.rotate_relative_to_world(
+                    selected_object, goal_angle - obj_angle)
             
             # Convert quaternion to euler angle (θ)
             goal_theta = R.from_quat(final_quat, scalar_first=True).as_euler('xyz')[2]
