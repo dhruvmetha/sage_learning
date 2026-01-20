@@ -43,15 +43,19 @@ class MaskDiffusionDataset(Dataset):
                 ret['goal_sample_region'] = data['local_goal_sample_region']
                 
                 # Target Vector: (dx, dy, dtheta) in OBJECT frame
-                # Shape in file is usually (1, 3), we want (3,)
-                ret['target_goal'] = data['target_goal_pose_deltas_obj'][0]
+                # Shape can be (1, 3) for 1-push samples, or (k, 3) for n-push
+                # trajectory-suffix samples. We always train a single-step model,
+                # so take only the first delta.
+                deltas = data['target_goal_pose_deltas_obj']
+                ret['target_goal'] = deltas[0] if getattr(deltas, "ndim", 0) > 1 else deltas
                 # local_target_goal is already (224, 224), no indexing needed
                 ret['target_goal_mask'] = data['local_target_goal']
                 
                 # Object theta (orientation) - needed for visualization
                 # This is the current object's theta in world frame
                 if 'local_object_theta' in data:
-                    ret['object_theta'] = data['local_object_theta'][0]  # Shape (1,) -> scalar
+                    theta_arr = data['local_object_theta']
+                    ret['object_theta'] = theta_arr[0] if getattr(theta_arr, "ndim", 0) > 0 else theta_arr
                 else:
                     ret['object_theta'] = np.float32(0.0)  # Fallback
 
@@ -64,7 +68,8 @@ class MaskDiffusionDataset(Dataset):
                 ret['movable'] = data['movable_objects_image'] if 'movable_objects_image' in data else data['movable']
                 ret['static'] = data['static_objects_image'] if 'static_objects_image' in data else data['static']
                 ret['target_object'] = data['target_object']
-                ret['target_goal'] = data['target_goal_pose_deltas_world'][0]
+                deltas = data['target_goal_pose_deltas_world']
+                ret['target_goal'] = deltas[0] if getattr(deltas, "ndim", 0) > 1 else deltas
                 # target_goal mask is already (224, 224), no indexing needed
                 ret['target_goal_mask'] = data['target_goal']
 
@@ -145,13 +150,16 @@ class MaskDiffusionHDF5Dataset(Dataset):
             ret['target_object'] = h5f['local_target_object'][real_idx]
             ret['robot_region'] = h5f['local_robot_region'][real_idx]
             ret['goal_sample_region'] = h5f['local_goal_sample_region'][real_idx]
-            ret['target_goal'] = h5f['target_goal_pose_deltas_obj'][real_idx][0]
+            # Supports both canonical (N, 1, 3) storage and legacy (N, k, 3).
+            deltas = h5f['target_goal_pose_deltas_obj'][real_idx]
+            ret['target_goal'] = deltas[0] if getattr(deltas, "ndim", 0) > 1 else deltas
             # local_target_goal is already (224, 224) per sample, no extra indexing needed
             ret['target_goal_mask'] = h5f['local_target_goal'][real_idx]
             
             # Object theta (orientation) - needed for visualization
             if 'local_object_theta' in h5f:
-                ret['object_theta'] = h5f['local_object_theta'][real_idx][0]  # Shape (1,) -> scalar
+                theta_arr = h5f['local_object_theta'][real_idx]
+                ret['object_theta'] = theta_arr[0] if getattr(theta_arr, "ndim", 0) > 0 else theta_arr
             else:
                 ret['object_theta'] = np.float32(0.0)  # Fallback
         else:
@@ -161,7 +169,8 @@ class MaskDiffusionHDF5Dataset(Dataset):
             ret['movable'] = h5f['movable_objects_image'][real_idx]
             ret['static'] = h5f['static_objects_image'][real_idx]
             ret['target_object'] = h5f['target_object'][real_idx]
-            ret['target_goal'] = h5f['target_goal_pose_deltas_world'][real_idx][0]
+            deltas = h5f['target_goal_pose_deltas_world'][real_idx]
+            ret['target_goal'] = deltas[0] if getattr(deltas, "ndim", 0) > 1 else deltas
             # target_goal mask is already (224, 224) per sample, no extra indexing needed
             ret['target_goal_mask'] = h5f['target_goal'][real_idx]
 

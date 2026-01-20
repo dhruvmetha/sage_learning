@@ -18,8 +18,11 @@ def compute_stats(h5_path, output_path, use_local=True, mode="mean_std"):
         print(f"Reading {key}...")
         data = f[key][:] 
         
+        # For n-push datasets, pose deltas may be stored as (N, k, 3) where k is the
+        # number of remaining actions (or canonicalized to (N, 1, 3)). We train a
+        # single-step model, so compute stats from the first delta only.
         if data.ndim == 3:
-            data = data.squeeze(1)
+            data = data[:, 0, :]
 
         stats = {"mode": mode, "n_samples": len(data)}
 
