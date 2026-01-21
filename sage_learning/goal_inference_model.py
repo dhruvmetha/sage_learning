@@ -4,30 +4,12 @@ import torch
 from pathlib import Path
 import numpy as np
 import cv2
-from torchvision import transforms
-from ktamp_learning.utils.image_utils import find_rectangle_corners
-# Use unified image converter instead of original json2img
-import sys
 import os
-from pathlib import Path
-
-NAMO_PYTHON_PATH = "/common/home/dm1487/robotics_research/ktamp/namo/python"
-NAMO_VISUALIZATION_PATH = os.path.join(NAMO_PYTHON_PATH, "namo", "visualization")
-
-for extra_path in (NAMO_PYTHON_PATH, NAMO_VISUALIZATION_PATH):
-    if extra_path not in sys.path:
-        sys.path.append(extra_path)
-
-SAGE_LEARNING_ROOT = Path(__file__).resolve().parents[1]
-if SAGE_LEARNING_ROOT.exists():
-    sage_root_str = str(SAGE_LEARNING_ROOT)
-    if sage_root_str not in sys.path:
-        sys.path.insert(0, sage_root_str)
-
-from ml_image_converter_adapter import MLImageConverterAdapter as ImageConverter
+from torchvision import transforms
+from sage_learning.utils.image_utils import find_rectangle_corners
+from sage_learning.image_converter import MLImageConverterAdapter as ImageConverter
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 class GoalInferenceModel:
     """
@@ -94,7 +76,8 @@ class GoalInferenceModel:
         """Normalize Hydra target paths after package migration."""
         remap_prefixes = [
             ("ktamp_learning.src.", "src."),
-            ("learning.ktamp_learning.", "ktamp_learning."),
+            ("learning.ktamp_learning.", "sage_learning."),
+            ("ktamp_learning.", "sage_learning."),
         ]
         for old, new in remap_prefixes:
             if target.startswith(old):

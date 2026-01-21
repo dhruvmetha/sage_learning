@@ -635,7 +635,7 @@ class GenerativeModule(pl.LightningModule):
             model=model_fn,
             x_init=x_init,
             num_steps=num_steps,
-            show_progress=True
+            show_progress=False
         )
 
     def configure_optimizers(self):

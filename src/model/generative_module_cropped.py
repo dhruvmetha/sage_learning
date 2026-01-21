@@ -369,7 +369,7 @@ class GenerativeModuleCropped(pl.LightningModule):
             model=model_fn,
             x_init=x_init,
             num_steps=num_steps,
-            show_progress=True,
+            show_progress=False,
         )
 
         # Pad to context size for compatibility with inference pipeline

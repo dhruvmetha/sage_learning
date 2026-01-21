@@ -1,12 +1,12 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="ktamp_learning",
+    name="sage_learning",
     version="0.1.0",
     description="Learning-based approach for knowledge transfer in robotic task and motion planning",
     author="",
     author_email="",
-    packages=find_packages(include=["ktamp_learning", "ktamp_learning.*", "src", "src.*"]),
+    packages=find_packages(include=["sage_learning", "sage_learning.*", "src", "src.*"]),
     install_requires=[
         "torch>=2.1",
         "torchvision",
