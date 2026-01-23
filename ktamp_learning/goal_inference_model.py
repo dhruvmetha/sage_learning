@@ -236,7 +236,7 @@ class GoalInferenceModel:
         else:
             return "unknown"
 
-    def infer(self, json_message, xml_path, robot_goal, selected_object, samples=32):
+    def infer(self, json_message, xml_path, robot_goal, selected_object, samples=32, seed=None):
         """
         Perform goal inference to get goal proposals.
         
@@ -246,6 +246,7 @@ class GoalInferenceModel:
             robot_goal: Robot goal position [x, y]
             selected_object: Name of the object to generate goals for
             samples: Number of samples to generate (default: 32)
+            seed: Random seed for reproducible noise (None for random)
             
         Returns:
             List of goal dictionaries, each containing:
@@ -347,7 +348,7 @@ class GoalInferenceModel:
         # Generate goal samples
         num_steps = self.num_steps if self.num_steps is not None else 20
         with torch.no_grad():
-            goal_samples = (self.model.sample_from_model(inp_for_goal, samples=samples, num_steps=num_steps)
+            goal_samples = (self.model.sample_from_model(inp_for_goal, samples=samples, num_steps=num_steps, seed=seed)
                           .permute(0, 2, 3, 1).cpu().numpy() + 1) / 2
 
         inp_for_goal = inp_for_goal.cpu().squeeze(0).numpy()

@@ -3,18 +3,22 @@
 #SBATCH --output=/common/users/tdn39/Robotics/Mujoco/sage_learning/job_scripts/slurm_logs/flowmatch_crossattn_dec2_2push_eval_%j.out
 #SBATCH --error=/common/users/tdn39/Robotics/Mujoco/sage_learning/job_scripts/slurm_logs/flowmatch_crossattn_dec2_2push_eval_%j.err
 #SBATCH --time=24:00:00
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:a4000:4
 #SBATCH --mem=128G
-#SBATCH --ntasks=1
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
 
 # Train (Cross-Attention) on dec2 2-push -> Evaluate on 2-push filtered manifest.
 # Usage: sbatch train_eval_flow_matching_cross_attention_dec2_2push.sh
 # Resume: sbatch train_eval_flow_matching_cross_attention_dec2_2push.sh /path/to/checkpoint.ckpt
 
-set -e
+set -euo pipefail
 
+# venv activation script references PYTHONPATH; with `set -u` this can error if unset.
+set +u
 source /common/home/tdn39/.virtualenvs/mujoco/bin/activate
+set -u
 
 SAGE_ROOT="/common/users/tdn39/Robotics/Mujoco/sage_learning"
 NAMO_ROOT="/common/users/tdn39/Robotics/Mujoco/namo_cpp"
@@ -25,6 +29,8 @@ export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+
+export HDF5_USE_FILE_LOCKING=FALSE
 
 export NCCL_DEBUG=WARN
 export NCCL_TIMEOUT=1800
@@ -57,21 +63,31 @@ STAMP=$(date +"%Y%m%d_%H%M%S")
 OUTDIR="${OUTDIR_BASE}/$(date +%Y-%m-%d)/${ARCH_NAME}_${NORM_MODE}_${STAMP}"
 mkdir -p "$OUTDIR"
 
+BATCH_SIZE="${BATCH_SIZE:-32}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+
 cd "$SAGE_ROOT"
 
-srun python src/train_generative.py \
+srun --ntasks=${SLURM_NTASKS:-4} --kill-on-bad-exit=1 python src/train_generative.py \
   --config-name=train_flow_matching_cross_attention \
+  trainer.devices=4 \
+  trainer.strategy=ddp \
   model.norm_mode=max_abs \
   model.pose_stats_file="$STATS_FILE" \
   model.overfit_mode=false \
   trainer.max_epochs=1000 \
   data.h5_file="$H5_FILE" \
-  data.batch_size=32 \
-  data.num_workers=8 \
+  data.batch_size=${BATCH_SIZE} \
+  data.num_workers=${NUM_WORKERS} \
   wandb_name="flowmatch_${ARCH_NAME}_${NORM_MODE}_${STAMP}" \
   hydra.run.dir="$OUTDIR" \
   $RESUME_ARG \
   2>&1 | tee "$OUTDIR/train.log"
+
+if [[ ! -d "$OUTDIR/checkpoints" ]] || ! compgen -G "$OUTDIR/checkpoints/*.ckpt" >/dev/null; then
+  echo "ERROR: no checkpoints found under $OUTDIR/checkpoints (training likely failed). Aborting eval." >&2
+  exit 1
+fi
 
 EVAL_OUTDIR="${OUTDIR}/eval_manifest_2push_${STAMP}"
 mkdir -p "$EVAL_OUTDIR"
@@ -89,10 +105,18 @@ if [ -z "$END_IDX" ] || [ "$END_IDX" -le 0 ]; then
 fi
 
 cd "$NAMO_ROOT"
-export CUDA_VISIBLE_DEVICES=0
+
+if [ -n "${SLURM_JOB_GPUS:-}" ]; then
+  export CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS}"
+fi
+
+EVAL_CONFIG="python/namo/data_collection/eval_vector_model_2push.yaml"
+if [[ "${EVAL_HYBRID:-0}" == "1" ]]; then
+  EVAL_CONFIG="python/namo/data_collection/eval_vector_model_2push_hybrid.yaml"
+fi
 
 python python/namo/data_collection/sequential_ml_collection.py \
-  --config-yaml python/namo/data_collection/eval_vector_model_2push.yaml \
+  --config-yaml "$EVAL_CONFIG" \
   --output-dir "$EVAL_OUTDIR" \
   --start-idx 0 \
   --end-idx "$END_IDX" \

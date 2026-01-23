@@ -126,9 +126,14 @@ class GenerativeModuleCropped(pl.LightningModule):
         context: torch.Tensor,
         samples: int = 1,
         num_steps: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> torch.Tensor:
         batch = context.shape[0]
         context_rep = context.repeat_interleave(samples, dim=0)
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=context.device)
+            generator.manual_seed(int(seed))
         x_init = torch.randn(
             batch * samples,
             self.target_channels,
@@ -136,6 +141,7 @@ class GenerativeModuleCropped(pl.LightningModule):
             self.crop_size,
             device=context.device,
             dtype=context.dtype,
+            generator=generator,
         )
 
         def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:

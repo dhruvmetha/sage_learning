@@ -256,8 +256,16 @@ class GoalVectorInferenceModel:
         # Theta change is the same in both frames
         return dx_world, dy_world, dtheta
 
-    def infer(self, json_message, xml_path, robot_goal, selected_object, 
-              samples=32, region_goals_sampled=None):
+    def infer(
+        self,
+        json_message,
+        xml_path,
+        robot_goal,
+        selected_object,
+        samples=32,
+        region_goals_sampled=None,
+        seed=None,
+    ):
         """
         Perform goal inference to get goal proposals.
         
@@ -268,6 +276,7 @@ class GoalVectorInferenceModel:
             selected_object: Name of the object to generate goals for
             samples: Number of samples to generate (default: 32)
             region_goals_sampled: Optional list of (x, y, theta) for goal region visualization
+            seed: Random seed for reproducible noise (None for random)
             
         Returns:
             List of goal dictionaries, each containing:
@@ -348,7 +357,8 @@ class GoalVectorInferenceModel:
                 inp_for_model, 
                 num_samples=samples, 
                 num_steps=num_steps,
-                denormalize=True
+                denormalize=True,
+                seed=seed,
             ).cpu().numpy()
 
         # Process samples and convert to world coordinates
@@ -387,8 +397,15 @@ class GoalVectorInferenceModel:
 
         return valid_goals
 
-    def infer_single(self, json_message, xml_path, robot_goal, selected_object,
-                     region_goals_sampled=None):
+    def infer_single(
+        self,
+        json_message,
+        xml_path,
+        robot_goal,
+        selected_object,
+        region_goals_sampled=None,
+        seed=None,
+    ):
         """
         Perform single goal inference (mean of samples).
         
@@ -398,8 +415,15 @@ class GoalVectorInferenceModel:
         Returns:
             Dictionary with single goal prediction (same structure as infer())
         """
-        goals = self.infer(json_message, xml_path, robot_goal, selected_object,
-                          samples=16, region_goals_sampled=region_goals_sampled)
+        goals = self.infer(
+            json_message,
+            xml_path,
+            robot_goal,
+            selected_object,
+            samples=16,
+            region_goals_sampled=region_goals_sampled,
+            seed=seed,
+        )
         
         if not goals:
             return None

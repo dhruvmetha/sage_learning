@@ -499,7 +499,16 @@ class UnifiedGenerativeModule(pl.LightningModule):
 
         self.logger.experiment.log(log_dict)
 
-    def sample_pose(self, context, num_samples=1, num_steps=20, denormalize=True, show_progress=False, sample_idx=None):
+    def sample_pose(
+        self,
+        context,
+        num_samples: int = 1,
+        num_steps: int = 20,
+        denormalize: bool = True,
+        show_progress: bool = False,
+        sample_idx=None,
+        seed: Optional[int] = None,
+    ):
         """
         Sample poses using the learned velocity field.
         
@@ -510,6 +519,7 @@ class UnifiedGenerativeModule(pl.LightningModule):
             denormalize: whether to denormalize output
             show_progress: show tqdm progress bar
             sample_idx: if in overfit_mode, use fixed noise for this sample index
+            seed: Random seed for reproducible noise (None for random)
         """
         self._sync_sampler_time_scaling()
         B = context.shape[0]
@@ -523,10 +533,30 @@ class UnifiedGenerativeModule(pl.LightningModule):
             # Use consistent fixed noise even without sample_idx
             generator = torch.Generator(device=context.device)
             generator.manual_seed(42)
-            x_init = torch.randn(total_samples, self.vector_dim, generator=generator, 
-                                device=context.device, dtype=context.dtype)
+            x_init = torch.randn(
+                total_samples,
+                self.vector_dim,
+                generator=generator,
+                device=context.device,
+                dtype=context.dtype,
+            )
+        elif seed is not None:
+            generator = torch.Generator(device=context.device)
+            generator.manual_seed(int(seed))
+            x_init = torch.randn(
+                total_samples,
+                self.vector_dim,
+                generator=generator,
+                device=context.device,
+                dtype=context.dtype,
+            )
         else:
-            x_init = torch.randn(total_samples, self.vector_dim, device=context.device)
+            x_init = torch.randn(
+                total_samples,
+                self.vector_dim,
+                device=context.device,
+                dtype=context.dtype,
+            )
             
         def model_fn(x, t):
             return self.network(x, t, context_repeated)
@@ -647,9 +677,14 @@ class GenerativeModule(pl.LightningModule):
         context: torch.Tensor,
         samples: int = 1,
         num_steps: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> torch.Tensor:
         batch = context.shape[0]
         context_rep = context.repeat_interleave(samples, dim=0)
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=context.device)
+            generator.manual_seed(int(seed))
         x_init = torch.randn(
             batch * samples,
             self.target_channels,
@@ -657,6 +692,7 @@ class GenerativeModule(pl.LightningModule):
             context.shape[-1],
             device=context.device,
             dtype=context.dtype,
+            generator=generator,
         )
 
         def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
