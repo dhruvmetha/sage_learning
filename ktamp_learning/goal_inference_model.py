@@ -27,7 +27,6 @@ if SAGE_LEARNING_ROOT.exists():
 from ml_image_converter_adapter import MLImageConverterAdapter as ImageConverter
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 class GoalInferenceModel:
     """

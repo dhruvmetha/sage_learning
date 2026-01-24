@@ -64,7 +64,9 @@ OUTDIR="${OUTDIR_BASE}/$(date +%Y-%m-%d)/${ARCH_NAME}_${NORM_MODE}_${STAMP}"
 mkdir -p "$OUTDIR"
 
 BATCH_SIZE="${BATCH_SIZE:-32}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+# HDF5-backed dataset + DDP can be fragile with many DataLoader workers on NFS.
+# Default to single-process loading for stability; override if you want more throughput.
+NUM_WORKERS="${NUM_WORKERS:-0}"
 
 cd "$SAGE_ROOT"
 
