@@ -266,9 +266,13 @@ class MLImageConverterAdapter:
         Returns:
             episode_data dict compatible with visualizer.generate_all_masks_highres()
         """
-        # Build state_observations from data_point
+        # Build state_observations from data_point (movable objects only)
+        # Static objects (walls) are handled separately via static_object_info
         state_obs = {}
         for obj_name, obj_info in data_point['objects'].items():
+            # Skip static objects - they should only appear in static mask, not movable
+            if "movable" not in obj_name:
+                continue
             pos = obj_info['position']
             quat = obj_info['quaternion']
             theta = R.from_quat(quat, scalar_first=True).as_euler('xyz', degrees=False)[2]
