@@ -115,37 +115,57 @@ class GoalInferenceModel:
                 self._remap_targets_recursive(item)
 
     def _load_model(self):
-        """Load a model from the given output directory path."""
+        """Load a model from the given output directory path or checkpoint file.
+
+        Supports two input formats:
+        1. Run directory: Contains .hydra/config.yaml and checkpoints/
+        2. Checkpoint file: A .ckpt file, config inferred from parent directories
+        """
+        # Determine if model_path is a checkpoint file or run directory
+        if self.model_path.suffix == '.ckpt' and self.model_path.is_file():
+            # Given a checkpoint file directly
+            checkpoint_path = self.model_path
+            # Infer run directory: checkpoint is typically at run_dir/checkpoints/file.ckpt
+            if checkpoint_path.parent.name == 'checkpoints':
+                run_dir = checkpoint_path.parent.parent
+            else:
+                run_dir = checkpoint_path.parent
+            config_path = run_dir / ".hydra" / "config.yaml"
+        else:
+            # Given a run directory
+            run_dir = self.model_path
+            config_path = run_dir / ".hydra" / "config.yaml"
+            checkpoint_path = None  # Will find below
+
         # Load config
-        config_path = self.model_path / ".hydra" / "config.yaml"
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found at {config_path}")
-        
+
         cfg = OmegaConf.load(config_path)
         if "model" in cfg:
             self._remap_targets_recursive(cfg.model)
-        
-        # Find checkpoint
-        checkpoint_dir = self.model_path / "checkpoints"
-        if not checkpoint_dir.exists():
-            raise FileNotFoundError(f"Checkpoints directory not found at {checkpoint_dir}")
-            
-        checkpoint_files = list(checkpoint_dir.glob("*.ckpt"))
-        checkpoint_path = None
-        
-        # Look for epoch checkpoint first, then last.ckpt
-        for checkpoint_file in checkpoint_files:
-            if "epoch" in checkpoint_file.name:
-                checkpoint_path = checkpoint_file
-                break
-        
+
+        # Find checkpoint if not already specified
         if checkpoint_path is None:
-            # Fallback to last.ckpt
-            last_ckpt = checkpoint_dir / "last.ckpt"
-            if last_ckpt.exists():
-                checkpoint_path = last_ckpt
-            else:
-                raise FileNotFoundError(f"No suitable checkpoint found in {checkpoint_dir}")
+            checkpoint_dir = run_dir / "checkpoints"
+            if not checkpoint_dir.exists():
+                raise FileNotFoundError(f"Checkpoints directory not found at {checkpoint_dir}")
+
+            checkpoint_files = list(checkpoint_dir.glob("*.ckpt"))
+
+            # Look for epoch checkpoint first, then last.ckpt
+            for checkpoint_file in checkpoint_files:
+                if "epoch" in checkpoint_file.name:
+                    checkpoint_path = checkpoint_file
+                    break
+
+            if checkpoint_path is None:
+                # Fallback to last.ckpt
+                last_ckpt = checkpoint_dir / "last.ckpt"
+                if last_ckpt.exists():
+                    checkpoint_path = last_ckpt
+                else:
+                    raise FileNotFoundError(f"No suitable checkpoint found in {checkpoint_dir}")
         
         # Load model
         model = hydra.utils.instantiate(cfg.model)
