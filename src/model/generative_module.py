@@ -1,681 +1,675 @@
-"""
-Unified Generative Module
-
-A PyTorch Lightning module that supports both diffusion and flow matching
-through pluggable path and sampler components.
-
-This design allows switching between generative methods via configuration
-without changing the core training/inference code.
-
-Usage:
-    # Flow Matching
-    module = GenerativeModule(
-        network=DiT(...),
-        path=FlowMatchingPath(),
-        sampler=ODESampler(method='midpoint'),
-        optimizer=...,
-    )
-
-    # Diffusion
-    module = GenerativeModule(
-        network=DiT(...),
-        path=DiffusionPath(num_timesteps=100),
-        sampler=DDPMSampler(num_timesteps=100),
-        optimizer=...,
-    )
-"""
-
 import torch
 import torch.nn as nn
-import torchvision
 import lightning.pytorch as pl
 from torchmetrics import MeanMetric, MinMetric
 from typing import Optional, Dict, Any
+import math
+import json
+import numpy as np
+import cv2
 
-from .base.base_path import BasePath
-from .base.base_sampler import BaseSampler
+# UPDATED IMPORTS to match your structure
+from .networks.vector_denoiser import VectorDenoiserBackbone
+from .common import BasePath, BaseSampler
+from .base import BasePath as DiffusionBasePath, BaseSampler as DiffusionBaseSampler
 
-
-class GenerativeModule(pl.LightningModule):
-    """
-    Unified generative module supporting diffusion, flow matching, and more.
-
-    The generative method is determined by the path and sampler components:
-    - path: Defines how to interpolate between noise and data (training)
-    - sampler: Defines how to generate samples from noise (inference)
-
-    Args:
-        network: Neural network backbone (DiT, UNet, etc.)
-        path: Path implementation (FlowMatchingPath, DiffusionPath, etc.)
-        sampler: Sampler implementation (ODESampler, DDPMSampler, etc.)
-        optimizer: Optimizer partial function
-        aux_loss_weight: Weight for auxiliary losses (e.g., dice loss)
-        context_channels: Number of input context channels (default 5: robot, goal, movable, static, target_object)
-        target_channels: Number of output target channels (default 1: target_goal only, 2 for multi-horizon)
-        use_local: Use local (object-centered) masks instead of global
-        use_multihorizon: Enable multi-horizon prediction (2 output channels with masked loss)
-    """
-
+class UnifiedGenerativeModule(pl.LightningModule):
     def __init__(
         self,
         network: nn.Module,
-        path: BasePath,
+        path: BasePath, 
         sampler: BaseSampler,
         optimizer: Any,
-        aux_loss_weight: float = 0.0,
         context_channels: int = 5,
-        target_channels: int = 1,
-        use_local: bool = False,
-        use_multihorizon: bool = False,
-        warmup_steps: int = 0,
-        decay_steps: int = 0,
-        end_lr: float = 0.0,
+        vector_dim: int = 3,
+        use_local: bool = True,
+        pose_stats_file: Optional[str] = None,
+        norm_mode: str = "mean_std",  # "max_abs" or "mean_std"
+        overfit_mode: bool = False, # If True, compute stats per batch
+        crop_size_meters: float = 2.0,
     ):
         super().__init__()
-
         self.network = network
         self.path = path
         self.sampler = sampler
         self.optimizer_partial = optimizer
-
-        self.aux_loss_weight = aux_loss_weight
+        self.crop_size_meters = crop_size_meters
         self.context_channels = context_channels
-        self.target_channels = target_channels
+        self.vector_dim = vector_dim
         self.use_local = use_local
-        self.use_multihorizon = use_multihorizon
+        self.norm_mode = norm_mode
+        self.overfit_mode = overfit_mode
 
-        # LR schedule parameters
-        self.warmup_steps = warmup_steps
-        self.decay_steps = decay_steps
-        self.end_lr = end_lr
+        self.register_buffer('xy_norm', torch.tensor(1.0))
+        self.register_buffer('theta_norm', torch.tensor(math.pi))
+        self.register_buffer('mean', torch.zeros(3))
+        self.register_buffer('std', torch.ones(3))
 
-        # Loss function
-        self.criterion = nn.MSELoss(reduction='none')  # Use 'none' for masked loss support
-        self.criterion_mean = nn.MSELoss()  # For backward compatibility
+        # 2. Load Global Stats (only if not overfitting)
+        if pose_stats_file is not None and not overfit_mode:
+            stats = self._load_pose_stats(pose_stats_file)
+            self.norm_mode = stats.get('mode', self.norm_mode)
 
-        # Metrics
+            if self.norm_mode == "max_abs":
+                self.xy_norm.fill_(stats['xy_norm'])
+                self.theta_norm.fill_(stats['theta_norm'])
+            else:
+                self.mean.copy_(torch.tensor(stats['mean']))
+                self.std.copy_(torch.tensor(stats['std']))
+
         self.train_loss = MeanMetric()
         self.val_loss = MeanMetric()
         self.val_loss_best = MinMetric()
-
-        # Save hyperparameters (excluding non-serializable objects)
         self.save_hyperparameters(ignore=["network", "path", "sampler", "optimizer"])
+        self._sampler_time_scaling_synced = False
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def _sync_sampler_time_scaling(self) -> None:
+        """Ensure sampler timestep scaling matches how the path trained the network.
+
+        Vector diffusion training via `VectorHFDiffusionPath` always feeds normalized
+        timesteps `t ∈ [0, 1]` into the network. However, `HFDiffusionSampler` defaults
+        to passing integer timesteps unless `normalize_t=True`. If these differ, W&B
+        validation samples (and any manual sampling via `sample_pose`) will look wrong.
         """
-        Forward pass through the network.
+        if self._sampler_time_scaling_synced:
+            return
+        self._sampler_time_scaling_synced = True
 
-        Args:
-            x: Input tensor (context + noisy/interpolated target)
-            t: Time values, shape (B,) or (B, 1)
+        desired_normalize_t = None
 
-        Returns:
-            Model prediction (noise or velocity depending on path)
-        """
-        # Ensure t has correct shape for the network
-        if t.dim() == 1:
-            t_input = t
-        else:
-            t_input = t.squeeze(-1)
+        # VectorHFDiffusionPath always uses normalized t ∈ [0, 1].
+        try:
+            from .paths.vector_hf_diffusion_path import VectorHFDiffusionPath
 
-        return self.network(x, t_input)
+            if isinstance(self.path, VectorHFDiffusionPath):
+                desired_normalize_t = True
+        except Exception:
+            pass
 
-    def _build_context(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Build context tensor from batch.
+        # Generic HF diffusion path can be configured either way.
+        if desired_normalize_t is None and hasattr(self.path, "normalize_t"):
+            desired_normalize_t = bool(getattr(self.path, "normalize_t"))
 
-        For global masks: Concatenates robot, goal, movable, static, target_object
-        For local masks: Concatenates static, movable, target_object, robot_region, goal_sample_region
-        """
-        if self.use_local:
-            # Local masks: static, movable, target_object, robot_region, goal_sample_region (5 channels)
-            parts = [
-                batch['static'],
-                batch['movable'],
-                batch['target_object'],
-                batch['robot_region'],
-                batch['goal_sample_region'],
-            ]
-        else:
-            # Global masks: robot, goal, movable, static, target_object (5 channels)
-            parts = [
-                batch['robot'],
-                batch['goal'],
-                batch['movable'],
-                batch['static'],
-                batch['target_object']
-            ]
+        if desired_normalize_t is None or not hasattr(self.sampler, "normalize_t"):
+            return
 
-        # Optional: coordinate grid
-        if 'coord_grid' in batch:
-            parts.append(batch['coord_grid'])
+        current = bool(getattr(self.sampler, "normalize_t"))
+        if current == desired_normalize_t:
+            return
 
-        return torch.cat(parts, dim=1)
+        setattr(self.sampler, "normalize_t", desired_normalize_t)
+        if getattr(getattr(self, "trainer", None), "is_global_zero", True):
+            print(
+                f"[UnifiedGenerativeModule] Set sampler.normalize_t={desired_normalize_t} "
+                "to match training-time path timestep scaling."
+            )
 
-    def _build_target(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Build target tensor from batch, clamped to [-1, 1].
-
-        For multi-horizon mode, returns [B, 2, H, W] from 'target_goals'.
-        For single-horizon mode, returns [B, 1, H, W] from 'target_goal'.
-        """
-        if self.use_multihorizon:
-            # Multi-horizon: target_goals is [B, 2, H, W]
-            return torch.clamp(batch['target_goals'], -1, 1)
-        else:
-            # Single-horizon: target_goal is [B, 1, H, W]
-            return torch.clamp(batch['target_goal'], -1, 1)
-
-    def _compute_multihorizon_loss(
-        self,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-        solution_depth: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute masked loss for multi-horizon prediction.
-
-        Channel 1 (goal_mask_a1) is always supervised.
-        Channel 2 (goal_mask_a2) is only supervised when solution_depth >= 2.
-
-        Args:
-            prediction: Model output [B, 2, H, W]
-            target: Ground truth [B, 2, H, W]
-            solution_depth: [B] tensor with solution depth (1 or 2)
-
-        Returns:
-            Combined loss for both channels
-        """
-        B, _, H, W = prediction.shape
-
-        # Channel 1 loss: always computed
-        loss_ch1 = self.criterion(prediction[:, 0:1], target[:, 0:1]).mean()
-
-        # Channel 2 loss: only compute where solution_depth >= 2
-        # Create mask [B, 1, 1, 1] for broadcasting
-        mask = (solution_depth >= 2).float().view(B, 1, 1, 1)
-
-        # Compute per-element loss for channel 2
-        loss_ch2_elements = self.criterion(prediction[:, 1:2], target[:, 1:2])  # [B, 1, H, W]
-
-        # Apply mask and compute mean only over valid samples
-        num_valid = mask.sum() + 1e-8  # Avoid division by zero
-        loss_ch2 = (loss_ch2_elements * mask).sum() / (num_valid * H * W)
-
-        return loss_ch1 + loss_ch2
-
-    def _compute_loss(
-        self,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        x_1: torch.Tensor,
-        solution_depth: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Compute loss with optional auxiliary losses and multi-horizon masking.
-
-        Args:
-            prediction: Model output (noise or velocity)
-            target: Ground truth (noise or velocity)
-            x_t: Current interpolated/noised point
-            t: Time values
-            x_1: Original data (for auxiliary losses)
-            solution_depth: [B] tensor with solution depth (1 or 2) for multi-horizon masking
-
-        Returns:
-            Total loss
-        """
-        if self.use_multihorizon and solution_depth is not None:
-            primary_loss = self._compute_multihorizon_loss(prediction, target, solution_depth)
-        else:
-            # Single-horizon: standard MSE loss
-            primary_loss = self.criterion_mean(prediction, target)
-
-        if self.aux_loss_weight > 0:
-            # Auxiliary loss: Dice loss on reconstructed x_1
-            x_1_pred = self.path.get_x1_from_prediction(x_t, t, prediction)
-
-            # Clamp and convert to [0, 1] for dice loss
-            x_1_pred = torch.sigmoid(torch.clamp(x_1_pred, -10.0, 10.0))
-            x_1_target = (x_1 + 1) / 2  # Convert from [-1, 1] to [0, 1]
-
-            aux_loss = self._focal_dice_loss(x_1_pred, x_1_target)
-
-            # Check for NaN
-            if torch.isnan(aux_loss):
-                return primary_loss
-
-            return primary_loss + self.aux_loss_weight * aux_loss
-
-        return primary_loss
+    def forward(self, x: torch.Tensor, t: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        return self.network(x, t, context)
 
     @staticmethod
-    def _focal_dice_loss(
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        alpha: float=0.5,
-        gamma: float=2.0,
-        smooth: float=1.0
-    ) -> torch.Tensor:
-        # pred, target: B×1×H×W in [0,1]
-        pred = pred.flatten(1)
-        target = target.flatten(1)
-        
-        # Clamp predictions to prevent extreme values
-        pred = torch.clamp(pred, 0.0, 1.0)
-        target = torch.clamp(target, 0.0, 1.0)
-        
-        focal_weight = alpha * (1 - pred) ** gamma * target + (1 - alpha) * pred ** gamma * (1 - target)
-        
-        intersection = (pred * target * focal_weight).sum(dim=1)
-        denom = (pred * focal_weight).sum(dim=1) + (target * focal_weight).sum(dim=1)
-        
-        # Add numerical stability
-        dice = (2 * intersection + smooth) / (denom + smooth + 1e-8)
-        
-        return 1 - dice.mean()
+    def _load_pose_stats(stats_file: str) -> Dict[str, float]:
+        with open(stats_file, 'r') as f:
+            return json.load(f)
 
-    def training_step(
-        self,
-        batch: Dict[str, torch.Tensor],
-        batch_idx: int
-    ) -> Optional[torch.Tensor]:
-        """
-        Training step: sample from path and compute loss.
-        """
-        # Build inputs
+    def _build_context(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if self.use_local:
+            parts = [
+                batch['static'], batch['movable'], batch['target_object'],
+                batch['robot_region'], batch['goal_sample_region']
+            ]
+        else:
+            parts = [
+                batch['robot'], batch['goal'], batch['movable'],
+                batch['static'], batch['target_object']
+            ]
+        if 'coord_grid' in batch:
+            parts.append(batch['coord_grid'])
+        return torch.cat(parts, dim=1)
+
+    def _normalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
+        if self.overfit_mode:
+            # We use .detach() to ensure we don't try to backprop through the stats themselves
+            txm = pose[:, 0:1].mean().detach()
+            tym = pose[:, 1:2].mean().detach()
+            
+            # Robust std computation
+            std_val = pose[:, 0:2].std()
+            if torch.isnan(std_val) or std_val < 1e-6:
+                ts = torch.tensor(1.0, device=pose.device)
+            else:
+                ts = std_val.detach()
+
+            thm = 0.0
+            ths = math.pi
+            
+            # Store in buffers so _denormalize_pose can find them later
+            self.mean[0] = txm
+            self.mean[1] = tym
+            self.mean[2] = 0.0
+            
+            self.std[0] = ts
+            self.std[1] = ts
+            self.std[2] = math.pi
+            
+            return (pose - self.mean) / self.std
+
+        if self.norm_mode == "max_abs":
+            # Scale to [-1, 1] using global max
+            norm_scale = torch.tensor([self.xy_norm, self.xy_norm, self.theta_norm], device=pose.device)
+            return torch.clamp(pose / norm_scale, -1, 1)
+        else:
+            # Standardize using global Mean/Std
+            return (pose - self.mean) / self.std
+
+    def _denormalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
+        """Inverse of normalization. Works for all modes."""
+        if self.norm_mode == "max_abs" and not self.overfit_mode:
+            norm_scale = torch.tensor([self.xy_norm, self.xy_norm, self.theta_norm], device=pose.device)
+            return pose * norm_scale
+        else:
+            # Works for both global Mean-Std and Overfit Batch-Std
+            return (pose * self.std) + self.mean
+
+    def training_step(self, batch, batch_idx):
         context = self._build_context(batch)
-        x_1 = self._build_target(batch)
-        x_0 = torch.randn_like(x_1)
+        if batch['target_goal'].dim() > 2:
+            raise ValueError("Target seems to be an image! The model expects a vector.")
+        x_1 = self._normalize_pose(batch['target_goal']) 
+        
+        if self.overfit_mode:
+            # DETERMINISTIC overfitting: Fixed noise, ALL timesteps in EVERY batch
+            # We expand the batch to include multiple timesteps per sample
+            # This prevents catastrophic forgetting between epochs
+            B = x_1.shape[0]
+            num_timesteps = 10  # Number of timesteps per sample
+            
+            # Generate fixed noise (same every iteration)
+            generator = torch.Generator(device=x_1.device)
+            generator.manual_seed(42)
+            x_0 = torch.randn(x_1.shape, generator=generator, device=x_1.device, dtype=x_1.dtype)
+            
+            # Expand batch: each sample gets num_timesteps copies at different t values
+            # x_1: (B, 3) -> (B * num_timesteps, 3)
+            # context: (B, C, H, W) -> (B * num_timesteps, C, H, W)
+            x_1_expanded = x_1.repeat_interleave(num_timesteps, dim=0)  # (B*T, 3)
+            x_0_expanded = x_0.repeat_interleave(num_timesteps, dim=0)  # (B*T, 3)
+            context = context.repeat_interleave(num_timesteps, dim=0)   # (B*T, C, H, W)
+            
+            # Create timesteps: each sample sees [0.05, 0.15, ..., 0.95]
+            t_values = torch.linspace(0.05, 0.95, num_timesteps, device=x_1.device)
+            t = t_values.repeat(B)  # (B*T,) - pattern: [0.05,0.15,...,0.95, 0.05,0.15,...,0.95, ...]
+            
+            t_expand = t.view(-1, 1)
+            x_t = (1 - t_expand) * x_0_expanded + t_expand * x_1_expanded
+            target_v = x_1_expanded - x_0_expanded
+            
+            # Import TrainingState
+            from .common import TrainingState
+            sample = TrainingState(x_t=x_t, t=t, target=target_v)
+            
+            # Save fixed noise for sampling consistency (original batch size)
+            if not hasattr(self, '_fixed_x0'):
+                self._fixed_x0 = x_0.clone()
+                self._fixed_x1 = x_1.clone()
+                self._fixed_target_v = (x_1 - x_0).clone()
+        else:
+            x_0 = torch.randn_like(x_1)
+            # Get training state (x_t, t, target) from Path
+            sample = self.path.compute_loss_samples(x_0=x_0, x_1=x_1)
+        
+        # Predict
+        prediction = self.network(sample.x_t, sample.t, context)
 
-        # Get solution_depth for multi-horizon masking
-        solution_depth = batch.get('solution_depth', None)
-        if solution_depth is not None:
-            solution_depth = torch.tensor(solution_depth, device=x_1.device) if not isinstance(solution_depth, torch.Tensor) else solution_depth
+        pred_xy = prediction[:, 0:2]
+        target_xy = sample.target[:, 0:2]
+        pred_theta_norm = prediction[:, 2]
+        target_theta_norm = sample.target[:, 2]
+        loss_xy = torch.nn.functional.mse_loss(pred_xy, target_xy)
 
-        # Sample from path
-        path_sample = self.path.sample(x_0=x_0, x_1=x_1)
+        # For Flow Matching, the target is a velocity in Euclidean space.
+        # Even for angles, we are transporting in the tangent space (or Euclidean embedding).
+        # Cosine loss is incorrect for velocity matching because velocity magnitude matters.
+        # We use MSE for theta velocity as well.
+        loss_theta = torch.nn.functional.mse_loss(pred_theta_norm, target_theta_norm)
 
-        # Build model input: [context, x_t]
-        model_input = torch.cat([context, path_sample.x_t], dim=1)
+        loss = loss_xy + (2.0 * loss_theta)
 
-        # Get prediction
-        prediction = self(model_input, path_sample.t)
-
-        # Compute loss
-        loss = self._compute_loss(
-            prediction=prediction,
-            target=path_sample.target,
-            x_t=path_sample.x_t,
-            t=path_sample.t,
-            x_1=x_1,
-            solution_depth=solution_depth,
-        )
-
-        # Handle NaN loss
-        if loss is None or torch.isnan(loss):
-            return None
-
-        # Log metrics
+        # Log step-level loss for debugging (shows variance in generative training)
+        self.log("train_loss_step", loss, on_step=True, on_epoch=False, prog_bar=True)
         self.train_loss(loss)
-        self.log("train_loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train_loss_epoch", self.train_loss, on_step=False, on_epoch=True, prog_bar=False)
 
+        # saving to visualize training examples when overfitting
+        # Note: In overfit_mode, we save the ORIGINAL batch data (not expanded)
+        if self.overfit_mode and (not hasattr(self, "_train_context") or batch_idx == 0):
+            # Re-build original context from batch (not the expanded one)
+            original_context = self._build_context(batch)
+            self._train_context = original_context.detach().clone()
+            
+            # Save the ORIGINAL normalized poses (before expansion)
+            # x_1 here is the non-expanded version from _normalize_pose(batch['target_goal'])
+            # We need to use _fixed_x1 which was saved from x_1 before expansion
+            self._train_gt_poses = self._fixed_x1.detach().clone()
+            
+            # Save the normalization stats used for this batch (critical for correct denormalization later)
+            self._train_norm_mean = self.mean.detach().clone()
+            self._train_norm_std = self.std.detach().clone()
+            
+            if 'target_goal_mask' in batch:
+                self._train_gt_images = batch['target_goal_mask'].detach().clone()
+            else:
+                self._train_gt_images = torch.zeros_like(batch['static'])
+            if 'object_theta' in batch:
+                self._train_object_theta = batch['object_theta'].detach().clone()
+            else:
+                self._train_object_theta = torch.zeros(batch['target_goal'].shape[0], device=batch['target_goal'].device)
         return loss
 
-    def validation_step(
-        self,
-        batch: Dict[str, torch.Tensor],
-        batch_idx: int
-    ) -> Optional[torch.Tensor]:
-        """
-        Validation step: same as training but with logging.
-        """
+    def validation_step(self, batch, batch_idx):
         context = self._build_context(batch)
-        x_1 = self._build_target(batch)
+        x_1 = self._normalize_pose(batch['target_goal'])
         x_0 = torch.randn_like(x_1)
+        
+        sample = self.path.compute_loss_samples(x_0=x_0, x_1=x_1)
+        prediction = self.network(sample.x_t, sample.t, context)
+        pred_xy = prediction[:, 0:2]
+        target_xy = sample.target[:, 0:2]
+        pred_theta_norm = prediction[:, 2]
+        target_theta_norm = sample.target[:, 2]
+        loss_xy = torch.nn.functional.mse_loss(pred_xy, target_xy)
 
-        # Get solution_depth for multi-horizon masking
-        solution_depth = batch.get('solution_depth', None)
-        if solution_depth is not None:
-            solution_depth = torch.tensor(solution_depth, device=x_1.device) if not isinstance(solution_depth, torch.Tensor) else solution_depth
+        # For Flow Matching, the target is a velocity in Euclidean space.
+        # Even for angles, we are transporting in the tangent space (or Euclidean embedding).
+        # Cosine loss is incorrect for velocity matching because velocity magnitude matters.
+        # We use MSE for theta velocity as well.
+        loss_theta = torch.nn.functional.mse_loss(pred_theta_norm, target_theta_norm)
 
-        path_sample = self.path.sample(x_0=x_0, x_1=x_1)
-        model_input = torch.cat([context, path_sample.x_t], dim=1)
-
-        prediction = self(model_input, path_sample.t)
-
-        loss = self._compute_loss(
-            prediction=prediction,
-            target=path_sample.target,
-            x_t=path_sample.x_t,
-            t=path_sample.t,
-            x_1=x_1,
-            solution_depth=solution_depth,
-        )
-
-        if loss is None or torch.isnan(loss):
-            return None
-
+        loss = loss_xy + (2.0 * loss_theta)
+        
         self.val_loss(loss)
         self.log("val_loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
-
-        # Save first batch for sample generation
         if batch_idx == 0:
-            target_object = batch.get('target_object')
             self._validation_context = context
-            self._validation_target = x_1
-            self._validation_target_object = target_object
-            self._validation_solution_depth = solution_depth
+            self._validation_gt_poses = x_1
 
+            if 'target_goal_mask' in batch:
+                self._validation_gt_images = batch['target_goal_mask']
+            else:
+                self._validation_gt_images = torch.zeros_like(batch['static'])
+            
+            # Store object theta for visualization (needed to convert object-frame delta to world frame)
+            if 'object_theta' in batch:
+                self._validation_object_theta = batch['object_theta']
+            else:
+                self._validation_object_theta = torch.zeros(batch['target_goal'].shape[0], device=batch['target_goal'].device)
         return loss
 
     def on_validation_epoch_end(self):
-        """Log best validation loss and generate samples."""
-        self.val_loss_best(self.val_loss.compute())
-        self.log("val_loss_best", self.val_loss_best, prog_bar=True)
+        if not self.overfit_mode:
+            self.val_loss_best(self.val_loss.compute())
+            self.log("val_loss_best", self.val_loss_best, prog_bar=True)
+            if hasattr(self, '_validation_context'):
+                self._visualize_predictions()
 
-        # Generate validation samples
-        if hasattr(self, '_validation_context'):
-            self._generate_validation_samples()
+    def on_train_epoch_end(self):
+        if self.overfit_mode and hasattr(self, '_train_context'):
+            self._visualize_predictions()
 
-        # Clear validation tensors to free GPU memory
-        self._validation_context = None
-        self._validation_target = None
-        self._validation_target_object = None
-        self._validation_solution_depth = None
-        torch.cuda.empty_cache()
+    def _get_transformed_mask_cv2(self, current_mask_tensor, pose_norm, object_theta_rad):
+            """
+            Uses the internal _denormalize_pose to ensure pixel-perfect 
+            alignment regardless of normalization mode.
+            """
+            mask_np = (current_mask_tensor.cpu().numpy() * 255).astype(np.uint8)
+            H, W = mask_np.shape
+            pixels_per_meter = W / self.crop_size_meters
+            
+            # 1. DENORMALIZE using the shared model logic
+            # Un-normalize back to raw meters/radians
+            real_pose = self._denormalize_pose(pose_norm.unsqueeze(0)).squeeze(0)
+            
+            dx_obj_meters = real_pose[0].item()
+            dy_obj_meters = real_pose[1].item()
+            dtheta_change = real_pose[2].item()
 
-    def _generate_validation_samples(self):
-        """Generate and log samples during validation.
+            # 2. Find current geometry
+            contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours: return torch.zeros_like(current_mask_tensor)
+            cnt = max(contours, key=cv2.contourArea).squeeze()
+            M = cv2.moments(cnt)
+            if M['m00'] == 0: return torch.zeros_like(current_mask_tensor)
+            curr_obj_cx, curr_obj_cy = M['m10'] / M['m00'], M['m01'] / M['m00']
+            
+            # 3. Rotate delta to world/image frame
+            c_theta, s_theta = np.cos(object_theta_rad), np.sin(object_theta_rad)
+            dx_world = dx_obj_meters * c_theta - dy_obj_meters * s_theta
+            dy_world = dx_obj_meters * s_theta + dy_obj_meters * c_theta
+            
+            # 4. Translation and Rotation
+            new_obj_cx = curr_obj_cx + (dx_world * pixels_per_meter)
+            new_obj_cy = curr_obj_cy + (dy_world * pixels_per_meter) # No Y-flip per data gen
+            
+            pts_centered = (cnt - np.array([curr_obj_cx, curr_obj_cy])).astype(np.float32)
+            cr, sr = np.cos(dtheta_change), np.sin(dtheta_change)
+            R = np.array(((cr, -sr), (sr, cr)))
+            
+            pts_final = (R @ pts_centered.T).T + np.array([new_obj_cx, new_obj_cy])
+            
+            new_mask = np.zeros_like(mask_np)
+            cv2.fillPoly(new_mask, [pts_final.astype(np.int32)], 255)
+            return torch.from_numpy(new_mask).float().to(self.device) / 255.0
 
-        Logs 8 images, each showing a different validation example.
-        Each image has 7 panels with different visualizations depending on mode.
-
-        Global mode (use_local=False):
-        - Context channels: 0=robot, 1=robot_goal, 2=movable, 3=static, 4=target_object
-        - Panels: Scene | TargetObj | GT | Pred1-4
-
-        Local mode (use_local=True):
-        - Context channels: 0=static, 1=movable, 2=target_object, 3=goal_region
-        - Panels: Scene | TargetObj | GT | Pred1-4
-
-        Multi-horizon mode (use_multihorizon=True):
-        - Shows both goal_mask_a1 and goal_mask_a2 predictions
-        - GT shows both channels
-        - Layout: Scene | Reach | GT_a1 | GT_a2 | Pred_a1 | Pred_a2 | Pred_a1 | Pred_a2
+    def _visualize_predictions(self):
         """
-        context = self._validation_context
-        target = self._validation_target
-        solution_depth = self._validation_solution_depth
+        Visualizes the validation samples with specific color encodings.
+        """
+        if not hasattr(self.logger, 'experiment'): return
+        import wandb
+        import torchvision
+        import cv2
+        import numpy as np
+        
+        # --- HELPER: Display Normalization ---
+        def _to_display(x: torch.Tensor) -> torch.Tensor:
+            """Convert from [-1, 1] to [0, 1] and ensure 2D (H, W)."""
+            return torch.clamp((x + 1) / 2, 0, 1).squeeze()
+
+        if self.overfit_mode:
+            context = self._train_context
+            gt_images = self._train_gt_images
+            gt_poses = self._train_gt_poses
+            object_thetas = self._train_object_theta
+            # Restore the normalization stats that were used when these poses were normalized
+            saved_mean, saved_std = self.mean.clone(), self.std.clone()
+            self.mean.copy_(self._train_norm_mean)
+            self.std.copy_(self._train_norm_std)
+        else:
+            context = self._validation_context
+            gt_images = self._validation_gt_images
+            gt_poses = self._validation_gt_poses
+            object_thetas = self._validation_object_theta
 
         num_examples = min(8, context.size(0))
         image_size = context.shape[-1]
+        
+        log_dict = {}
 
-        # Log images if logger is available
-        if hasattr(self.logger, 'experiment'):
-            import wandb
+        for i in range(num_examples):
+            # Extract Data
+            ctx = context[i]             # (5, H, W)
+            gt_img_mask = gt_images[i]   # (1, H, W) or (H,W)
+            gt_pose_delta = gt_poses[i]  # (3,)
+            obj_theta = object_thetas[i].item()  # scalar in radians
 
-            def _to_display(x: torch.Tensor) -> torch.Tensor:
-                return torch.clamp((x + 1) / 2, 0, 1)
+            # --- CORRECT CHANNEL MAPPING ---
+            # Based on _build_context: 
+            # [0]=Static, [1]=Movable, [2]=Target, [3]=RobotRegion, [4]=GoalRegion
+            static_walls = _to_display(ctx[0:1])
+            # movable = _to_display(ctx[1:2]) # Not used in viz
+            target_obj_curr = _to_display(ctx[2:3])
+            robot_region = _to_display(ctx[3:4])
+            goal_sample_region = _to_display(ctx[4:5])
+            
+            # Ensure GT Image Mask is 2D [0,1]
+            gt_img_mask_disp = _to_display(gt_img_mask.unsqueeze(0) if gt_img_mask.dim()==2 else gt_img_mask)
 
-            log_dict = {}
-            for i in range(num_examples):
-                ctx = context[i:i+1]  # (1, C, H, W)
-
-                # Handle multi-horizon vs single-horizon target
-                if self.use_multihorizon:
-                    # target is [B, 2, H, W], get both channels
-                    gt_a1 = _to_display(target[i:i+1, 0:1])[0, 0]  # (H, W)
-                    gt_a2 = _to_display(target[i:i+1, 1:2])[0, 0]  # (H, W)
-                    # Get solution depth for this sample (for caption)
-                    sample_depth = int(solution_depth[i].item()) if solution_depth is not None else 0
+            # Generate "Ghost" Masks using Pose Deltas
+            # Pass object_theta to correctly transform object-frame delta to world frame
+            gt_pose_mask = self._get_transformed_mask_cv2(target_obj_curr, gt_pose_delta, obj_theta)
+            
+            # DEBUG: Log denormalized pose values to verify correctness
+            if i == 0 and self.current_epoch % 20 == 0:
+                denorm_pose = self._denormalize_pose(gt_pose_delta.unsqueeze(0)).squeeze(0)
+                print(f"[DEBUG Viz] Epoch {self.current_epoch}, Sample 0:")
+                print(f"  Normalized pose: {gt_pose_delta.cpu().numpy()}")
+                print(f"  Denormalized pose: {denorm_pose.cpu().numpy()}")
+                print(f"  Mean: {self.mean.cpu().numpy()}, Std: {self.std.cpu().numpy()}")
+            
+            # Generate Predictions
+            with torch.no_grad():
+                if self.overfit_mode and hasattr(self, '_fixed_x0'):
+                    # DIRECT velocity test: x_1 = x_0 + v
+                    # This directly tests if the model learned the correct velocity
+                    # without relying on ODE integration across unseen timesteps
+                    x_0_i = self._fixed_x0[i:i+1]  # (1, 3)
+                    # Query model at t=0.5 (middle of training range)
+                    t_test = torch.tensor([0.5], device=ctx.device)
+                    x_t_test = 0.5 * x_0_i + 0.5 * gt_pose_delta.unsqueeze(0)
+                    pred_v = self.network(x_t_test, t_test, ctx.unsqueeze(0))
+                    # Reconstruct x_1 from x_0 + predicted velocity
+                    pred_x1 = x_0_i + pred_v  # (1, 3)
+                    # Repeat for 4 samples (they should all be identical in overfit mode)
+                    p_list = pred_x1.repeat(4, 1)
                 else:
-                    # target is [B, 1, H, W]
-                    gt_a1 = _to_display(target[i:i+1])[0, 0]  # (H, W)
-                    gt_a2 = None
-                    sample_depth = 1
+                    # Normal ODE sampling for non-overfit mode
+                    p_list = self.sample_pose(ctx.unsqueeze(0), num_samples=4, denormalize=False, sample_idx=i)
 
-                # Generate predictions
-                with torch.no_grad():
-                    if self.use_multihorizon:
-                        # Generate 2 samples, each with both channels
-                        sample1 = self.sample(ctx, num_steps=20)[0]  # (2, H, W)
-                        sample2 = self.sample(ctx, num_steps=20)[0]  # (2, H, W)
-                        pred_a1_1 = _to_display(sample1[0:1])[0]  # (H, W)
-                        pred_a2_1 = _to_display(sample1[1:2])[0]  # (H, W)
-                        pred_a1_2 = _to_display(sample2[0:1])[0]  # (H, W)
-                        pred_a2_2 = _to_display(sample2[1:2])[0]  # (H, W)
-                    else:
-                        pred_a1_1 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
-                        pred_a1_2 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
-                        pred_a1_3 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
-                        pred_a1_4 = _to_display(self.sample(ctx, num_steps=20)[0, 0:1])[0]
+            # --- PANEL 1: LOCAL SCENE ---
+            # Req: RobotRegion(Red), GoalRegion(Green), Target(Cyan), Walls(Black)
+            img1 = torch.zeros(3, image_size, image_size, device=ctx.device)
+            img1[0] = robot_region
+            # Green Channel: Goal Region + part of Cyan Target
+            img1[1] = torch.clamp(goal_sample_region + target_obj_curr, 0, 1) 
+            # Blue Channel: Part of Cyan Target
+            img1[2] = target_obj_curr                                 
 
-                if self.use_local:
-                    # Local mode channels: 0=static, 1=movable, 2=target_object, 3=robot_region, 4=goal_sample_region
-                    static = _to_display(ctx[0, 0:1])[0]
-                    movable = _to_display(ctx[0, 1:2])[0]
-                    target_obj = _to_display(ctx[0, 2:3])[0]
-                    robot_region = _to_display(ctx[0, 3:4])[0]
-                    goal_sample_region = _to_display(ctx[0, 4:5])[0]
+            # --- PANEL 2: GT ANALYSIS ---
+            # Req: Target(Cyan), GT_Image(Orange), GT_Pose(Blue), Walls(Red)
+            # Orange = Red(1.0) + Green(0.5)
+            img2 = torch.zeros(3, image_size, image_size, device=ctx.device)
+            
+            # Red Channel: Walls + GT_Image (Full Red)
+            img2[0] = torch.clamp(static_walls + gt_img_mask_disp, 0, 1)
+            
+            # Green Channel: Target (Cyan) + GT_Image (Half Green for Orange)
+            img2[1] = torch.clamp(target_obj_curr + (0.5 * gt_img_mask_disp), 0, 1)
+            
+            # Blue Channel: Target (Cyan) + GT_Pose
+            img2[2] = torch.clamp(target_obj_curr + gt_pose_mask, 0, 1)
 
-                    # Consistent colors: R=static/context, G=variable/pred, B=target_obj (always blue)
+            # --- PANELS 3-6: PREDICTIONS ---
+            # Req: Walls(Red), GT_Pose(Blue), Pred_Pose(Green)
+            preds_imgs = []
+            for j in range(4):
+                pred_pose_mask = self._get_transformed_mask_cv2(target_obj_curr, p_list[j], obj_theta)
+                
+                p_img = torch.zeros(3, image_size, image_size, device=ctx.device)
+                p_img[0] = static_walls     # Red
+                p_img[1] = pred_pose_mask   # Green
+                p_img[2] = gt_pose_mask     # Blue
+                
+                preds_imgs.append(p_img)
 
-                    # Image 1: Scene (R=static, G=movable, B=target_obj)
-                    img1 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img1[0, 0] = static
-                    img1[0, 1] = movable
-                    img1[0, 2] = target_obj
+            # --- STITCH & LOG ---
+            row_tensors = [img1, img2] + preds_imgs
+            row_stack = torch.stack(row_tensors)
+            
+            # Normalize=False because we manually constructed [0,1] tensors
+            grid = torchvision.utils.make_grid(row_stack, nrow=6, normalize=False, padding=2)
 
-                    # Image 2: Reachability (R=robot_region, G=goal_sample_region, B=target_obj)
-                    img2 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img2[0, 0] = robot_region
-                    img2[0, 1] = goal_sample_region
-                    img2[0, 2] = target_obj
+            grid_np = grid.cpu().permute(1, 2, 0).numpy()
+            caption = f"Ex {i} | Scene | GT Analysis (Org=Img, Blu=Pose) | Preds (Grn) vs GT (Blu)"
+            log_dict[f'val_sample_{i}'] = wandb.Image(grid_np, caption=caption)
 
-                    # Helper to make prediction/GT images
-                    def make_pred_img(pred_loc):
-                        img = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                        img[0, 0] = static
-                        img[0, 1] = pred_loc
-                        img[0, 2] = target_obj
-                        return img
+        # Restore original stats if we swapped them for overfit visualization
+        if self.overfit_mode:
+            self.mean.copy_(saved_mean)
+            self.std.copy_(saved_std)
 
-                    if self.use_multihorizon:
-                        # Multi-horizon: Show GT_a1, GT_a2, then 2 samples with both channels
-                        # Layout: Scene | Reach | GT_a1 | GT_a2 | Pred_a1 | Pred_a2 | Pred_a1 | Pred_a2
-                        img3 = make_pred_img(gt_a1)  # GT_a1
-                        img4 = make_pred_img(gt_a2)  # GT_a2
-                        img5 = make_pred_img(pred_a1_1)  # Sample1 a1
-                        img6 = make_pred_img(pred_a2_1)  # Sample1 a2
-                        img7 = make_pred_img(pred_a1_2)  # Sample2 a1
-                        img8 = make_pred_img(pred_a2_2)  # Sample2 a2
+        self.logger.experiment.log(log_dict)
 
-                        row = torch.cat([img1, img2, img3, img4, img5, img6, img7, img8], dim=0)
-                        nrow = 8
-                        caption = f"Epoch {self.current_epoch} depth={sample_depth} | Scene | Reach | GT_a1 | GT_a2 | S1_a1 | S1_a2 | S2_a1 | S2_a2"
-                    else:
-                        # Single-horizon: original layout
-                        img3 = make_pred_img(gt_a1)
-                        img4 = make_pred_img(pred_a1_1)
-                        img5 = make_pred_img(pred_a1_2)
-                        img6 = make_pred_img(pred_a1_3)
-                        img7 = make_pred_img(pred_a1_4)
-
-                        row = torch.cat([img1, img2, img3, img4, img5, img6, img7], dim=0)
-                        nrow = 7
-                        caption = f"Epoch {self.current_epoch} | Scene | Reach | GT | Pred1-4"
-
-                else:
-                    # Global mode channels: 0=robot, 1=robot_goal, 2=movable, 3=static, 4=target_object
-                    robot = _to_display(ctx[0, 0:1])[0]
-                    robot_goal = _to_display(ctx[0, 1:2])[0]
-                    movable = _to_display(ctx[0, 2:3])[0]
-                    static = _to_display(ctx[0, 3:4])[0]
-                    target_obj = _to_display(ctx[0, 4:5])[0]
-
-                    # Image 1: Scene (robot=R, robot_goal=G, static+movable=B)
-                    img1 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img1[0, 0] = robot
-                    img1[0, 1] = robot_goal
-                    img1[0, 2] = torch.clamp(static + movable, 0, 1)
-
-                    # Image 2: Target object context (robot=R, robot_goal+target_obj=G, static+target_obj=B)
-                    img2 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img2[0, 0] = robot
-                    img2[0, 1] = torch.clamp(robot_goal + target_obj, 0, 1)
-                    img2[0, 2] = torch.clamp(static + target_obj, 0, 1)
-
-                    # Image 3: Ground truth (robot=R, robot_goal+gt_location=G, target_obj=B)
-                    img3 = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                    img3[0, 0] = robot
-                    img3[0, 1] = torch.clamp(robot_goal + gt_a1, 0, 1)
-                    img3[0, 2] = target_obj
-
-                    # Images 4-7: Predictions (robot=R, robot_goal+pred=G, static+target_obj=B)
-                    def make_pred_img(pred_loc):
-                        img = torch.zeros(1, 3, image_size, image_size, device=ctx.device)
-                        img[0, 0] = robot
-                        img[0, 1] = torch.clamp(robot_goal + pred_loc, 0, 1)
-                        img[0, 2] = torch.clamp(static + target_obj, 0, 1)
-                        return img
-
-                    img4 = make_pred_img(pred_a1_1)
-                    img5 = make_pred_img(pred_a1_2)
-                    img6 = make_pred_img(pred_a1_3)
-                    img7 = make_pred_img(pred_a1_4)
-
-                    row = torch.cat([img1, img2, img3, img4, img5, img6, img7], dim=0)
-                    nrow = 7
-                    caption = f"Epoch {self.current_epoch} | Scene | TargetObj | GT | Pred1 | Pred2 | Pred3 | Pred4"
-
-                grid = torchvision.utils.make_grid(row, nrow=nrow, normalize=True, padding=2)
-
-                # Convert to numpy and log
-                grid_np = grid.cpu().permute(1, 2, 0).numpy()
-                log_dict[f'val_sample_{i+1}'] = wandb.Image(grid_np, caption=caption)
-
-            self.logger.experiment.log(log_dict)
-
-    def sample(
-        self,
-        context: torch.Tensor,
-        num_samples: int = 1,
-        num_steps: int = 20,
-        show_progress: bool = False
-    ) -> torch.Tensor:
+    def sample_pose(self, context, num_samples=1, num_steps=20, denormalize=True, show_progress=False, sample_idx=None):
         """
-        Generate samples given context.
-
+        Sample poses using the learned velocity field.
+        
         Args:
-            context: Context tensor, shape (B, C_context, H, W)
-            num_samples: Number of samples per context (currently must be 1)
-            num_steps: Number of sampling steps
-            show_progress: Whether to show progress bar
-
-        Returns:
-            Generated samples, shape (B, C_target, H, W)
+            context: (B, C, H, W) context images
+            num_samples: number of samples per context
+            num_steps: ODE integration steps
+            denormalize: whether to denormalize output
+            show_progress: show tqdm progress bar
+            sample_idx: if in overfit_mode, use fixed noise for this sample index
         """
-        B, C, H, W = context.shape
+        self._sync_sampler_time_scaling()
+        B = context.shape[0]
+        context_repeated = context.repeat_interleave(num_samples, dim=0)
+        total_samples = B * num_samples
+        
+        if self.overfit_mode and hasattr(self, '_fixed_x0') and sample_idx is not None:
+            # Use the SAME fixed noise as training for deterministic comparison
+            x_init = self._fixed_x0[sample_idx:sample_idx+1].repeat(num_samples, 1)
+        elif self.overfit_mode:
+            # Use consistent fixed noise even without sample_idx
+            generator = torch.Generator(device=context.device)
+            generator.manual_seed(42)
+            x_init = torch.randn(total_samples, self.vector_dim, generator=generator, 
+                                device=context.device, dtype=context.dtype)
+        else:
+            x_init = torch.randn(total_samples, self.vector_dim, device=context.device)
+            
+        def model_fn(x, t):
+            return self.network(x, t, context_repeated)
+        samples = self.sampler.sample(model_fn, x_init, num_steps, show_progress, device=context.device)
+        if denormalize: return self._denormalize_pose(samples)
+        return samples
 
-        # Initialize from noise
-        x_init = torch.randn(B, self.target_channels, H, W, device=context.device)
+    def configure_optimizers(self):
+        return self.optimizer_partial(params=self.parameters())
 
-        # Create model function that includes context
-        def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            model_input = torch.cat([context, x], dim=1)
-            return self(model_input, t)
 
-        # Sample using the configured sampler
-        return self.sampler.sample(
-            model=model_fn,
-            x_init=x_init,
-            num_steps=num_steps,
-            show_progress=show_progress
-        )
+class GenerativeModule(pl.LightningModule):
+    """Image-to-image diffusion module (global or local masks)."""
 
+    def __init__(
+        self,
+        network: nn.Module,
+        path: DiffusionBasePath,
+        sampler: DiffusionBaseSampler,
+        optimizer: Any,
+        context_channels: int = 5,
+        target_channels: int = 1,
+        use_local: bool = True,
+        aux_loss_weight: float = 0.0,
+    ):
+        super().__init__()
+        self.network = network
+        self.path = path
+        self.sampler = sampler
+        self.optimizer_partial = optimizer
+        self.context_channels = context_channels
+        self.target_channels = target_channels
+        self.use_local = use_local
+        self.aux_loss_weight = aux_loss_weight
+
+        self.train_loss = MeanMetric()
+        self.val_loss = MeanMetric()
+        self.val_loss_best = MinMetric()
+        self.save_hyperparameters(ignore=["network", "path", "sampler", "optimizer"])
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.network(x, t)
+
+    def _build_context(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if self.use_local:
+            parts = [
+                batch["static"],
+                batch["movable"],
+                batch["target_object"],
+                batch.get("robot_region", torch.zeros_like(batch["static"])),
+                batch.get("goal_sample_region", torch.zeros_like(batch["static"])),
+            ]
+        else:
+            parts = [
+                batch["robot"],
+                batch["goal"],
+                batch["movable"],
+                batch["static"],
+                batch["target_object"],
+            ]
+        if "coord_grid" in batch:
+            parts.append(batch["coord_grid"])
+        return torch.cat(parts, dim=1)
+
+    def _get_target(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        target = batch["target_goal_mask"]
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        return target
+
+    def training_step(self, batch, batch_idx):
+        context = self._build_context(batch)
+        x_1 = self._get_target(batch)
+        x_0 = torch.randn_like(x_1)
+
+        sample = self.path.sample(x_0=x_0, x_1=x_1)
+        model_in = torch.cat([context, sample.x_t], dim=1)
+        prediction = self.network(model_in, sample.t)
+
+        loss = torch.nn.functional.mse_loss(prediction, sample.target)
+
+        if self.aux_loss_weight > 0:
+            pred_x1 = self.path.get_x1_from_prediction(sample.x_t, sample.t, prediction)
+            aux_loss = torch.nn.functional.mse_loss(pred_x1, x_1)
+            loss = loss + self.aux_loss_weight * aux_loss
+
+        self.train_loss(loss)
+        self.log("train_loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=False)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        context = self._build_context(batch)
+        x_1 = self._get_target(batch)
+        x_0 = torch.randn_like(x_1)
+
+        sample = self.path.sample(x_0=x_0, x_1=x_1)
+        model_in = torch.cat([context, sample.x_t], dim=1)
+        prediction = self.network(model_in, sample.t)
+
+        loss = torch.nn.functional.mse_loss(prediction, sample.target)
+
+        if self.aux_loss_weight > 0:
+            pred_x1 = self.path.get_x1_from_prediction(sample.x_t, sample.t, prediction)
+            aux_loss = torch.nn.functional.mse_loss(pred_x1, x_1)
+            loss = loss + self.aux_loss_weight * aux_loss
+
+        self.val_loss(loss)
+        self.log("val_loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    def on_validation_epoch_end(self):
+        self.val_loss_best(self.val_loss.compute())
+        self.log("val_loss_best", self.val_loss_best, prog_bar=True)
+
+    @torch.no_grad()
     def sample_from_model(
         self,
-        inp: torch.Tensor,
-        tgt_size: int = 1,
-        samples: int = 32,
-        num_steps: int = 20,
-        seed: int = None
+        context: torch.Tensor,
+        samples: int = 1,
+        num_steps: Optional[int] = None,
     ) -> torch.Tensor:
-        """
-        Sample generation interface for inference.
-
-        Args:
-            inp: Input context tensor (B, C_context, H, W)
-            tgt_size: Number of target channels (default 1 for goal-only)
-            samples: Number of samples to generate
-            num_steps: Number of sampling steps
-            seed: Random seed for reproducible noise (None for random)
-
-        Returns:
-            Generated samples, shape (samples, tgt_size, H, W)
-        """
-        # Repeat input for multiple samples
-        inp_repeated = inp.repeat(samples, 1, 1, 1)
-
-        # Initialize from different noise for each sample (enables diverse outputs)
-        if seed is not None:
-            generator = torch.Generator(device=inp.device).manual_seed(seed)
-            x_init = torch.randn(samples, tgt_size, inp.shape[2], inp.shape[3], device=inp.device, generator=generator)
-        else:
-            x_init = torch.randn(samples, tgt_size, inp.shape[2], inp.shape[3], device=inp.device)
+        batch = context.shape[0]
+        context_rep = context.repeat_interleave(samples, dim=0)
+        x_init = torch.randn(
+            batch * samples,
+            self.target_channels,
+            context.shape[-1],
+            context.shape[-1],
+            device=context.device,
+            dtype=context.dtype,
+        )
 
         def model_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            model_input = torch.cat([inp_repeated, x], dim=1)
-            return self(model_input, t)
+            model_in = torch.cat([context_rep, x], dim=1)
+            return self.network(model_in, t)
 
         return self.sampler.sample(
-            model=model_fn,
-            x_init=x_init,
+            model_fn,
+            x_init,
             num_steps=num_steps,
-            show_progress=False
+            show_progress=False,
+            device=context.device,
         )
 
     def configure_optimizers(self):
-        """Configure optimizer and LR scheduler."""
-        optimizer = self.optimizer_partial(params=self.parameters())
-
-        # If no scheduler params, return optimizer only
-        if self.warmup_steps == 0 and self.decay_steps == 0:
-            return {
-                "optimizer": optimizer,
-                "gradient_clip_val": 1.0,
-            }
-
-        # Get base LR from optimizer
-        base_lr = optimizer.param_groups[0]["lr"]
-
-        def lr_lambda(step):
-            # Warmup phase
-            if step < self.warmup_steps:
-                return step / max(1, self.warmup_steps)
-
-            # Decay phase (cosine decay from base_lr to end_lr)
-            if self.decay_steps > 0:
-                decay_progress = min(1.0, (step - self.warmup_steps) / self.decay_steps)
-                # Cosine decay
-                lr_mult = self.end_lr / base_lr + (1 - self.end_lr / base_lr) * 0.5 * (
-                    1 + torch.cos(torch.tensor(decay_progress * 3.14159)).item()
-                )
-                return lr_mult
-
-            return 1.0
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-            },
-            "gradient_clip_val": 1.0,
-        }
+        return self.optimizer_partial(params=self.parameters())

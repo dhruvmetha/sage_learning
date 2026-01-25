@@ -15,6 +15,10 @@ class GoalInferenceModel:
     """
     Model for performing goal pose inference using a trained diffusion model.
     Generates goal proposals for a selected object in SE(2) space.
+
+    Supports two model types:
+    - Image mask models (GenerativeModule): Output image masks, converted to SE2 via rectangle fitting
+    - SE2 pose models (VectorDiffusionModule): Output SE2 deltas directly in object-local frame
     """
 
     def __init__(self, model_path, device="cuda", sampler_method=None, num_steps=None):
@@ -43,7 +47,20 @@ class GoalInferenceModel:
             self._override_sampler(sampler_method)
 
         # Model loaded - sampler: {type(self.model.sampler).__name__} (method: {self._get_sampler_method()})
-        
+
+        # Detect model type: SE2 pose model vs image mask model
+        # SE2 models have vector_dim in config and use VectorDiffusionModule
+        model_cfg = self.cfg.model
+        self.is_se2_model = (
+            hasattr(model_cfg, 'vector_dim') or
+            'VectorDiffusionModule' in model_cfg.get('_target_', '') or
+            'vector_diffusion' in model_cfg.get('_target_', '').lower()
+        )
+
+        # For SE2 models, get crop size in meters for coordinate transform
+        if self.is_se2_model:
+            self.crop_size_meters = getattr(model_cfg, 'crop_size_meters', 5.0)
+
         # Use data config
         self.data_cfg = self.cfg.data
 
@@ -65,10 +82,12 @@ class GoalInferenceModel:
         self.crop_size = getattr(self.data_cfg, 'crop_size',
                                  getattr(self.cfg, 'crop_size', None))
 
-        # Setup image transform (resize to context_size)
+        # Setup image transform
+        # SE2 models use 224x224 input, mask models use context_size
+        target_size = 224 if self.is_se2_model else self.context_size
         self.transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Resize((self.context_size, self.context_size)),
+            transforms.Resize((target_size, target_size)),
             transforms.Lambda(lambda x: x * 2 - 1),
         ])
         
@@ -184,8 +203,9 @@ class GoalInferenceModel:
         """
         Perform goal inference to get goal proposals.
 
-        Automatically routes to the appropriate inference method based on whether
-        the model was trained with local (object-centered) or global masks.
+        Automatically routes to the appropriate inference method based on model type:
+        - SE2 models: Direct pose prediction via _infer_se2()
+        - Image mask models: Mask prediction via _infer_local() or global inference
 
         Args:
             json_message: Raw JSON message from planning system
@@ -198,11 +218,16 @@ class GoalInferenceModel:
         Returns:
             List of goal dictionaries, each containing:
             - index: Sample index
-            - goal_center: [x, y] goal center in world coordinates (global only)
-            - final_quat: Quaternion for object rotation (global only)
+            - goal_center: [x, y] goal center in world coordinates (global/mask models only)
+            - final_quat: Quaternion for object rotation (global/mask models only)
             - x, y, theta: SE(2) pose components
-            - goal_sample: Raw goal sample array
+            - goal_sample: Raw goal sample array (mask models only)
+            - input_channels: Input tensor for visualization
         """
+        # Route to SE2 inference for direct pose prediction models
+        if self.is_se2_model:
+            return self._infer_se2(json_message, xml_path, robot_goal, selected_object, samples, seed=seed)
+
         # Auto-route to local inference if model was trained with use_local=True
         if self.use_local:
             return self._infer_local(json_message, xml_path, robot_goal, selected_object, samples, seed=seed)
@@ -445,6 +470,125 @@ class GoalInferenceModel:
                 'theta': goal_theta,
                 'goal_sample': goal_sample,
                 'input_channels': inp_for_goal_np
+            })
+
+        return valid_goals
+
+    def _infer_se2(self, json_message, xml_path, robot_goal, selected_object, samples=32, seed=None):
+        """
+        Perform goal inference using SE2 pose prediction models.
+
+        SE2 models directly output (dx, dy, dtheta) deltas in the object's local frame.
+        These deltas are transformed to world coordinates using the object's current pose.
+
+        Args:
+            json_message: Raw JSON message from planning system
+            xml_path: Path to MuJoCo XML file for ImageConverter
+            robot_goal: Robot goal position [x, y]
+            selected_object: Name of the object to generate goals for
+            samples: Number of samples to generate (default: 32)
+            seed: Random seed for reproducible noise (None for random)
+
+        Returns:
+            List of goal dictionaries, each containing:
+            - index: Sample index
+            - x, y, theta: SE(2) pose in world coordinates
+            - input_channels: Input tensor for visualization
+        """
+        # Create ImageConverter and generate local masks (same as mask models)
+        image_converter = ImageConverter(xml_path)
+        local_data = image_converter.create_local_masks(
+            data_point=json_message,
+            selected_object=selected_object,
+            robot_goal_pos=robot_goal,
+            region_goals_sampled=None,
+            crop_size_meters=self.crop_size_meters,
+            highres_size=1024,
+            output_size=224  # SE2 models use 224x224
+        )
+
+        if 'local_static' not in local_data:
+            raise ValueError(f"Failed to generate local masks for object '{selected_object}'")
+
+        # Stack input channels in TRAINING ORDER:
+        # static, movable, target_object, robot_region, goal_sample_region
+        input_channels = [
+            local_data['local_static'],
+            local_data['local_movable'],
+            local_data['local_target_object'],
+            local_data['local_robot_region'],
+            local_data['local_goal_sample_region'],
+        ]
+
+        # Add coordinate grid if model was trained with it
+        if self.use_coord_grid:
+            orig_size = local_data['local_static'].shape[0]
+            ys, xs = np.meshgrid(np.linspace(0, 1, orig_size),
+                                 np.linspace(0, 1, orig_size),
+                                 indexing='ij')
+            coord_grid = np.stack([xs, ys], axis=-1).astype(np.float32)
+            input_channels.append(coord_grid)
+
+        # Concatenate and transform to tensor
+        inp_for_goal = np.concatenate(input_channels, axis=-1)
+        inp_for_goal = self.transform(inp_for_goal).unsqueeze(0).to(self.device)
+
+        # Get object's current pose for coordinate transformation
+        object_center = local_data['object_center']  # (x, y) in world frame
+        object_theta = local_data['object_theta']    # radians
+
+        # Generate SE2 pose samples using model.sample_pose()
+        num_steps = self.num_steps if self.num_steps is not None else 20
+
+        with torch.no_grad():
+            # Set seed if provided
+            if seed is not None:
+                torch.manual_seed(seed)
+
+            # sample_pose returns (num_samples, 3) tensor with (dx, dy, dtheta) deltas
+            # These are already denormalized (in meters/radians) in object-local frame
+            pose_deltas = self.model.sample_pose(
+                inp_for_goal,
+                num_samples=samples,
+                num_steps=num_steps,
+                denormalize=True
+            )
+
+        inp_for_goal_np = inp_for_goal.cpu().squeeze(0).numpy()
+
+        # Transform deltas from object-local frame to world coordinates
+        # This is the same transformation used by primitives:
+        # goal = object_pose + R(object_theta) @ delta
+        cos_t = np.cos(object_theta)
+        sin_t = np.sin(object_theta)
+
+        valid_goals = []
+        for i, delta in enumerate(pose_deltas):
+            dx, dy, dtheta = delta.cpu().numpy()
+
+            # Transform position delta to world frame
+            world_x = object_center[0] + dx * cos_t - dy * sin_t
+            world_y = object_center[1] + dx * sin_t + dy * cos_t
+
+            # Add angular delta to get goal theta
+            goal_theta = object_theta + dtheta
+
+            # Normalize theta to [-pi, pi]
+            while goal_theta > np.pi:
+                goal_theta -= 2 * np.pi
+            while goal_theta < -np.pi:
+                goal_theta += 2 * np.pi
+
+            valid_goals.append({
+                'index': i,
+                'x': float(world_x),
+                'y': float(world_y),
+                'theta': float(goal_theta),
+                'input_channels': inp_for_goal_np,
+                # Include deltas for debugging/visualization
+                'delta_x': float(dx),
+                'delta_y': float(dy),
+                'delta_theta': float(dtheta),
             })
 
         return valid_goals
