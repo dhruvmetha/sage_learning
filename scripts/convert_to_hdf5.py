@@ -77,6 +77,9 @@ MINIMAL_KEYS = [
     'local_movable',
     'local_robot_region',
     'local_goal_sample_region',
+    'local_robot',         # Robot position (sampled to be within robot_region)
+    'local_goal',          # Goal position (sampled to be within goal_sample_region)
+    'local_goal_samples',  # Goal sample positions (all within goal_sample_region)
     # Metadata needed for training
     'xml_file',
     'solution_depth',  # How many actions remain

@@ -1133,6 +1133,7 @@ class NAMODataVisualizer:
         highres = {
             'robot': np.zeros((highres_size, highres_size), dtype=np.float32),
             'goal': np.zeros((highres_size, highres_size), dtype=np.float32),
+            'goal_samples': np.zeros((highres_size, highres_size), dtype=np.float32),
             'movable': np.zeros((highres_size, highres_size), dtype=np.float32),
             'static': np.zeros((highres_size, highres_size), dtype=np.float32),
             'reachable': np.zeros((highres_size, highres_size), dtype=np.float32),
@@ -1238,6 +1239,11 @@ class NAMODataVisualizer:
         # This makes semantic sense - goals should be reachable from robot's target location
         if not region_goals_sampled and robot_goal:
             region_goals_sampled = [(robot_goal[0], robot_goal[1], robot_goal[2] if len(robot_goal) > 2 else 0.0)]
+
+        # Draw goal_samples mask (circles at all sampled goal positions)
+        if region_goals_sampled:
+            for goal in region_goals_sampled:
+                draw_circle(highres['goal_samples'], goal[0], goal[1], goal_circle_radius)
 
         # 6. Compute robot_region (reachable cells from robot position)
         # Get robot position and robot half-extent for inflation
@@ -1387,9 +1393,118 @@ class NAMODataVisualizer:
             pad_left = x1 - x1_raw     # positive if x1_raw < 0
             pad_right = x2_raw - x2    # positive if x2_raw > highres_size
 
+            # === Sample positions for local masks if originals are outside crop ===
+            # This ensures local_robot, local_goal, local_goal_samples always have content
+
+            def circle_fully_within_region(px, py, radius_px, region_mask):
+                """Check if a circle at (px, py) is fully contained within the region mask."""
+                h, w = region_mask.shape
+                # Create a temporary mask with the circle
+                temp = np.zeros((h, w), dtype=np.float32)
+                cv2.circle(temp, (px, py), max(1, radius_px), 1.0, -1)
+                # Check that all circle pixels are within the region
+                circle_pixels = temp > 0
+                return np.all(region_mask[circle_pixels] > 0.5)
+
+            def sample_from_region_in_crop(region_mask, crop_y1, crop_y2, crop_x1, crop_x2,
+                                           n_samples=1, radius_px=0, max_attempts=500):
+                """Sample random points from region mask within crop bounds.
+
+                Ensures the entire circle (not just center) is within the region.
+                """
+                region_crop = region_mask[crop_y1:crop_y2, crop_x1:crop_x2]
+                ys, xs = np.where(region_crop > 0)
+                if len(ys) == 0:
+                    return []
+
+                # Shuffle candidate indices for random sampling
+                all_indices = np.arange(len(ys))
+                np.random.shuffle(all_indices)
+
+                results = []
+                idx_pos = 0
+
+                while len(results) < n_samples and idx_pos < min(max_attempts, len(all_indices)):
+                    idx = all_indices[idx_pos]
+                    px, py = crop_x1 + xs[idx], crop_y1 + ys[idx]
+
+                    # Check if entire circle is within the region
+                    if radius_px > 0:
+                        if circle_fully_within_region(px, py, radius_px, region_mask):
+                            results.append((px, py))
+                    else:
+                        results.append((px, py))
+
+                    idx_pos += 1
+
+                return results
+
+            robot_radius_px = int(0.2 * scale)
+            goal_radius_px = int(goal_circle_radius * scale)
+
+            def mask_fully_within_region(mask, region, crop_y1, crop_y2, crop_x1, crop_x2):
+                """Check if all nonzero pixels in mask (within crop) are within region."""
+                mask_crop = mask[crop_y1:crop_y2, crop_x1:crop_x2]
+                region_crop = region[crop_y1:crop_y2, crop_x1:crop_x2]
+                mask_pixels = mask_crop > 0.5
+                if not np.any(mask_pixels):
+                    return False  # No pixels in crop
+                return np.all(region_crop[mask_pixels] > 0.5)
+
+            # 1. Ensure robot is fully within robot_region (sample if outside or not visible)
+            robot_crop = highres['robot'][y1:y2, x1:x2]
+            robot_in_region = mask_fully_within_region(highres['robot'], highres['robot_region'], y1, y2, x1, x2)
+            if np.count_nonzero(robot_crop) == 0 or not robot_in_region:
+                # Clear the crop area and sample a valid position
+                highres['robot'][y1:y2, x1:x2] = 0
+                samples = sample_from_region_in_crop(
+                    highres['robot_region'], y1, y2, x1, x2,
+                    n_samples=1, radius_px=robot_radius_px
+                )
+                for px, py in samples:
+                    cv2.circle(highres['robot'], (px, py), max(1, robot_radius_px), 1.0, -1)
+
+            # 2. Ensure goal is fully within goal_sample_region (sample if outside or not visible)
+            goal_crop = highres['goal'][y1:y2, x1:x2]
+            goal_in_region = mask_fully_within_region(highres['goal'], highres['goal_sample_region'], y1, y2, x1, x2)
+            if np.count_nonzero(goal_crop) == 0 or not goal_in_region:
+                # Clear the crop area and sample a valid position
+                highres['goal'][y1:y2, x1:x2] = 0
+                samples = sample_from_region_in_crop(
+                    highres['goal_sample_region'], y1, y2, x1, x2,
+                    n_samples=1, radius_px=goal_radius_px
+                )
+                for px, py in samples:
+                    cv2.circle(highres['goal'], (px, py), max(1, goal_radius_px), 1.0, -1)
+
+            # 3. Ensure goal_samples are fully within goal_sample_region
+            # Clear any samples outside the region, then ensure at least 5 valid samples
+            goal_samples_crop = highres['goal_samples'][y1:y2, x1:x2]
+            goal_region_crop = highres['goal_sample_region'][y1:y2, x1:x2]
+            # Zero out any goal_samples pixels that are outside the region
+            invalid_mask = (goal_samples_crop > 0.5) & (goal_region_crop < 0.5)
+            if np.any(invalid_mask):
+                # Create a mask for the full highres and clear invalid pixels in crop area
+                highres['goal_samples'][y1:y2, x1:x2][invalid_mask] = 0
+
+            # Now count valid samples and add more if needed
+            min_goal_samples = 5
+            goal_samples_crop = highres['goal_samples'][y1:y2, x1:x2]  # Re-read after clearing
+            circle_area = max(1, np.pi * goal_radius_px**2)
+            existing_approx = int(np.count_nonzero(goal_samples_crop) / circle_area)
+            n_needed = max(0, min_goal_samples - existing_approx)
+            if n_needed > 0:
+                samples = sample_from_region_in_crop(
+                    highres['goal_sample_region'], y1, y2, x1, x2,
+                    n_samples=n_needed, radius_px=goal_radius_px
+                )
+                for px, py in samples:
+                    cv2.circle(highres['goal_samples'], (px, py), max(1, goal_radius_px), 1.0, -1)
+
             local_masks = {}
-            # For local, we want: target_object, target_goal, static, movable, robot_region, goal_sample_region
-            local_mask_names = ['target_object', 'target_goal', 'static', 'movable', 'robot_region', 'goal_sample_region']
+            # For local, we want: target_object, target_goal, static, movable, robot_region, goal_sample_region,
+            # plus robot, goal, goal_samples (position circles)
+            local_mask_names = ['target_object', 'target_goal', 'static', 'movable', 'robot_region', 'goal_sample_region', 'robot', 'goal', 'goal_samples']
             # Add multi-horizon goal masks (goal_mask_a1, goal_mask_a2, ...)
             # Always include at least 2 goal horizons for consistent dataset schema
             min_goal_horizons = 2
