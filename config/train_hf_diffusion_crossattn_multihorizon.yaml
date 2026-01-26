@@ -14,9 +14,9 @@
 #       data_dir=/path/to/2_push_data.h5
 
 # Experiment name (used in output path)
-name: hf_diffusion_crossattn_multihorizon_arrakis
-output_dir: /common/users/dm1487/namo_data/outputs/${name}
-data_dir: /common/users/dm1487/namo_data/h5_files/dec2/aug9_envs/2_push_train_corrected_overlaps_2
+name: diffusion_crossattn_multihorizon
+output_dir: /common/users/shared/robot_learning/dm1487/namo/models/img2multi_img/diffusion/crossattn_multihorizon
+data_dir: /common/users/shared/robot_learning/dm1487/namo/datasets/h5_files/img2img/dec2/aug9_envs/2_push_train.h5
 
 # Resume from checkpoint (set to path to resume training, null to start fresh)
 ckpt_path: null
@@ -45,7 +45,7 @@ batch_size: 256
 
 # Training
 max_epochs: 1000
-check_val_every_n_epoch: 
+check_val_every_n_epoch: 1
 
 # Learning rate schedule
 base_lr: 0.0004
@@ -56,6 +56,10 @@ decay_steps: 300000
 # Image and channel configuration
 image_size: 64
 context_channels: 5
+
+# Disable coord_grid to match Dec 16 cropped model architecture
+# This means noisy channels go directly to transformer without positional encoding
+use_coord_grid: false
 
 # Data format (set to false to force NPZ even if H5 exists)
 use_h5: true

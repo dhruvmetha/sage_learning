@@ -63,6 +63,9 @@ image_size: 64
 # Multi-horizon always uses local masks
 use_local: true
 
+# Use coordinate grid (standard DiT needs this for positional info)
+use_coord_grid: true
+
 # GPU (for legacy compatibility)
 gpu_id: 0
 

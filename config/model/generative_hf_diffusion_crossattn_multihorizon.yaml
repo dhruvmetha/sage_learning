@@ -13,7 +13,7 @@ network:
   _target_: src.model.dit.dit_crossattn.DiTCrossAttn
   img_size: ${image_size}
   patch: 4
-  in_ch: 9      # 5 context + 2 coord_grid + 2 noisy_targets
+  in_ch: 7      # 5 context + 2 noisy_targets (no coord_grid, matching Dec 16)
   context_channels: ${context_channels}
   out_ch: 2     # goal_mask_a1, goal_mask_a2
   dim: 256

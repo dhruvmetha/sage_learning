@@ -340,6 +340,9 @@ class MultiHorizonDataModule(pl.LightningDataModule):
         """Check if an HDF5 file exists in the data directory."""
         roots = self._normalized_roots()
         for root in roots:
+            # Check if root itself is an H5 file
+            if root.is_file() and root.suffix == '.h5':
+                return str(root)
             h5_path = root.parent / f"{root.name}.h5"
             if h5_path.exists():
                 return str(h5_path)

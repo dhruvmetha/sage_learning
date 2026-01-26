@@ -180,7 +180,8 @@ class GoalInferenceModel:
         else:
             return "unknown"
 
-    def infer(self, json_message, xml_path, robot_goal, selected_object, samples=32, seed=None):
+    def infer(self, json_message, xml_path, robot_goal, selected_object, samples=32, seed=None,
+              region_goals_sampled=None):
         """
         Perform goal inference to get goal proposals.
 
@@ -194,6 +195,9 @@ class GoalInferenceModel:
             selected_object: Name of the object to generate goals for
             samples: Number of samples to generate (default: 32)
             seed: Random seed for reproducible noise (None for random)
+            region_goals_sampled: Optional list of (x, y, theta) tuples representing
+                                  goal samples for the target neighbor region.
+                                  Used for computing goal_sample_region mask in ML inference.
 
         Returns:
             List of goal dictionaries, each containing:
@@ -205,7 +209,8 @@ class GoalInferenceModel:
         """
         # Auto-route to local inference if model was trained with use_local=True
         if self.use_local:
-            return self._infer_local(json_message, xml_path, robot_goal, selected_object, samples, seed=seed)
+            return self._infer_local(json_message, xml_path, robot_goal, selected_object, samples, seed=seed,
+                                     region_goals_sampled=region_goals_sampled)
 
         # Global inference (original behavior)
         # Create ImageConverter and process data
@@ -302,7 +307,8 @@ class GoalInferenceModel:
 
         return valid_goals
 
-    def _infer_local(self, json_message, xml_path, robot_goal, selected_object, samples=32, seed=None):
+    def _infer_local(self, json_message, xml_path, robot_goal, selected_object, samples=32, seed=None,
+                     region_goals_sampled=None):
         """
         Perform goal inference using local (object-centered) masks.
 
@@ -319,6 +325,9 @@ class GoalInferenceModel:
             selected_object: Name of the object to generate goals for
             samples: Number of samples to generate (default: 32)
             seed: Random seed for reproducible noise (None for random)
+            region_goals_sampled: Optional list of (x, y, theta) tuples representing
+                                  goal samples for the target neighbor region.
+                                  Used for computing goal_sample_region mask.
 
         Returns:
             List of goal dictionaries, each containing:
@@ -333,7 +342,7 @@ class GoalInferenceModel:
             data_point=json_message,
             selected_object=selected_object,
             robot_goal_pos=robot_goal,
-            region_goals_sampled=None,  # Will use robot_goal as fallback
+            region_goals_sampled=region_goals_sampled,  # Use provided region goals for goal_sample_region mask
             crop_size_meters=5.0,
             highres_size=1024,
             output_size=224
