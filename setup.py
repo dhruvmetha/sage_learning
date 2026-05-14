@@ -21,11 +21,11 @@ setup(
         "tensorboard",
         "torchmetrics",
     ],
-    extras_require={
-        "fb": [
-            "flow-matching",  # Facebook's flow matching library
-            "torchdyn",       # For adaptive ODE solvers (dopri5, tsit5)
-        ],
-    },
+    # extras_require={
+    #     "fb": [
+    #         "flow-matching",  # Facebook's flow matching library
+    #         "torchdyn",       # For adaptive ODE solvers (dopri5, tsit5)
+    #     ],
+    # },
     python_requires=">=3.9",
 )
