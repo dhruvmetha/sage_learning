@@ -599,7 +599,7 @@ class GenerativeModule(pl.LightningModule):
     def sample_from_model(
         self,
         inp: torch.Tensor,
-        tgt_size: int = 1,
+        tgt_size: int = None,
         samples: int = 32,
         num_steps: int = 20,
         seed: int = None
@@ -609,7 +609,8 @@ class GenerativeModule(pl.LightningModule):
 
         Args:
             inp: Input context tensor (B, C_context, H, W)
-            tgt_size: Number of target channels (default 1 for goal-only)
+            tgt_size: Number of target channels. If None, uses self.target_channels
+                      (supports multi-horizon models with 2 output channels)
             samples: Number of samples to generate
             num_steps: Number of sampling steps
             seed: Random seed for reproducible noise (None for random)
@@ -617,6 +618,10 @@ class GenerativeModule(pl.LightningModule):
         Returns:
             Generated samples, shape (samples, tgt_size, H, W)
         """
+        # Use model's configured target_channels if not specified
+        if tgt_size is None:
+            tgt_size = self.target_channels
+
         # Repeat input for multiple samples
         inp_repeated = inp.repeat(samples, 1, 1, 1)
 

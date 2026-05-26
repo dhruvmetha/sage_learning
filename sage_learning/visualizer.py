@@ -618,7 +618,7 @@ class NAMODataVisualizer:
             )
         
         # Draw robot goal position
-        self._draw_circle_mask(masks['goal'], robot_goal[0], robot_goal[1], 0.25, world_bounds, 1.0)
+        self._draw_circle_mask(masks['goal'], robot_goal[0], robot_goal[1], 0.05, world_bounds, 1.0)
         
         # Get target object info from action sequence
         target_object_id = None
@@ -637,7 +637,7 @@ class NAMODataVisualizer:
             # Draw robot position
             if 'robot_pose' in final_state:
                 robot_pose = final_state['robot_pose']
-                self._draw_circle_mask(masks['robot'], robot_pose[0], robot_pose[1], 0.2, world_bounds, 1.0)
+                self._draw_circle_mask(masks['robot'], robot_pose[0], robot_pose[1], 0.15, world_bounds, 1.0)
             
             # Draw movable objects
             for obj_name, pose in final_state.items():
@@ -829,7 +829,7 @@ class NAMODataVisualizer:
 
     def generate_local_episode_masks(self, episode_data: Dict[str, Any],
                                      crop_size_meters: float = 2.0,
-                                     goal_circle_radius: float = 0.2,
+                                     goal_circle_radius: float = 0.05,
                                      highres_size: int = 2048,
                                      output_size: int = 224) -> Optional[Dict[str, np.ndarray]]:
         """Generate local object-centered masks by rendering at high resolution and cropping.
@@ -840,7 +840,7 @@ class NAMODataVisualizer:
         Args:
             episode_data: Episode data dictionary (must have action_sequence with target object)
             crop_size_meters: Size of the square crop region in meters (default: 2.0m)
-            goal_circle_radius: Radius of goal region circles in meters (default: 0.1m)
+            goal_circle_radius: Radius of goal region circles in meters (default: 0.05, ~10px)
             highres_size: Size of high-resolution render (default: 2048)
             output_size: Size of output masks (default: 224)
 
@@ -1045,7 +1045,7 @@ class NAMODataVisualizer:
                                    global_output_size: int = 224,
                                    local_output_size: int = 224,
                                    local_crop_size_meters: float = 5.0,
-                                   goal_circle_radius: float = 0.25) -> Dict[str, Any]:
+                                   goal_circle_radius: float = 0.05) -> Optional[Dict[str, Any]]:
         """Generate both global and local masks from a single high-resolution render.
 
         This is more efficient than calling generate_episode_masks and
@@ -1058,9 +1058,10 @@ class NAMODataVisualizer:
             global_output_size: Size of global output masks (default: 224)
             local_output_size: Size of local output masks (default: 224)
             local_crop_size_meters: Size of local crop region in meters (default: 5.0)
-            goal_circle_radius: Radius of robot goal circle in meters (default: 0.25)
+            goal_circle_radius: Radius of robot goal circle in meters (default: 0.05, ~10px)
 
         Returns:
+            None if region_goals_sampled is not available (datapoint should be skipped).
             Dictionary containing:
             - 'global': Dict of global masks (resized from full highres)
                 - robot, goal, movable, static, reachable, target_object, target_goal,
@@ -1177,7 +1178,7 @@ class NAMODataVisualizer:
             # Draw robot position
             if 'robot_pose' in first_state:
                 robot_pose = first_state['robot_pose']
-                draw_circle(highres['robot'], robot_pose[0], robot_pose[1], 0.2)
+                draw_circle(highres['robot'], robot_pose[0], robot_pose[1], 0.15)
 
             # Draw movable objects
             for obj_name, pose in first_state.items():
@@ -1235,10 +1236,9 @@ class NAMODataVisualizer:
             if region_goal_used:
                 region_goals_sampled = [region_goal_used]
 
-        # Fallback for inference: use robot_goal if no goal samples available
-        # This makes semantic sense - goals should be reachable from robot's target location
-        if not region_goals_sampled and robot_goal:
-            region_goals_sampled = [(robot_goal[0], robot_goal[1], robot_goal[2] if len(robot_goal) > 2 else 0.0)]
+        # No fallback - if no region_goals_sampled, skip this datapoint
+        if not region_goals_sampled:
+            return None
 
         # Draw goal_samples mask (circles at all sampled goal positions)
         if region_goals_sampled:
@@ -1439,7 +1439,7 @@ class NAMODataVisualizer:
 
                 return results
 
-            robot_radius_px = int(0.2 * scale)
+            robot_radius_px = int(0.15 * scale)  # ~30px at typical scale
             goal_radius_px = int(goal_circle_radius * scale)
 
             def mask_fully_within_region(mask, region, crop_y1, crop_y2, crop_x1, crop_x2):

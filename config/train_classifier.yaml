@@ -1,0 +1,44 @@
+# Training config for primitive feasibility classifier
+#
+# Usage:
+#   python src/train_classifier.py --config-name=train_classifier \
+#       data_dir=/common/users/dm1487/namo_data/f_characterization/classifier_train_npz
+#
+
+name: primitive_classifier
+output_dir: /common/users/dm1487/namo_data/outputs/classifier/${name}
+
+# Data
+data_dir: ???  # REQUIRED: path to classifier NPZ files
+batch_size: 64
+num_workers: 4
+image_size: 64
+
+# Training
+max_epochs: 500
+check_val_every_n_epoch: 1
+early_stopping_patience: 20
+log_every_n_steps: 50
+precision: 16-mixed
+
+# Learning rate
+base_lr: 0.0003
+end_lr: 0.000001
+warmup_steps: 500
+decay_steps: 100000
+weight_decay: 0.01
+
+# Model
+use_local: true
+use_coord_grid: false
+context_channels: 5
+pos_weight: 1.0  # increase if F is sparse (class imbalance)
+use_focal_loss: false
+focal_alpha: 0.25
+focal_gamma: 2.0
+dice_weight: 1.0   # BCE + Dice: forces sharp boundaries on feasible set
+
+defaults:
+  - data: classifier_data
+  - model: classifier
+  - network: dit_classifier

@@ -1,0 +1,37 @@
+# V3b: milder stratification than V3 (50/50). Targets 30% hard share per batch.
+# Same loss config as V1b/V3. Tests: does less aggressive oversample avoid V3's overfitting?
+
+name: v3b_stratified_hard30
+output_dir: /common/users/dm1487/scratch_namo/classifier_experiments/${name}
+
+data_dir: ???
+batch_size: 64
+num_workers: 4
+image_size: 64
+
+max_epochs: 60
+check_val_every_n_epoch: 1
+early_stopping_patience: 15
+log_every_n_steps: 50
+precision: 16-mixed
+
+base_lr: 0.0003
+end_lr: 0.000001
+warmup_steps: 500
+decay_steps: 60000
+weight_decay: 0.01
+
+use_local: true
+use_coord_grid: false
+context_channels: 5
+
+pos_weight: 5.0
+use_focal_loss: true
+focal_alpha: 0.25
+focal_gamma: 2.0
+dice_weight: 1.0
+
+defaults:
+  - data: classifier_data_stratified_mild
+  - model: classifier
+  - network: dit_classifier

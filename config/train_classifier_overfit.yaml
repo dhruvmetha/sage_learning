@@ -1,0 +1,35 @@
+# Overfitting test: 200 instances, train=test, DiT backbone
+# If the model can't drive loss to ~0 on 200 samples, something is broken.
+
+name: classifier_overfit_test
+output_dir: /common/users/dm1487/namo_data/outputs/classifier/${name}
+
+data_dir: /common/users/dm1487/namo_data/f_characterization/classifier_overfit_200
+batch_size: 32
+num_workers: 2
+image_size: 64
+
+max_epochs: 500
+check_val_every_n_epoch: 10
+log_every_n_steps: 10
+precision: 32-true
+
+base_lr: 0.0003
+end_lr: 0.000001
+warmup_steps: 100
+decay_steps: 50000
+weight_decay: 0.01
+
+use_local: true
+use_coord_grid: false
+context_channels: 5
+pos_weight: 1.0
+use_focal_loss: false
+focal_alpha: 0.25
+focal_gamma: 2.0
+dice_weight: 1.0
+
+defaults:
+  - data: classifier_data_overfit
+  - model: classifier
+  - network: dit_classifier
