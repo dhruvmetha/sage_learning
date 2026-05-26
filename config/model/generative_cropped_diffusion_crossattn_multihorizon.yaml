@@ -21,6 +21,13 @@ network:
   depth: 8
   heads: 8
 
+  # See generative_cropped_diffusion_crossattn.yaml for what these do.
+  ctx_downsample_factor: 8
+  use_pos_bias: true
+  pos_bias_init_amp: 2.0
+  pos_bias_init_sigma: 8.0
+  cross_attn_init_scale: 0.01
+
 # HuggingFace diffusion path
 path:
   _target_: src.model.paths.hf_diffusion_path.HFDiffusionPath

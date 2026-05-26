@@ -46,6 +46,8 @@ class GenerativeModuleCropped(pl.LightningModule):
         end_lr: float = 0.0,
         use_multihorizon: bool = False,
         target_channels: int = 1,
+        use_min_snr: bool = False,
+        min_snr_gamma: float = 5.0,
     ):
         super().__init__()
 
@@ -60,6 +62,13 @@ class GenerativeModuleCropped(pl.LightningModule):
         # Multi-horizon settings
         self.use_multihorizon = use_multihorizon
         self.target_channels = target_channels
+
+        # Min-SNR-gamma loss weighting (Hang et al., 2023).
+        # Disabled by default — vanilla MSE on epsilon/v/sample is the standard
+        # DDPM loss and a fine starting point. Enable to downweight loss at very
+        # low-noise timesteps (where the model can trivially predict).
+        self.use_min_snr = use_min_snr
+        self.min_snr_gamma = min_snr_gamma
 
         # LR schedule parameters
         self.warmup_steps = warmup_steps
@@ -125,6 +134,37 @@ class GenerativeModuleCropped(pl.LightningModule):
             # Single-horizon: target_goal is [B, 1, crop_size, crop_size]
             return torch.clamp(batch['target_goal'], -1, 1)
 
+    def _min_snr_weight(self, t: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Per-sample Min-SNR-gamma weight, shaped for broadcasting onto a
+        per-element loss tensor (B, C, H, W). Returns None when disabled
+        or when the path doesn't expose SNR.
+
+        Formulas (Hang et al., 2023), branched by prediction type:
+            epsilon  : w = min(SNR, gamma) / SNR
+            v_pred   : w = min(SNR, gamma) / (SNR + 1)
+            sample   : w = min(SNR, gamma)
+        """
+        if not self.use_min_snr:
+            return None
+        if not hasattr(self.path, "get_snr"):
+            return None
+
+        snr = self.path.get_snr(t)                              # (B,)
+        capped = torch.clamp(snr, max=self.min_snr_gamma)
+
+        pred_type = getattr(self.path, "prediction_type", "noise")
+        if pred_type == "noise":
+            weight = capped / snr.clamp(min=1e-8)
+        elif pred_type == "velocity":
+            weight = capped / (snr + 1.0)
+        elif pred_type == "sample":
+            weight = capped
+        else:
+            weight = torch.ones_like(snr)
+
+        return weight.view(-1, 1, 1, 1)
+
     def training_step(
         self,
         batch: Dict[str, Any],
@@ -143,6 +183,11 @@ class GenerativeModuleCropped(pl.LightningModule):
 
         # Loss computation
         per_element_loss = self.criterion(prediction, path_sample.target)
+
+        # Optional Min-SNR-gamma per-sample weighting
+        snr_weight = self._min_snr_weight(path_sample.t)
+        if snr_weight is not None:
+            per_element_loss = per_element_loss * snr_weight
 
         if self.use_multihorizon:
             # Channel 0 (goal_mask_a1): Always supervised
@@ -183,6 +228,11 @@ class GenerativeModuleCropped(pl.LightningModule):
         path_sample = self.path.sample(x_0=x_0, x_1=x_1)
         prediction = self(path_sample.x_t, path_sample.t, context)
         per_element_loss = self.criterion(prediction, path_sample.target)
+
+        # Optional Min-SNR-gamma per-sample weighting (matches training_step)
+        snr_weight = self._min_snr_weight(path_sample.t)
+        if snr_weight is not None:
+            per_element_loss = per_element_loss * snr_weight
 
         if self.use_multihorizon:
             loss_ch0 = per_element_loss[:, 0].mean()

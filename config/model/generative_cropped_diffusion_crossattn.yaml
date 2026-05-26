@@ -4,7 +4,8 @@
 # Key differences from generative_cropped_diffusion.yaml:
 # - Context is encoded to spatial features (not pooled)
 # - Transformer uses cross-attention to attend to context features
-# - Time conditioning still uses scale/shift modulation
+# - Time conditioning uses AdaLN-Zero on every sub-layer (DiT-style)
+# - Cross-attn has a learnable relative position bias for Q-KV spatial alignment
 
 _target_: src.model.generative_module_cropped.GenerativeModuleCropped
 
@@ -21,7 +22,33 @@ network:
   depth: 8
   heads: 8
 
+  # Context encoder downsampling: context_size / ctx_downsample_factor = KV grid side.
+  # Must divide context_size evenly. Default 8 -> 8x8 = 64 KV tokens for context_size=64.
+  ctx_downsample_factor: 8
+
+  # --- Cross-attn spatial alignment (learnable relative position bias) ---
+  # When true, cross-attn logits get a per-head learnable bias initialized as a
+  # 2D Gaussian peaked at the spatially-correct (Q, KV) partner. Each query
+  # token starts with a prior to attend to the KV cell covering its same world
+  # location; remains fully learnable so the model can deviate from it.
+  use_pos_bias: true
+  # Peak amplitude of the Gaussian (in attention-logit space). ~2.0 -> ~7x
+  # softmax weight on the nominal partner vs. uniform at init.
+  pos_bias_init_amp: 2.0
+  # Spread of the Gaussian, in pixels of the context frame. 8.0 ≈ one KV cell
+  # for ctx_downsample_factor=8.
+  pos_bias_init_sigma: 8.0
+
+  # --- Cross-attn warm-start (avoid the AdaLN-Zero dead-zone) ---
+  # Initial gamma for the cross-attn AdaLN. Strict AdaLN-Zero (=0.0) would make
+  # cross-attn contribute zero at init and ramp up slowly. A small non-zero
+  # value lets cross-attn contribute (and accumulate gradient) from step 1.
+  cross_attn_init_scale: 0.01
+
 # HuggingFace diffusion path
+# prediction_type options: epsilon (default, standard DDPM), v_prediction, sample.
+# To try v_prediction, change BOTH path.prediction_type AND sampler.prediction_type
+# (they must match).
 path:
   _target_: src.model.paths.hf_diffusion_path.HFDiffusionPath
   num_train_timesteps: 1000
@@ -53,3 +80,10 @@ crop_size: ${crop_size}
 warmup_steps: ${warmup_steps}
 decay_steps: ${decay_steps}
 end_lr: ${end_lr}
+
+# --- Optional training tricks (default OFF — not bug fixes, opt-in only) ---
+# Min-SNR-gamma loss weighting (Hang et al., 2023). Caps per-sample loss
+# weight at high SNR (low noise) to focus capacity on more informative
+# timesteps. Typical gamma = 5. Enable with: model.use_min_snr=true
+use_min_snr: false
+min_snr_gamma: 5.0

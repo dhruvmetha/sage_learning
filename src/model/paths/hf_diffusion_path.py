@@ -196,6 +196,23 @@ class HFDiffusionPath(BasePath):
 
         return x_1
 
+    def get_snr(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Signal-to-noise ratio at continuous timesteps t in [0, 1].
+
+        SNR(t) = alpha_cumprod[t] / (1 - alpha_cumprod[t])
+
+        Used by Min-SNR-gamma loss weighting (Hang et al., 2023). Returns
+        per-sample SNR as a (B,) tensor on the same device as t.
+        """
+        device = t.device
+        timesteps = (t * self.num_train_timesteps).long().clamp(
+            0, self.num_train_timesteps - 1
+        )
+        alphas_cumprod = self._scheduler.alphas_cumprod.to(device)
+        a = alphas_cumprod[timesteps]
+        return a / (1.0 - a).clamp(min=1e-8)
+
     @property
     def hf_scheduler(self):
         """Access the underlying HuggingFace scheduler."""
