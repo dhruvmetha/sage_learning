@@ -20,6 +20,9 @@ train_split: 0.9
 # Use HDF5 file if available (faster loading)
 use_h5: ${use_h5}
 
+# Crop variant to read from the dual-crop NPZ/H5 ("local_wide" or "local_tight").
+crop_prefix: ${crop_prefix}
+
 # Weighted sampling strategy (requires HDF5 with appropriate fields)
 # Options:
 #   - "none" or false: Uniform sampling (default)
