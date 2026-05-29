@@ -330,6 +330,28 @@ class MLImageConverterAdapter:
 
         return episode_data
 
+    @staticmethod
+    def _robot_half_extent_from_config(namo_config_path,
+                                       default=(0.035, 0.035)) -> Tuple[float, float]:
+        """Parse planning.robot_size [hx, hy] (meters) from the namo config YAML.
+
+        Falls back to the 7 cm car footprint (0.035, 0.035) when the config is
+        missing/unreadable. The wavefront exporter treats the config value as
+        authoritative; this only needs to populate object_info['robot'] so the
+        exporter's presence gate passes.
+        """
+        if namo_config_path:
+            try:
+                import yaml
+                with open(namo_config_path) as f:
+                    cfg = yaml.safe_load(f) or {}
+                rs = (cfg.get('planning', {}) or {}).get('robot_size')
+                if rs and len(rs) >= 2:
+                    return float(rs[0]), float(rs[1])
+            except Exception:
+                pass
+        return default
+
     def create_local_masks(self, data_point: Dict[str, Any],
                            selected_object: str,
                            robot_goal_pos: Tuple[float, float],
@@ -337,7 +359,9 @@ class MLImageConverterAdapter:
                            crop_size_meters: float = 5.0,
                            highres_size: int = 1024,
                            output_size: int = 224,
-                           goal_circle_radius: float = 0.1) -> Dict[str, Any]:
+                           goal_circle_radius: float = 0.1,
+                           namo_config_path: str = None,
+                           episode_data: Dict[str, Any] = None) -> Dict[str, Any]:
         """Create local masks centered on selected object using the SAME method as training.
 
         This method converts the data_point to episode format and calls
@@ -369,19 +393,41 @@ class MLImageConverterAdapter:
         # Store data_point for compatibility
         self.data_point = data_point
 
-        # Convert to episode format
-        episode_data = self._convert_datapoint_to_episode_format(
-            data_point, selected_object, robot_goal_pos, region_goals_sampled
-        )
+        # Prefer a caller-supplied episode_data built DIRECTLY from the live env
+        # (same source training uses: env.get_object_info()/get_observation()).
+        # This bypasses the lossy JSON round-trip entirely. Fall back to building
+        # episode_data from the JSON data_point when no env was available.
+        if episode_data is None:
+            episode_data = self._convert_datapoint_to_episode_format(
+                data_point, selected_object, robot_goal_pos, region_goals_sampled
+            )
+        # The unified wavefront region computation needs the scene XML path
+        # (gated on episode_data['xml_file'] in generate_all_masks_highres).
+        if 'xml_file' not in episode_data or not episode_data['xml_file']:
+            episode_data['xml_file'] = data_point.get('xml_path')
+        # WavefrontSnapshotExporter requires a 'robot' entry in object_info
+        # (hard gate). Inference builds object_info from movable/static objects
+        # only and omits the robot, so the exporter raises and falls back to a
+        # legacy BFS with the WRONG default robot size — leaving robot_region /
+        # goal_sample_region blank. Inject it (the exporter reads the true
+        # footprint from namo_config_path; these sizes are the fallback).
+        sinfo = episode_data.get('static_object_info')
+        if isinstance(sinfo, dict) and 'robot' not in sinfo:
+            hx, hy = self._robot_half_extent_from_config(namo_config_path)
+            sinfo['robot'] = {'size_x': hx, 'size_y': hy}
 
-        # Use the SAME visualizer method as training
-        visualizer = NAMODataVisualizer()
+        # Use the SAME visualizer method as training. The v3 cropped models are
+        # trained on the TIGHT crop (crop_prefix="local_tight"), so request that
+        # crop here. generate_all_masks_highres returns dual crops keyed
+        # 'local_wide'/'local_tight'; we consume only tight. (Commit 2993c76
+        # moved the visualizer to this dual-crop API; this adapter follows it.)
+        visualizer = NAMODataVisualizer(namo_config_path=namo_config_path)
         result = visualizer.generate_all_masks_highres(
             episode_data,
             highres_size=highres_size,
             global_output_size=output_size,
             local_output_size=output_size,
-            local_crop_size_meters=crop_size_meters,
+            tight_crop_size_meters=crop_size_meters,
             goal_circle_radius=goal_circle_radius
         )
 
@@ -389,18 +435,22 @@ class MLImageConverterAdapter:
         if result is None:
             return None
 
-        # Extract local masks and convert to (H, W, 1) format for inference compatibility
+        # Extract local masks and convert to (H, W, 1) format for inference
+        # compatibility. Visualizer keys are 'local_tight_<name>'; downstream
+        # (goal_inference_model) expects 'local_<name>', so strip the crop tag.
         local_masks = {}
-        if result['local'] is not None:
-            for name, mask in result['local'].items():
-                local_masks[name] = mask[:, :, np.newaxis]
+        if result['local_tight'] is not None:
+            for name, mask in result['local_tight'].items():
+                consumer_key = name.replace('local_tight_', 'local_', 1)
+                local_masks[consumer_key] = mask[:, :, np.newaxis]
 
         # Add metadata
-        if result['local_metadata'] is not None:
-            local_masks['object_center'] = result['local_metadata']['object_center']
-            local_masks['object_theta'] = result['local_metadata']['object_theta']
-            local_masks['crop_size_meters'] = result['local_metadata']['crop_size_meters']
-            local_masks['resolution'] = result['local_metadata']['resolution']
+        if result['local_tight_metadata'] is not None:
+            meta = result['local_tight_metadata']
+            local_masks['object_center'] = meta['object_center']
+            local_masks['object_theta'] = meta['object_theta']
+            local_masks['crop_size_meters'] = meta['crop_size_meters']
+            local_masks['resolution'] = meta['resolution']
 
         return local_masks
 

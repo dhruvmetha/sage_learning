@@ -17,7 +17,8 @@ class GoalInferenceModel:
     Generates goal proposals for a selected object in SE(2) space.
     """
 
-    def __init__(self, model_path, device="cuda", sampler_method=None, num_steps=None):
+    def __init__(self, model_path, device="cuda", sampler_method=None, num_steps=None,
+                 namo_config_path=None):
         """
         Initialize the goal inference model.
 
@@ -29,11 +30,18 @@ class GoalInferenceModel:
                 For Diffusion: "ddpm", "ddim"
                 If None, uses the method from training config.
             num_steps: Override number of sampling steps (default: uses training config or 20)
+            namo_config_path: Path to the NAMO YAML config. Required for the
+                local region masks (robot_region / goal_sample_region) to be
+                built with the correct robot footprint via the unified wavefront
+                — the SAME path training used. Without it, mask generation falls
+                back to a legacy BFS with a wrong default robot size, leaving
+                those channels effectively blank (train/inference mismatch).
         """
         self.device = device
         self.model_path = Path(model_path)
         self.sampler_method = sampler_method
         self.num_steps = num_steps
+        self.namo_config_path = namo_config_path
 
         # Load model
         self.model, self.cfg = self._load_model()
@@ -192,7 +200,7 @@ class GoalInferenceModel:
             return "unknown"
 
     def infer(self, json_message, xml_path, robot_goal, selected_object, samples=32, seed=None,
-              region_goals_sampled=None):
+              region_goals_sampled=None, episode_data=None):
         """
         Perform goal inference to get goal proposals.
 
@@ -221,7 +229,7 @@ class GoalInferenceModel:
         # Auto-route to local inference if model was trained with use_local=True
         if self.use_local:
             return self._infer_local(json_message, xml_path, robot_goal, selected_object, samples, seed=seed,
-                                     region_goals_sampled=region_goals_sampled)
+                                     region_goals_sampled=region_goals_sampled, episode_data=episode_data)
 
         # Global inference (original behavior)
         # Create ImageConverter and process data
@@ -319,7 +327,7 @@ class GoalInferenceModel:
         return valid_goals
 
     def _infer_local(self, json_message, xml_path, robot_goal, selected_object, samples=32, seed=None,
-                     region_goals_sampled=None):
+                     region_goals_sampled=None, episode_data=None):
         """
         Perform goal inference using local (object-centered) masks.
 
@@ -347,16 +355,25 @@ class GoalInferenceModel:
             - goal_sample: Raw goal sample array
             - input_channels: Input tensor for visualization
         """
-        # Create ImageConverter and generate local masks
+        # Create ImageConverter and generate local masks.
+        # crop_size_meters MUST match the crop the model was trained on. The v3
+        # cropped DiT trains on the TIGHT crop (crop_prefix="local_tight"); use
+        # the visualizer's own constant so inference and the data-build pipeline
+        # can never drift. (Old value 5.0 m was the pre-dual-crop default and
+        # silently fed the model a 10x-too-wide context.)
+        from sage_learning.visualizer import NAMODataVisualizer
+        tight_crop_m = NAMODataVisualizer._LOCAL_TIGHT_CROP_DEFAULT_METERS
         image_converter = ImageConverter(xml_path)
         local_data = image_converter.create_local_masks(
             data_point=json_message,
             selected_object=selected_object,
             robot_goal_pos=robot_goal,
             region_goals_sampled=region_goals_sampled,  # Use provided region goals for goal_sample_region mask
-            crop_size_meters=5.0,
+            crop_size_meters=tight_crop_m,
             highres_size=1024,
-            output_size=224
+            output_size=224,
+            namo_config_path=self.namo_config_path,  # unified wavefront → correct robot footprint
+            episode_data=episode_data,  # if provided (built from live env), bypass JSON round-trip
         )
 
         # Check if local masks were generated successfully
