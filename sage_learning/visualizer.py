@@ -87,6 +87,7 @@ Notes:
 - Movable object poses come from state_observations, static objects from static_object_info
 """
 
+import math
 import os
 import sys
 import pickle
@@ -238,9 +239,22 @@ class NAMODataVisualizer:
 
     IMG_SIZE = 224  # Mask size for image-based representations
 
-    def __init__(self, figsize=(12, 8)):
+    def __init__(self, figsize=(12, 8), namo_config_path: Optional[str] = None):
+        """
+        Args:
+            figsize: matplotlib figure size for any plotting.
+            namo_config_path: path to the namo YAML config (e.g.
+                config/namo_config_complete_skill15_car_1x.yaml). When provided,
+                region-mask BFS is delegated to WavefrontSnapshotExporter, which
+                reads `planning.robot_size` from this YAML — matching what the
+                C++ WavefrontPlanner used during collection. When None, falls
+                back to in-place BFS using `static_object_info['robot']` (which
+                underestimates the robot footprint for multi-geom bodies like
+                the diff-drive car — see comments at line 1248+).
+        """
         self.figsize = figsize
-    
+        self.namo_config_path = namo_config_path
+
     def _extract_env_info_from_episode(self, episode_data: Dict[str, Any]) -> EnvironmentInfo:
         """Extract environment information from episode data."""
         static_object_info = episode_data.get('static_object_info') or {}
@@ -1033,6 +1047,17 @@ class NAMODataVisualizer:
     # Constants matching C++ WavefrontGrid and WavefrontSnapshotExporter
     INFLATION_EPSILON = 0.005  # Same as WavefrontSnapshotExporter.INFLATION_EPSILON
 
+    # Wide crop must contain a full push: max primitive delta (~0.448 m for
+    # car) + object half-extent (~0.12 m) ⇒ crop ≥ 1.14 m. 1.2 m gives a small
+    # margin. For small envs the crop overflows the world bounds — padding
+    # fills with zeros, which the model learns to ignore.
+    _LOCAL_WIDE_CROP_DEFAULT_METERS = 1.2
+
+    # Tight crop is object-centered context for SE(2)/index regression.
+    # Doesn't need to contain the goal pose (output is scalars), so we can
+    # zoom in for finer pixel resolution per cm.
+    _LOCAL_TIGHT_CROP_DEFAULT_METERS = 0.5
+
     # 8-connected neighbor offsets (matching C++ WavefrontGrid and WavefrontSnapshotExporter)
     NEIGHBOR_OFFSETS_8 = (
         (-1, -1), (-1, 0), (-1, 1),
@@ -1044,20 +1069,26 @@ class NAMODataVisualizer:
                                    highres_size: int = 1024,
                                    global_output_size: int = 224,
                                    local_output_size: int = 224,
-                                   local_crop_size_meters: float = 5.0,
+                                   wide_crop_size_meters: Optional[float] = None,
+                                   tight_crop_size_meters: Optional[float] = None,
                                    goal_circle_radius: float = 0.05) -> Optional[Dict[str, Any]]:
-        """Generate both global and local masks from a single high-resolution render.
+        """Generate global masks + dual-crop local masks + SE(2) targets.
 
-        This is more efficient than calling generate_episode_masks and
-        generate_local_episode_masks separately, as it renders once at high resolution
-        and then creates both global (full resize) and local (crop + resize) masks.
+        Renders the env once at high resolution, then crops twice around the
+        target object — once wide (mask-prediction supervision) and once tight
+        (SE(2)/primitive-index supervision). SE(2) deltas and primitive indices
+        are crop-independent and emitted alongside.
 
         Args:
             episode_data: Episode data dictionary
             highres_size: Size of high-resolution render (default: 1024)
             global_output_size: Size of global output masks (default: 224)
             local_output_size: Size of local output masks (default: 224)
-            local_crop_size_meters: Size of local crop region in meters (default: 5.0)
+            wide_crop_size_meters: Side length of the wide object-centered crop
+                in meters. Includes goal_mask_a* channels. Must be large enough
+                to contain a full push (≥1.14 m for car). Default 1.2 m.
+            tight_crop_size_meters: Side length of the tight object-centered
+                crop in meters. No goal_mask channels (would clip). Default 0.5 m.
             goal_circle_radius: Radius of robot goal circle in meters (default: 0.05, ~10px)
 
         Returns:
@@ -1070,6 +1101,20 @@ class NAMODataVisualizer:
                 - local_target_object, local_target_goal, local_static, local_movable,
                   local_robot_region, local_goal_sample_region
             - 'local_metadata': Dict with object_center, local_bounds for inference
+
+            Return shape:
+            {
+              'global': {<name>: (224,224)},                # full-env resize
+              'local_wide':  {'local_wide_<name>':  (224,224)},
+              'local_tight': {'local_tight_<name>': (224,224)},
+              'local_wide_metadata':  {...},
+              'local_tight_metadata': {...},
+              'se2_targets': {
+                'se2_target_a{1,2}': (3,) world-frame Δ from initial obj pose,
+                'edge_idx_a{1,2}':   (1,) int, -1 if action absent,
+                'depth_idx_a{1,2}':  (1,) int, -1 if action absent,
+              },
+            }
 
             robot_region: Binary mask of cells reachable by robot (computed via BFS on
                 inflated obstacle map). 1 = reachable from robot position, 0 = blocked.
@@ -1100,6 +1145,15 @@ class NAMODataVisualizer:
         world_width = x_max_w - x_min_w
         world_height = y_max_w - y_min_w
         world_size = max(world_width, world_height)
+
+        # Two fixed crops per NPZ — wide for mask supervision, tight for
+        # SE(2)/index supervision. Same physical extent across envs, so pixel
+        # scale (mm/px) is constant per crop type. Tight crop never contains
+        # goal mask channels (would clip out of frame for far pushes).
+        if wide_crop_size_meters is None:
+            wide_crop_size_meters = float(self._LOCAL_WIDE_CROP_DEFAULT_METERS)
+        if tight_crop_size_meters is None:
+            tight_crop_size_meters = float(self._LOCAL_TIGHT_CROP_DEFAULT_METERS)
         scale = highres_size / world_size
         world_center_x = (x_min_w + x_max_w) / 2
         world_center_y = (y_min_w + y_max_w) / 2
@@ -1144,12 +1198,13 @@ class NAMODataVisualizer:
             'goal_sample_region': np.zeros((highres_size, highres_size), dtype=np.float32),
         }
 
-        # Initialize multi-horizon goal masks (goal_mask_a1, goal_mask_a2, ...)
-        # Always generate at least 2 goal horizons for consistent dataset schema
-        min_goal_horizons = 2
-        num_goal_horizons = max(min_goal_horizons, len(action_sequence))
-        for action_idx in range(1, num_goal_horizons + 1):
-            highres[f'goal_mask_a{action_idx}'] = np.zeros((highres_size, highres_size), dtype=np.float32)
+        # Single-horizon supervision: each suffix-split NPZ owns ONE action's
+        # mask + SE(2). For multi-push chains, the suffix split already creates
+        # separate NPZs anchored at each step's correct pre-pose — so an
+        # explicit "a2 in the a1 crop" mask would be wrong-framed (drawn at the
+        # planner's a2 target in a crop centered on state[0], when it should
+        # be in a crop centered on post_action_state_obs[0]).
+        highres['goal_mask_a1'] = np.zeros((highres_size, highres_size), dtype=np.float32)
 
         # 1. Draw static objects (walls)
         for obj in env_info.static_objects:
@@ -1205,12 +1260,14 @@ class NAMODataVisualizer:
                             goal_x, goal_y, goal_theta = target_pose[0], target_pose[1], target_pose[2]
                             draw_rotated_box(highres['target_goal'], goal_x, goal_y, size_x, size_y, goal_theta)
 
-                        # Draw multi-horizon goal masks (goal_mask_a1, goal_mask_a2, ...)
-                        for action_idx, action in enumerate(action_sequence, start=1):
-                            action_target = action.get('target')
+                        # Single-horizon: only the FIRST action of this
+                        # suffix-split episode. Anchored at the current
+                        # state[0] (= the pre-pose for action 1 of this suffix).
+                        if action_sequence:
+                            action_target = action_sequence[0].get('target')
                             if action_target and len(action_target) >= 3:
                                 ax, ay, atheta = action_target[0], action_target[1], action_target[2]
-                                draw_rotated_box(highres[f'goal_mask_a{action_idx}'], ax, ay, size_x, size_y, atheta)
+                                draw_rotated_box(highres['goal_mask_a1'], ax, ay, size_x, size_y, atheta)
 
         # 4. Draw reachable objects
         reachable_list = episode_data.get('reachable_objects_before_action')
@@ -1245,37 +1302,120 @@ class NAMODataVisualizer:
             for goal in region_goals_sampled:
                 draw_circle(highres['goal_samples'], goal[0], goal[1], goal_circle_radius)
 
-        # 6. Compute robot_region (reachable cells from robot position)
-        # Get robot position and robot half-extent for inflation
+        # 6. Compute robot_region and goal_sample_region.
+        #
+        # When `self.namo_config_path` is set (production path), delegate to
+        # WavefrontSnapshotExporter — the canonical Python mirror of the C++
+        # wavefront the planner used during collection. The exporter reads
+        # `planning.robot_size` from the namo config YAML, ensuring inflation
+        # exactly matches what the planner saw.
+        #
+        # Without `namo_config_path`, falls back to legacy in-place BFS at
+        # highres resolution. The legacy path reads robot half-extent from
+        # `static_object_info['robot']`, which for multi-geom bodies (e.g.
+        # diff-drive car: front+rear chassis boxes) reports only the first
+        # geom's size — underestimating real footprint by ~2x. The fallback
+        # is preserved for backward compatibility with old runs but should
+        # NOT be used for new car-robot data collection.
         robot_px, robot_py = None, None
-        robot_half_extent_x = 0.15  # Default fallback
-        robot_half_extent_y = 0.15  # Default fallback
-
-        # Get robot half-extent from static_object_info (matching WavefrontSnapshotExporter)
-        robot_info = static_object_info.get('robot', {})
-        if 'size_x' in robot_info:
-            robot_half_extent_x = robot_info['size_x']
-        if 'size_y' in robot_info:
-            robot_half_extent_y = robot_info['size_y']
-
         if state_observations and len(state_observations) > 0:
             first_state = state_observations[0]
             if 'robot_pose' in first_state:
                 robot_pose = first_state['robot_pose']
                 robot_px, robot_py = world_to_highres(robot_pose[0], robot_pose[1])
 
-        if robot_px is not None and robot_py is not None:
-            # Compute inflation amounts matching WavefrontSnapshotExporter
+        unified_ok = False
+        episode_xml_file = episode_data.get('xml_file')
+        if (robot_px is not None and robot_py is not None
+                and self.namo_config_path
+                and state_observations
+                and episode_xml_file):
+            try:
+                from namo.visualization.wavefront_snapshot import WavefrontSnapshotExporter
+                exporter = WavefrontSnapshotExporter.from_geometry(
+                    world_bounds=world_bounds,
+                    object_info=static_object_info,
+                    observation=state_observations[0],
+                    config_path=self.namo_config_path,
+                    robot_goal=robot_goal,
+                )
+                snap = exporter.build_snapshot(
+                    xml_path=episode_xml_file,
+                    config_path=self.namo_config_path,
+                    use_current_state=True,
+                    verbose=False,
+                )
+                # snap.region_map shape = (grid_width, grid_height) = (x_dim, y_dim)
+                # Image convention is (rows, cols) = (y_dim, x_dim) → transpose first.
+                rm_image = snap.region_map.T.astype(np.int32)
+
+                # Place the region map on the highres canvas using the SAME
+                # world-to-pixel mapping the walls use (via world_to_highres).
+                # Naively resizing to (highres_size, highres_size) would stretch
+                # a non-square world to fit a square canvas — misaligning the
+                # region edges from the wall polygons that ARE placed correctly.
+                #
+                # Correct path: scale region_map to (world_width * scale,
+                # world_height * scale) preserving aspect, then place it
+                # CENTERED inside the square 1024×1024 canvas (the same way
+                # world_to_highres centers the world).
+                target_w = max(1, int(round(world_width * scale)))
+                target_h = max(1, int(round(world_height * scale)))
+                rm_resized = cv2.resize(
+                    rm_image, (target_w, target_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                rm_hr = np.zeros((highres_size, highres_size), dtype=np.int32)
+                y_off = (highres_size - target_h) // 2
+                x_off = (highres_size - target_w) // 2
+                rm_hr[y_off:y_off+target_h, x_off:x_off+target_w] = rm_resized
+                labels = dict(snap.region_labels)  # int → label name
+                # Region containing robot: "robot" (separated) or "robot_goal" (combined).
+                robot_id = next(
+                    (rid for rid, name in labels.items()
+                     if name in ('robot', 'robot_goal')),
+                    0,
+                )
+                # Region containing the XML goal: "goal" or "robot_goal".
+                goal_id = next(
+                    (rid for rid, name in labels.items()
+                     if name in ('goal', 'robot_goal')),
+                    0,
+                )
+                if robot_id:
+                    highres['robot_region'] = (rm_hr == robot_id).astype(np.float32)
+                else:
+                    highres['robot_region'] = np.zeros(
+                        (highres_size, highres_size), dtype=np.float32)
+                if goal_id:
+                    highres['goal_sample_region'] = (rm_hr == goal_id).astype(np.float32)
+                else:
+                    highres['goal_sample_region'] = np.zeros(
+                        (highres_size, highres_size), dtype=np.float32)
+                unified_ok = True
+            except Exception as e:
+                # Don't silently corrupt — surface the failure and fall back
+                # to legacy BFS so the run produces *some* masks.
+                print(f"[NAMODataVisualizer] unified wavefront snapshot failed: {e}; "
+                      f"falling back to legacy BFS (may use wrong robot size)")
+
+        if not unified_ok and robot_px is not None and robot_py is not None:
+            # === Legacy fallback (preserves old behavior) ===
+            # Reads robot half-extent from static_object_info — wrong for car!
+            # Only kicks in when namo_config_path isn't set OR snapshot failed.
+            robot_half_extent_x = 0.15  # Default
+            robot_half_extent_y = 0.15  # Default
+            robot_info = static_object_info.get('robot', {})
+            if 'size_x' in robot_info:
+                robot_half_extent_x = robot_info['size_x']
+            if 'size_y' in robot_info:
+                robot_half_extent_y = robot_info['size_y']
+
             inflate_x = robot_half_extent_x + self.INFLATION_EPSILON
             inflate_y = robot_half_extent_y + self.INFLATION_EPSILON
-
-            # Build inflated obstacle grid by drawing each obstacle with inflated size
-            # This matches the WavefrontSnapshotExporter approach (rotated box inflation)
             inflated_obstacles = np.zeros((highres_size, highres_size), dtype=np.uint8)
 
-            # Helper to draw inflated rotated box
             def draw_inflated_box(mask, cx, cy, half_x, half_y, angle):
-                """Draw obstacle inflated by robot half-extent + epsilon."""
                 inflated_half_x = half_x + inflate_x
                 inflated_half_y = half_y + inflate_y
                 px, py = world_to_highres(cx, cy)
@@ -1288,13 +1428,13 @@ class NAMODataVisualizer:
                 box = np.int32(box)
                 cv2.fillPoly(mask, [box], 1)
 
-            # Draw inflated static obstacles
             for obj in env_info.static_objects:
                 qw, qx, qy, qz = obj.quat_w, obj.quat_x, obj.quat_y, obj.quat_z
-                angle = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-                draw_inflated_box(inflated_obstacles, obj.x, obj.y, obj.size_x, obj.size_y, angle)
+                angle = np.arctan2(2.0 * (qw * qz + qx * qy),
+                                   1.0 - 2.0 * (qy * qy + qz * qz))
+                draw_inflated_box(inflated_obstacles, obj.x, obj.y,
+                                  obj.size_x, obj.size_y, angle)
 
-            # Draw inflated movable obstacles
             if state_observations and len(state_observations) > 0:
                 first_state = state_observations[0]
                 for obj_name, pose in first_state.items():
@@ -1304,61 +1444,52 @@ class NAMODataVisualizer:
                     obj_info = static_object_info.get(obj_base_name, {})
                     if 'size_x' in obj_info and 'size_y' in obj_info:
                         x, y, theta = pose[0], pose[1], pose[2]
-                        draw_inflated_box(inflated_obstacles, x, y, obj_info['size_x'], obj_info['size_y'], theta)
+                        draw_inflated_box(inflated_obstacles, x, y,
+                                          obj_info['size_x'], obj_info['size_y'],
+                                          theta)
 
-            # Use scipy.ndimage.label for fast connected component analysis
-            # This is ~200x faster than Python BFS for 1024x1024 grids
             from scipy import ndimage
-
-            # Fix: If robot position is in inflated obstacle due to discretization,
-            # clear the robot cell and its 8-neighborhood (matching C++ wavefront_grid behavior)
-            if (0 <= robot_px < highres_size and 0 <= robot_py < highres_size and
-                inflated_obstacles[robot_py, robot_px] == 1):
+            if (0 <= robot_px < highres_size and 0 <= robot_py < highres_size
+                    and inflated_obstacles[robot_py, robot_px] == 1):
                 for dy in [-1, 0, 1]:
                     for dx in [-1, 0, 1]:
                         ny, nx = robot_py + dy, robot_px + dx
                         if 0 <= ny < highres_size and 0 <= nx < highres_size:
                             inflated_obstacles[ny, nx] = 0
-
-            # Create free space mask and find connected components (8-connected)
             free_space = (inflated_obstacles == 0).astype(np.int32)
-            structure_8conn = np.ones((3, 3), dtype=np.int32)  # 8-connected
-            labeled_regions, num_regions = ndimage.label(free_space, structure=structure_8conn)
-
-            # Find robot's region and create mask
-            if (0 <= robot_px < highres_size and 0 <= robot_py < highres_size and
-                labeled_regions[robot_py, robot_px] > 0):
+            structure_8conn = np.ones((3, 3), dtype=np.int32)
+            labeled_regions, num_regions = ndimage.label(free_space,
+                                                         structure=structure_8conn)
+            if (0 <= robot_px < highres_size and 0 <= robot_py < highres_size
+                    and labeled_regions[robot_py, robot_px] > 0):
                 robot_label = labeled_regions[robot_py, robot_px]
                 highres['robot_region'] = (labeled_regions == robot_label).astype(np.float32)
             else:
-                highres['robot_region'] = np.zeros((highres_size, highres_size), dtype=np.float32)
-
-            # 7. Compute goal_sample_region (reachable cells from first goal sample)
-            # Reuse labeled_regions from robot_region computation
+                highres['robot_region'] = np.zeros((highres_size, highres_size),
+                                                   dtype=np.float32)
             if region_goals_sampled and len(region_goals_sampled) > 0:
                 goal_sample = region_goals_sampled[0]
-                goal_sample_px, goal_sample_py = world_to_highres(goal_sample[0], goal_sample[1])
-
-                # Fix: If goal sample position is in inflated obstacle, clear its neighborhood
-                # and re-label (only if different from robot case)
-                if (0 <= goal_sample_px < highres_size and 0 <= goal_sample_py < highres_size and
-                    inflated_obstacles[goal_sample_py, goal_sample_px] == 1):
+                goal_sample_px, goal_sample_py = world_to_highres(goal_sample[0],
+                                                                  goal_sample[1])
+                if (0 <= goal_sample_px < highres_size
+                        and 0 <= goal_sample_py < highres_size
+                        and inflated_obstacles[goal_sample_py, goal_sample_px] == 1):
                     for dy in [-1, 0, 1]:
                         for dx in [-1, 0, 1]:
                             ny, nx = goal_sample_py + dy, goal_sample_px + dx
                             if 0 <= ny < highres_size and 0 <= nx < highres_size:
                                 inflated_obstacles[ny, nx] = 0
-                    # Re-label with updated free space
                     free_space = (inflated_obstacles == 0).astype(np.int32)
-                    labeled_regions, num_regions = ndimage.label(free_space, structure=structure_8conn)
-
-                # Find goal's region and create mask
-                if (0 <= goal_sample_px < highres_size and 0 <= goal_sample_py < highres_size and
-                    labeled_regions[goal_sample_py, goal_sample_px] > 0):
+                    labeled_regions, num_regions = ndimage.label(
+                        free_space, structure=structure_8conn)
+                if (0 <= goal_sample_px < highres_size
+                        and 0 <= goal_sample_py < highres_size
+                        and labeled_regions[goal_sample_py, goal_sample_px] > 0):
                     goal_label = labeled_regions[goal_sample_py, goal_sample_px]
                     highres['goal_sample_region'] = (labeled_regions == goal_label).astype(np.float32)
                 else:
-                    highres['goal_sample_region'] = np.zeros((highres_size, highres_size), dtype=np.float32)
+                    highres['goal_sample_region'] = np.zeros(
+                        (highres_size, highres_size), dtype=np.float32)
 
         # === Create global masks (resize full highres to output size) ===
         global_masks = {}
@@ -1367,181 +1498,279 @@ class NAMODataVisualizer:
                                 interpolation=cv2.INTER_AREA)
             global_masks[name] = resized.astype(np.float32)
 
-        # === Create local masks (crop around target object, then resize) ===
-        local_masks = None
-        local_metadata = None
+        # === Sampling helpers (hoisted so the dual-crop loop reuses them) ===
+        def circle_fully_within_region(px, py, radius_px, region_mask):
+            """Check if a circle at (px, py) is fully contained within the region mask."""
+            h, w = region_mask.shape
+            temp = np.zeros((h, w), dtype=np.float32)
+            cv2.circle(temp, (px, py), max(1, radius_px), 1.0, -1)
+            circle_pixels = temp > 0
+            return np.all(region_mask[circle_pixels] > 0.5)
 
-        if obj_x is not None and obj_y is not None:
-            # Compute crop window centered on object
+        def sample_from_region_in_crop(region_mask, crop_y1, crop_y2, crop_x1, crop_x2,
+                                       n_samples=1, radius_px=0, max_attempts=500):
+            """Sample random points from region mask within crop bounds."""
+            region_crop = region_mask[crop_y1:crop_y2, crop_x1:crop_x2]
+            ys, xs = np.where(region_crop > 0)
+            if len(ys) == 0:
+                return []
+            all_indices = np.arange(len(ys))
+            np.random.shuffle(all_indices)
+            results = []
+            idx_pos = 0
+            while len(results) < n_samples and idx_pos < min(max_attempts, len(all_indices)):
+                idx = all_indices[idx_pos]
+                px, py = crop_x1 + xs[idx], crop_y1 + ys[idx]
+                if radius_px > 0:
+                    if circle_fully_within_region(px, py, radius_px, region_mask):
+                        results.append((px, py))
+                else:
+                    results.append((px, py))
+                idx_pos += 1
+            return results
+
+        def mask_fully_within_region(mask, region, crop_y1, crop_y2, crop_x1, crop_x2):
+            """Check if all nonzero pixels in mask (within crop) are within region."""
+            mask_crop = mask[crop_y1:crop_y2, crop_x1:crop_x2]
+            region_crop = region[crop_y1:crop_y2, crop_x1:crop_x2]
+            mask_pixels = mask_crop > 0.5
+            if not np.any(mask_pixels):
+                return False
+            return np.all(region_crop[mask_pixels] > 0.5)
+
+        robot_radius_px = int(0.15 * scale)
+        goal_radius_px = int(goal_circle_radius * scale)
+
+        # The robot/goal/goal_samples masks get mutated by the sampling logic
+        # below to keep them visible inside the crop. For dual-crop we need to
+        # rewind those before the second pass — keep originals around.
+        _orig_robot = highres['robot'].copy()
+        _orig_goal = highres['goal'].copy()
+        _orig_goal_samples = highres['goal_samples'].copy()
+
+        # Mask channels common to both crops. Wide also includes goal_mask_a1
+        # (the single-horizon supervision target).
+        _base_local_names = ['target_object', 'target_goal', 'static', 'movable',
+                             'robot_region', 'goal_sample_region',
+                             'robot', 'goal', 'goal_samples']
+
+        def extract_local_crop(crop_size_meters: float, prefix: str,
+                               include_goal_masks: bool):
+            """Run sampling + cropping on `highres` for one crop size.
+
+            Mutates highres['robot'/'goal'/'goal_samples'] — caller must rewind
+            them from the saved originals before each call.
+            """
             obj_px, obj_py = world_to_highres(obj_x, obj_y)
-            crop_size_px = int(local_crop_size_meters * scale)
+            crop_size_px = int(crop_size_meters * scale)
             half_crop = crop_size_px // 2
 
-            # Calculate raw crop bounds (may extend outside image)
             y1_raw, y2_raw = obj_py - half_crop, obj_py + half_crop
             x1_raw, x2_raw = obj_px - half_crop, obj_px + half_crop
+            y1 = max(0, y1_raw); y2 = min(highres_size, y2_raw)
+            x1 = max(0, x1_raw); x2 = min(highres_size, x2_raw)
+            pad_top = y1 - y1_raw
+            pad_bottom = y2_raw - y2
+            pad_left = x1 - x1_raw
+            pad_right = x2_raw - x2
 
-            # Clamp to image bounds for extraction
-            y1 = max(0, y1_raw)
-            y2 = min(highres_size, y2_raw)
-            x1 = max(0, x1_raw)
-            x2 = min(highres_size, x2_raw)
-
-            # Calculate padding needed to keep object at center
-            pad_top = y1 - y1_raw      # positive if y1_raw < 0
-            pad_bottom = y2_raw - y2   # positive if y2_raw > highres_size
-            pad_left = x1 - x1_raw     # positive if x1_raw < 0
-            pad_right = x2_raw - x2    # positive if x2_raw > highres_size
-
-            # === Sample positions for local masks if originals are outside crop ===
-            # This ensures local_robot, local_goal, local_goal_samples always have content
-
-            def circle_fully_within_region(px, py, radius_px, region_mask):
-                """Check if a circle at (px, py) is fully contained within the region mask."""
-                h, w = region_mask.shape
-                # Create a temporary mask with the circle
-                temp = np.zeros((h, w), dtype=np.float32)
-                cv2.circle(temp, (px, py), max(1, radius_px), 1.0, -1)
-                # Check that all circle pixels are within the region
-                circle_pixels = temp > 0
-                return np.all(region_mask[circle_pixels] > 0.5)
-
-            def sample_from_region_in_crop(region_mask, crop_y1, crop_y2, crop_x1, crop_x2,
-                                           n_samples=1, radius_px=0, max_attempts=500):
-                """Sample random points from region mask within crop bounds.
-
-                Ensures the entire circle (not just center) is within the region.
-                """
-                region_crop = region_mask[crop_y1:crop_y2, crop_x1:crop_x2]
-                ys, xs = np.where(region_crop > 0)
-                if len(ys) == 0:
-                    return []
-
-                # Shuffle candidate indices for random sampling
-                all_indices = np.arange(len(ys))
-                np.random.shuffle(all_indices)
-
-                results = []
-                idx_pos = 0
-
-                while len(results) < n_samples and idx_pos < min(max_attempts, len(all_indices)):
-                    idx = all_indices[idx_pos]
-                    px, py = crop_x1 + xs[idx], crop_y1 + ys[idx]
-
-                    # Check if entire circle is within the region
-                    if radius_px > 0:
-                        if circle_fully_within_region(px, py, radius_px, region_mask):
-                            results.append((px, py))
-                    else:
-                        results.append((px, py))
-
-                    idx_pos += 1
-
-                return results
-
-            robot_radius_px = int(0.15 * scale)  # ~30px at typical scale
-            goal_radius_px = int(goal_circle_radius * scale)
-
-            def mask_fully_within_region(mask, region, crop_y1, crop_y2, crop_x1, crop_x2):
-                """Check if all nonzero pixels in mask (within crop) are within region."""
-                mask_crop = mask[crop_y1:crop_y2, crop_x1:crop_x2]
-                region_crop = region[crop_y1:crop_y2, crop_x1:crop_x2]
-                mask_pixels = mask_crop > 0.5
-                if not np.any(mask_pixels):
-                    return False  # No pixels in crop
-                return np.all(region_crop[mask_pixels] > 0.5)
-
-            # 1. Ensure robot is fully within robot_region (sample if outside or not visible)
-            robot_crop = highres['robot'][y1:y2, x1:x2]
-            robot_in_region = mask_fully_within_region(highres['robot'], highres['robot_region'], y1, y2, x1, x2)
-            if np.count_nonzero(robot_crop) == 0 or not robot_in_region:
-                # Clear the crop area and sample a valid position
+            # Ensure robot circle is visible inside crop (sample from region if not)
+            robot_crop_view = highres['robot'][y1:y2, x1:x2]
+            robot_in_region = mask_fully_within_region(
+                highres['robot'], highres['robot_region'], y1, y2, x1, x2)
+            if np.count_nonzero(robot_crop_view) == 0 or not robot_in_region:
                 highres['robot'][y1:y2, x1:x2] = 0
                 samples = sample_from_region_in_crop(
                     highres['robot_region'], y1, y2, x1, x2,
-                    n_samples=1, radius_px=robot_radius_px
-                )
+                    n_samples=1, radius_px=robot_radius_px)
                 for px, py in samples:
-                    cv2.circle(highres['robot'], (px, py), max(1, robot_radius_px), 1.0, -1)
+                    cv2.circle(highres['robot'], (px, py),
+                               max(1, robot_radius_px), 1.0, -1)
 
-            # 2. Ensure goal is fully within goal_sample_region (sample if outside or not visible)
-            goal_crop = highres['goal'][y1:y2, x1:x2]
-            goal_in_region = mask_fully_within_region(highres['goal'], highres['goal_sample_region'], y1, y2, x1, x2)
-            if np.count_nonzero(goal_crop) == 0 or not goal_in_region:
-                # Clear the crop area and sample a valid position
+            # Same for goal
+            goal_crop_view = highres['goal'][y1:y2, x1:x2]
+            goal_in_region = mask_fully_within_region(
+                highres['goal'], highres['goal_sample_region'], y1, y2, x1, x2)
+            if np.count_nonzero(goal_crop_view) == 0 or not goal_in_region:
                 highres['goal'][y1:y2, x1:x2] = 0
                 samples = sample_from_region_in_crop(
                     highres['goal_sample_region'], y1, y2, x1, x2,
-                    n_samples=1, radius_px=goal_radius_px
-                )
+                    n_samples=1, radius_px=goal_radius_px)
                 for px, py in samples:
-                    cv2.circle(highres['goal'], (px, py), max(1, goal_radius_px), 1.0, -1)
+                    cv2.circle(highres['goal'], (px, py),
+                               max(1, goal_radius_px), 1.0, -1)
 
-            # 3. Ensure goal_samples are fully within goal_sample_region
-            # Clear any samples outside the region, then ensure at least 5 valid samples
-            goal_samples_crop = highres['goal_samples'][y1:y2, x1:x2]
-            goal_region_crop = highres['goal_sample_region'][y1:y2, x1:x2]
-            # Zero out any goal_samples pixels that are outside the region
-            invalid_mask = (goal_samples_crop > 0.5) & (goal_region_crop < 0.5)
+            # Clean + top-up goal_samples
+            goal_samples_view = highres['goal_samples'][y1:y2, x1:x2]
+            goal_region_view = highres['goal_sample_region'][y1:y2, x1:x2]
+            invalid_mask = (goal_samples_view > 0.5) & (goal_region_view < 0.5)
             if np.any(invalid_mask):
-                # Create a mask for the full highres and clear invalid pixels in crop area
                 highres['goal_samples'][y1:y2, x1:x2][invalid_mask] = 0
 
-            # Now count valid samples and add more if needed
             min_goal_samples = 5
-            goal_samples_crop = highres['goal_samples'][y1:y2, x1:x2]  # Re-read after clearing
+            goal_samples_view = highres['goal_samples'][y1:y2, x1:x2]
             circle_area = max(1, np.pi * goal_radius_px**2)
-            existing_approx = int(np.count_nonzero(goal_samples_crop) / circle_area)
+            existing_approx = int(np.count_nonzero(goal_samples_view) / circle_area)
             n_needed = max(0, min_goal_samples - existing_approx)
             if n_needed > 0:
                 samples = sample_from_region_in_crop(
                     highres['goal_sample_region'], y1, y2, x1, x2,
-                    n_samples=n_needed, radius_px=goal_radius_px
-                )
+                    n_samples=n_needed, radius_px=goal_radius_px)
                 for px, py in samples:
-                    cv2.circle(highres['goal_samples'], (px, py), max(1, goal_radius_px), 1.0, -1)
+                    cv2.circle(highres['goal_samples'], (px, py),
+                               max(1, goal_radius_px), 1.0, -1)
 
-            local_masks = {}
-            # For local, we want: target_object, target_goal, static, movable, robot_region, goal_sample_region,
-            # plus robot, goal, goal_samples (position circles)
-            local_mask_names = ['target_object', 'target_goal', 'static', 'movable', 'robot_region', 'goal_sample_region', 'robot', 'goal', 'goal_samples']
-            # Add multi-horizon goal masks (goal_mask_a1, goal_mask_a2, ...)
-            # Always include at least 2 goal horizons for consistent dataset schema
-            min_goal_horizons = 2
-            num_goal_horizons = max(min_goal_horizons, len(action_sequence))
-            for action_idx in range(1, num_goal_horizons + 1):
-                local_mask_names.append(f'goal_mask_a{action_idx}')
-            for name in local_mask_names:
+            mask_names = list(_base_local_names)
+            if include_goal_masks:
+                mask_names.append('goal_mask_a1')
+
+            out = {}
+            for name in mask_names:
                 hr_mask = highres[name]
                 cropped = hr_mask[y1:y2, x1:x2]
                 if cropped.shape[0] == 0 or cropped.shape[1] == 0:
-                    local_masks[f'local_{name}'] = np.zeros((local_output_size, local_output_size), dtype=np.float32)
+                    out[f'{prefix}_{name}'] = np.zeros(
+                        (local_output_size, local_output_size), dtype=np.float32)
                 else:
-                    # Pad cropped region to maintain object at center (pad with zeros = empty space)
                     if pad_top > 0 or pad_bottom > 0 or pad_left > 0 or pad_right > 0:
                         cropped = np.pad(cropped,
-                                        ((pad_top, pad_bottom), (pad_left, pad_right)),
-                                        mode='constant', constant_values=0)
+                                         ((pad_top, pad_bottom), (pad_left, pad_right)),
+                                         mode='constant', constant_values=0)
                     resized = cv2.resize(cropped, (local_output_size, local_output_size),
-                                        interpolation=cv2.INTER_AREA)
-                    local_masks[f'local_{name}'] = resized.astype(np.float32)
+                                         interpolation=cv2.INTER_AREA)
+                    out[f'{prefix}_{name}'] = resized.astype(np.float32)
 
-            # Local metadata
-            # Object is always at center of padded crop, so use object position as crop center
-            half_size = local_crop_size_meters / 2.0
-            local_bounds = (obj_x - half_size, obj_x + half_size, obj_y - half_size, obj_y + half_size)
-            local_metadata = {
-                'object_center': (obj_x, obj_y),  # Object is at center of (padded) crop
+            half_size = crop_size_meters / 2.0
+            meta = {
+                'object_center': (obj_x, obj_y),
                 'object_theta': obj_theta,
-                'local_bounds': local_bounds,
-                'crop_size_meters': local_crop_size_meters,
-                'resolution': local_crop_size_meters / local_output_size
+                'local_bounds': (obj_x - half_size, obj_x + half_size,
+                                 obj_y - half_size, obj_y + half_size),
+                'crop_size_meters': crop_size_meters,
+                'resolution': crop_size_meters / local_output_size,
             }
+            return out, meta
+
+        local_wide = None
+        local_wide_metadata = None
+        local_tight = None
+        local_tight_metadata = None
+
+        if obj_x is not None and obj_y is not None:
+            # Wide crop first (canonical: includes goal masks for supervision)
+            local_wide, local_wide_metadata = extract_local_crop(
+                wide_crop_size_meters, 'local_wide', include_goal_masks=True)
+
+            # Rewind sampler-mutated channels before the second crop
+            highres['robot'][:] = _orig_robot
+            highres['goal'][:] = _orig_goal
+            highres['goal_samples'][:] = _orig_goal_samples
+
+            local_tight, local_tight_metadata = extract_local_crop(
+                tight_crop_size_meters, 'local_tight', include_goal_masks=False)
+
+        # === SE(2) targets + primitive indices (crop-independent) ===
+        #
+        # For each action i ∈ {1, 2}:
+        #   se2_target_a{i} = action[i-1].target − pre_pose_for_action_i (world frame)
+        #
+        # The pre-pose for action i is the OBJECT'S POSE THE PLANNER SAW WHEN
+        # GENERATING PRIMITIVE i — NOT the initial state for i>1:
+        #   i=1: pre-pose = state_observations[0].obj_pose   (initial state)
+        #   i=2: pre-pose = post_action_state_observations[0].obj_pose
+        #                   (= ACTUAL post-physics pose after action 1)
+        #
+        # Using the initial state for both would be wrong for i=2: physics
+        # noise during action 1 means action[0].target (planner's intended
+        # pose) ≠ actual post-physics state, and the planner generates
+        # primitive 2 against the actual state. Rotating the stored Δ by
+        # pre_pose_for_action_i's θ recovers the body-frame primitive Δ
+        # exactly (verified against 1x_car primitive table: <1 mm / <0.1°).
+        #
+        # `episode_data['all_future_states']` is the canonical chain:
+        #   all_future_states[0] = state_observations[step]
+        #   all_future_states[1] = post_action_state_observations[step]
+        #   all_future_states[2] = post_action_state_observations[step+1]
+        #   ...
+        # So pre-pose for action i (1-indexed) = all_future_states[i-1].
+        # Fallback chain when all_future_states isn't present:
+        #   - i=1 → first_state (state_observations[0])
+        #   - i=2 → episode_data['post_action_state_observations'][0]
+        all_future_states = episode_data.get('all_future_states') or []
+        post_states = episode_data.get('post_action_state_observations') or []
+
+        def _resolve_pre_pose_for_action(i_one_indexed):
+            """Return (px, py, ptheta) — the pre-pose for action i, or None."""
+            # Preferred: all_future_states chain
+            if all_future_states and (i_one_indexed - 1) < len(all_future_states):
+                s = all_future_states[i_one_indexed - 1]
+            elif i_one_indexed == 1 and state_observations:
+                s = state_observations[0]
+            elif i_one_indexed == 2 and post_states:
+                s = post_states[0]
+            else:
+                return None
+            if not s or target_object_id is None:
+                return None
+            pose_key = f"{target_object_id}_pose"
+            if pose_key not in s:
+                return None
+            p = s[pose_key]
+            if p is None or len(p) < 3:
+                return None
+            return float(p[0]), float(p[1]), float(p[2])
+
+        # Single-horizon: just a1 — the first action of this suffix-split
+        # episode. For multi-push chains, each suffix step gets its own NPZ
+        # with image anchored at the correct pre-pose.
+        se2_targets = {}
+        pre = _resolve_pre_pose_for_action(1) if obj_x is not None else None
+        if pre is not None and action_sequence:
+            act = action_sequence[0]
+            tgt = act.get('target')
+            if tgt is not None and len(tgt) >= 3:
+                ax, ay, ath = float(tgt[0]), float(tgt[1]), float(tgt[2])
+                px, py, pth = pre
+                dth = math.atan2(math.sin(ath - pth), math.cos(ath - pth))
+                se2_targets['se2_target_a1'] = np.array(
+                    [ax - px, ay - py, dth], dtype=np.float32)
+                se2_targets['pre_pose_a1'] = np.array(
+                    [px, py, pth], dtype=np.float32)
+            else:
+                se2_targets['se2_target_a1'] = np.zeros(3, dtype=np.float32)
+                se2_targets['pre_pose_a1'] = np.zeros(3, dtype=np.float32)
+            se2_targets['edge_idx_a1'] = np.array(
+                [int(act.get('edge_idx', -1))], dtype=np.int32)
+            se2_targets['depth_idx_a1'] = np.array(
+                [int(act.get('depth', -1))], dtype=np.int32)
+        else:
+            se2_targets['se2_target_a1'] = np.zeros(3, dtype=np.float32)
+            se2_targets['pre_pose_a1'] = np.zeros(3, dtype=np.float32)
+            se2_targets['edge_idx_a1'] = np.array([-1], dtype=np.int32)
+            se2_targets['depth_idx_a1'] = np.array([-1], dtype=np.int32)
+
+        # Target object size — needed downstream to pick which primitive .dat
+        # (square/wide/tall) corresponds to (edge_idx, depth_idx). Loader
+        # applies the shape rule (namo_push_skill.hpp:55-63):
+        #   ratio = max(sx, sy) / min(sx, sy)
+        #   ratio < 1.05 → square; else sx > sy → wide; else → tall.
+        if (target_object_id is not None
+                and target_size_x is not None
+                and target_size_y is not None):
+            obj_info = static_object_info.get(target_object_id, {})
+            sz = obj_info.get('size_z', 0.05)
+            se2_targets['target_object_size'] = np.array(
+                [target_size_x, target_size_y, sz], dtype=np.float32)
+        else:
+            se2_targets['target_object_size'] = np.zeros(3, dtype=np.float32)
 
         return {
             'global': global_masks,
-            'local': local_masks,
-            'local_metadata': local_metadata
+            'local_wide': local_wide,
+            'local_tight': local_tight,
+            'local_wide_metadata': local_wide_metadata,
+            'local_tight_metadata': local_tight_metadata,
+            'se2_targets': se2_targets,
         }
 
     def save_masks(self, masks: Dict[str, np.ndarray], output_dir: str,

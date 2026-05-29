@@ -68,37 +68,67 @@ def is_string_dtype(dtype) -> bool:
 
 
 MINIMAL_KEYS = [
-    # Local masks
-    'local_target_object',
-    'local_target_goal',
-    'local_goal_mask_a1',  # Multi-horizon: next action's goal (preferred over local_target_goal)
-    'local_goal_mask_a2',  # Multi-horizon: second action's goal (if exists)
-    'local_static',
-    'local_movable',
-    'local_robot_region',
-    'local_goal_sample_region',
-    'local_robot',         # Robot position (sampled to be within robot_region)
-    'local_goal',          # Goal position (sampled to be within goal_sample_region)
-    'local_goal_samples',  # Goal sample positions (all within goal_sample_region)
-    # Metadata needed for training
+    # === Wide crop (1.2 m) — mask-prediction supervision ===
+    'local_wide_static',
+    'local_wide_movable',
+    'local_wide_target_object',
+    'local_wide_target_goal',
+    'local_wide_robot_region',
+    'local_wide_goal_sample_region',
+    'local_wide_goal_mask_a1',     # single-horizon target
+    'local_wide_robot',            # sampled robot position in robot_region
+    'local_wide_goal',             # sampled goal position in goal_sample_region
+    'local_wide_goal_samples',     # multiple sampled goal positions
+    'local_wide_crop_size_meters',
+    'local_wide_resolution',
+    'local_wide_object_center',
+    'local_wide_object_theta',
+    'local_wide_bounds',
+
+    # === Tight crop (0.5 m) — SE(2)/index-prediction supervision ===
+    'local_tight_static',
+    'local_tight_movable',
+    'local_tight_target_object',
+    'local_tight_target_goal',
+    'local_tight_robot_region',
+    'local_tight_goal_sample_region',
+    'local_tight_robot',
+    'local_tight_goal',
+    'local_tight_goal_samples',
+    'local_tight_crop_size_meters',
+    'local_tight_resolution',
+    'local_tight_object_center',
+    'local_tight_object_theta',
+    'local_tight_bounds',
+
+    # === Crop-independent supervision targets ===
+    'se2_target_a1',         # world-frame Δ from pre_pose_a1
+    'pre_pose_a1',            # (px, py, p_theta) crop center / Δ anchor
+    'edge_idx_a1',            # primitive direction (0..59)
+    'depth_idx_a1',           # primitive length step (0..9)
+    'target_object_size',     # (sx, sy, sz) — loader picks .dat shape
+
+    # === Metadata ===
     'xml_file',
-    'solution_depth',  # How many actions remain
-    # Solution counts for sample weighting
-    'solutions_found',  # Number of solutions recorded for this region
-    'solutions_total',  # Total solutions found during search
-    'pushes_total',     # Total push attempts for this region
+    'solution_depth',
+    'solutions_found',
+    'solutions_total',
+    'pushes_total',
 ]
 
 
 def convert_npz_to_hdf5(input_dir: str, output_file: str, compression: str = "gzip",
-                        minimal: bool = False):
+                        compression_opts=4, minimal: bool = False,
+                        tight_only: bool = False):
     """Convert directory of NPZ files to single HDF5 file.
 
     Args:
         input_dir: Directory containing NPZ files
         output_file: Output HDF5 file path
-        compression: Compression algorithm ('gzip' or None)
-        minimal: If True, only keep local masks and xml_file
+        compression: Compression algorithm — 'gzip', 'lzf', or None.
+        compression_opts: Only used for 'gzip' (1-9, ignored for 'lzf').
+        minimal: If True, only keep the MINIMAL_KEYS list.
+        tight_only: If True (and minimal), drop local_wide_* keys.
     """
     input_path = Path(input_dir)
     output_path = Path(output_file)
@@ -120,8 +150,12 @@ def convert_npz_to_hdf5(input_dir: str, output_file: str, compression: str = "gz
         print(f"Using sample file: {sample_file}")
         available_keys = get_npz_keys(sample_file)
         print(f"Keys in sample file: {available_keys}")
-        # Use MINIMAL_KEYS but only if they exist in at least one file
+        # Use MINIMAL_KEYS but only if they exist in at least one file.
+        # tight_only drops local_wide_* keys (dataloader reads only tight).
         keys = [k for k in MINIMAL_KEYS if k in available_keys]
+        if tight_only:
+            keys = [k for k in keys if not k.startswith("local_wide_")]
+            print(f"Tight-only mode: dropped local_wide_* keys, kept {len(keys)}")
         print(f"Minimal mode: keeping only {keys}")
     else:
         sample_file = find_file_with_max_keys(npz_files)
@@ -160,10 +194,15 @@ def convert_npz_to_hdf5(input_dir: str, output_file: str, compression: str = "gz
             shape = (n_samples,) + shapes[key]
             chunks = (1,) + shapes[key]
 
-            if compression:
+            if compression == "lzf":
                 ds = h5f.create_dataset(
                     key, shape=shape, dtype=dtypes[key],
-                    chunks=chunks, compression=compression, compression_opts=4
+                    chunks=chunks, compression="lzf"
+                )
+            elif compression:
+                ds = h5f.create_dataset(
+                    key, shape=shape, dtype=dtypes[key],
+                    chunks=chunks, compression=compression, compression_opts=compression_opts
                 )
             else:
                 ds = h5f.create_dataset(
@@ -226,12 +265,20 @@ def main():
     parser.add_argument("output_file", help="Output HDF5 file path")
     parser.add_argument("--no-compression", action="store_true",
                         help="Disable compression (faster writes, larger file)")
+    parser.add_argument("--compression", choices=("gzip", "lzf"), default="gzip",
+                        help="Compression algorithm (overridden by --no-compression).")
+    parser.add_argument("--compression-opts", type=int, default=4,
+                        help="gzip level 1-9 (ignored for lzf). Default 4.")
+    parser.add_argument("--tight-only", action="store_true",
+                        help="In --minimal mode, drop local_wide_* keys.")
     parser.add_argument("--minimal", action="store_true",
                         help="Only keep local masks and xml_file (smaller file)")
     args = parser.parse_args()
 
-    compression = None if args.no_compression else "gzip"
-    convert_npz_to_hdf5(args.input_dir, args.output_file, compression, minimal=args.minimal)
+    compression = None if args.no_compression else args.compression
+    convert_npz_to_hdf5(args.input_dir, args.output_file, compression,
+                        compression_opts=args.compression_opts,
+                        minimal=args.minimal, tight_only=args.tight_only)
 
 
 if __name__ == "__main__":
