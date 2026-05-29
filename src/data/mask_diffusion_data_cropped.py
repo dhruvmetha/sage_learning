@@ -43,8 +43,9 @@ class MaskDiffusionCroppedDataset(Dataset):
         self,
         datafiles: List[str],
         context_size: int = 64,
-        crop_size: int = 24,
+        crop_size: int = 64,
         split: str = "train",
+        crop_prefix: str = "local_tight",
     ):
         """
         Args:
@@ -52,11 +53,15 @@ class MaskDiffusionCroppedDataset(Dataset):
             context_size: Size to resize context channels to (default 64)
             crop_size: Size of center crop for target (default 24)
             split: Dataset split name
+            crop_prefix: NPZ key prefix for the crop variant — "local_wide" (1.2 m,
+                default; has explicit goal_mask_a1) or "local_tight" (0.5 m;
+                action mask lives in target_goal which is byte-identical content).
         """
         self.datafiles = datafiles
         self.context_size = context_size
         self.crop_size = crop_size
         self.split = split
+        self.crop_prefix = crop_prefix
 
         # Transform for context (full resolution)
         self.context_transform = transforms.Compose([
@@ -79,18 +84,20 @@ class MaskDiffusionCroppedDataset(Dataset):
     def __getitem__(self, idx):
         sample_path = self.datafiles[idx]
 
+        p = self.crop_prefix
         with np.load(sample_path) as data:
             # Load local masks (object-centered)
-            static = data.get('local_static')
-            movable = data.get('local_movable')
-            target_object = data.get('local_target_object')
-            robot_region = data.get('local_robot_region')
-            goal_sample_region = data.get('local_goal_sample_region')
+            static = data.get(f'{p}_static')
+            movable = data.get(f'{p}_movable')
+            target_object = data.get(f'{p}_target_object')
+            robot_region = data.get(f'{p}_robot_region')
+            goal_sample_region = data.get(f'{p}_goal_sample_region')
 
-            # Load target (use local_goal_mask_a1 or fallback)
-            target_goal = data.get('local_goal_mask_a1')
+            # Action mask: prefer explicit goal_mask_a1 (wide has it), else
+            # fall back to target_goal (tight only has this; same content).
+            target_goal = data.get(f'{p}_goal_mask_a1')
             if target_goal is None:
-                target_goal = data.get('local_target_goal')
+                target_goal = data.get(f'{p}_target_goal')
 
             # Copy arrays
             static = static.copy() if static is not None else np.zeros((224, 224))
@@ -127,7 +134,8 @@ class MaskDiffusionCroppedHDF5Dataset(Dataset):
         h5_path: str,
         indices: List[int],
         context_size: int = 64,
-        crop_size: int = 24,
+        crop_size: int = 64,
+        crop_prefix: str = "local_tight",
     ):
         if not HAS_H5PY:
             raise ImportError("h5py required for HDF5 dataset")
@@ -136,6 +144,7 @@ class MaskDiffusionCroppedHDF5Dataset(Dataset):
         self.indices = indices
         self.context_size = context_size
         self.crop_size = crop_size
+        self.crop_prefix = crop_prefix
         self._h5_file = None
 
         # Transforms
@@ -164,17 +173,19 @@ class MaskDiffusionCroppedHDF5Dataset(Dataset):
         h5f = self._get_h5_file()
         real_idx = self.indices[idx]
 
-        # Load local masks
-        static = h5f['local_static'][real_idx] if 'local_static' in h5f else None
-        movable = h5f['local_movable'][real_idx] if 'local_movable' in h5f else None
-        target_object = h5f['local_target_object'][real_idx] if 'local_target_object' in h5f else None
-        robot_region = h5f['local_robot_region'][real_idx] if 'local_robot_region' in h5f else None
-        goal_sample_region = h5f['local_goal_sample_region'][real_idx] if 'local_goal_sample_region' in h5f else None
+        # Load local masks (object-centered crop, prefix-parameterized)
+        p = self.crop_prefix
+        static = h5f[f'{p}_static'][real_idx] if f'{p}_static' in h5f else None
+        movable = h5f[f'{p}_movable'][real_idx] if f'{p}_movable' in h5f else None
+        target_object = h5f[f'{p}_target_object'][real_idx] if f'{p}_target_object' in h5f else None
+        robot_region = h5f[f'{p}_robot_region'][real_idx] if f'{p}_robot_region' in h5f else None
+        goal_sample_region = h5f[f'{p}_goal_sample_region'][real_idx] if f'{p}_goal_sample_region' in h5f else None
 
-        # Target
-        target_goal = h5f['local_goal_mask_a1'][real_idx] if 'local_goal_mask_a1' in h5f else None
+        # Action mask: prefer explicit goal_mask_a1 (wide), else fall back to
+        # target_goal (tight only has this; byte-identical content).
+        target_goal = h5f[f'{p}_goal_mask_a1'][real_idx] if f'{p}_goal_mask_a1' in h5f else None
         if target_goal is None:
-            target_goal = h5f['local_target_goal'][real_idx] if 'local_target_goal' in h5f else None
+            target_goal = h5f[f'{p}_target_goal'][real_idx] if f'{p}_target_goal' in h5f else None
 
         # Handle missing data
         if static is None:
@@ -224,13 +235,14 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
         self,
         data_dir: Union[str, List[str]],
         context_size: int = 64,
-        crop_size: int = 24,
+        crop_size: int = 64,
         batch_size: int = 32,
         num_workers: int = 4,
         pin_memory: bool = True,
         train_split: float = 1.0,
         use_h5: bool = True,
         weighted_sampling: Union[bool, str] = False,
+        crop_prefix: str = "local_tight",
     ):
         """
         Args:
@@ -239,6 +251,9 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
                 - False / "none": Uniform sampling (default)
                 - True / "inverse_solutions": Weight = 1/solutions_found (upsample rare regions)
                 - "solution_depth": Balance depths equally (1-push and 2-push appear equally in batches)
+            crop_prefix: "local_wide" (1.2 m crop, default) or "local_tight"
+                (0.5 m crop). The cross-attn model is agnostic to physical scale;
+                this just switches which set of NPZ/H5 keys the dataset reads.
         """
         super().__init__()
 
@@ -250,6 +265,7 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
         self.pin_memory = pin_memory
         self.train_split = train_split
         self.use_h5 = use_h5
+        self.crop_prefix = crop_prefix
         # Normalize weighted_sampling to string
         if weighted_sampling is True:
             self.weighted_sampling = "inverse_solutions"
@@ -463,12 +479,14 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
                 print(f"[setup] Creating train dataset...", flush=True)
                 self.train_dataset = MaskDiffusionCroppedHDF5Dataset(
                     h5_path, train_indices,
-                    context_size=self.context_size, crop_size=self.crop_size
+                    context_size=self.context_size, crop_size=self.crop_size,
+                    crop_prefix=self.crop_prefix,
                 )
                 print(f"[setup] Creating val dataset...", flush=True)
                 self.val_dataset = MaskDiffusionCroppedHDF5Dataset(
                     h5_path, val_indices,
-                    context_size=self.context_size, crop_size=self.crop_size
+                    context_size=self.context_size, crop_size=self.crop_size,
+                    crop_prefix=self.crop_prefix,
                 )
 
                 # Create weighted sampler if enabled
@@ -505,12 +523,12 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
                 self.train_dataset = MaskDiffusionCroppedDataset(
                     train_files,
                     context_size=self.context_size, crop_size=self.crop_size,
-                    split="train"
+                    split="train", crop_prefix=self.crop_prefix,
                 )
                 self.val_dataset = MaskDiffusionCroppedDataset(
                     val_files,
                     context_size=self.context_size, crop_size=self.crop_size,
-                    split="val"
+                    split="val", crop_prefix=self.crop_prefix,
                 )
 
         print("[setup] Complete!")
@@ -558,7 +576,7 @@ class MaskDiffusionCroppedMultiHorizonDataset(Dataset):
         self,
         datafiles: List[str],
         context_size: int = 64,
-        crop_size: int = 24,
+        crop_size: int = 64,
         split: str = "train",
     ):
         """
@@ -596,16 +614,16 @@ class MaskDiffusionCroppedMultiHorizonDataset(Dataset):
 
         with np.load(sample_path) as data:
             # Load local masks (object-centered)
-            static = data.get('local_static')
-            movable = data.get('local_movable')
-            target_object = data.get('local_target_object')
-            robot_region = data.get('local_robot_region')
-            goal_sample_region = data.get('local_goal_sample_region')
+            static = data.get('local_wide_static')
+            movable = data.get('local_wide_movable')
+            target_object = data.get('local_wide_target_object')
+            robot_region = data.get('local_wide_robot_region')
+            goal_sample_region = data.get('local_wide_goal_sample_region')
 
             # Load multi-horizon targets
-            goal_mask_a1 = data.get('local_goal_mask_a1')
+            goal_mask_a1 = data.get('local_wide_goal_mask_a1')
             if goal_mask_a1 is None:
-                goal_mask_a1 = data.get('local_target_goal')
+                goal_mask_a1 = data.get('local_wide_target_goal')
             goal_mask_a2 = data.get('local_goal_mask_a2')
 
             # Load solution_depth
@@ -653,7 +671,7 @@ class MaskDiffusionCroppedMultiHorizonHDF5Dataset(Dataset):
         h5_path: str,
         indices: List[int],
         context_size: int = 64,
-        crop_size: int = 24,
+        crop_size: int = 64,
     ):
         if not HAS_H5PY:
             raise ImportError("h5py required for HDF5 dataset")
@@ -691,16 +709,16 @@ class MaskDiffusionCroppedMultiHorizonHDF5Dataset(Dataset):
         real_idx = self.indices[idx]
 
         # Load local masks
-        static = h5f['local_static'][real_idx] if 'local_static' in h5f else None
-        movable = h5f['local_movable'][real_idx] if 'local_movable' in h5f else None
-        target_object = h5f['local_target_object'][real_idx] if 'local_target_object' in h5f else None
-        robot_region = h5f['local_robot_region'][real_idx] if 'local_robot_region' in h5f else None
-        goal_sample_region = h5f['local_goal_sample_region'][real_idx] if 'local_goal_sample_region' in h5f else None
+        static = h5f['local_wide_static'][real_idx] if 'local_wide_static' in h5f else None
+        movable = h5f['local_wide_movable'][real_idx] if 'local_wide_movable' in h5f else None
+        target_object = h5f['local_wide_target_object'][real_idx] if 'local_wide_target_object' in h5f else None
+        robot_region = h5f['local_wide_robot_region'][real_idx] if 'local_wide_robot_region' in h5f else None
+        goal_sample_region = h5f['local_wide_goal_sample_region'][real_idx] if 'local_wide_goal_sample_region' in h5f else None
 
         # Multi-horizon targets
-        goal_mask_a1 = h5f['local_goal_mask_a1'][real_idx] if 'local_goal_mask_a1' in h5f else None
+        goal_mask_a1 = h5f['local_wide_goal_mask_a1'][real_idx] if 'local_wide_goal_mask_a1' in h5f else None
         if goal_mask_a1 is None:
-            goal_mask_a1 = h5f['local_target_goal'][real_idx] if 'local_target_goal' in h5f else None
+            goal_mask_a1 = h5f['local_wide_target_goal'][real_idx] if 'local_wide_target_goal' in h5f else None
         goal_mask_a2 = h5f['local_goal_mask_a2'][real_idx] if 'local_goal_mask_a2' in h5f else None
 
         # Solution depth
@@ -765,7 +783,7 @@ class MaskDiffusionCroppedMultiHorizonDataModule(pl.LightningDataModule):
         self,
         data_dir: Union[str, List[str]],
         context_size: int = 64,
-        crop_size: int = 24,
+        crop_size: int = 64,
         batch_size: int = 32,
         num_workers: int = 4,
         pin_memory: bool = True,

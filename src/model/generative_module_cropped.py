@@ -435,10 +435,7 @@ class GenerativeModuleCropped(pl.LightningModule):
 
         # If no scheduler params, return optimizer only
         if self.warmup_steps == 0 and self.decay_steps == 0:
-            return {
-                "optimizer": optimizer,
-                "gradient_clip_val": 1.0,
-            }
+            return optimizer
 
         # Get base LR from optimizer
         base_lr = optimizer.param_groups[0]["lr"]
@@ -468,5 +465,4 @@ class GenerativeModuleCropped(pl.LightningModule):
                 "interval": "step",
                 "frequency": 1,
             },
-            "gradient_clip_val": 1.0,
         }
