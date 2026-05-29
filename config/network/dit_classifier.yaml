@@ -1,0 +1,10 @@
+_target_: src.model.dit.dit_classifier.DiTClassifier
+img_size: ${image_size}
+patch: 4
+in_channels: ${context_channels}
+dim: 256
+depth: 8
+heads: 8
+mlp_ratio: 4.0
+dropout: 0.0
+hidden_dim: 512

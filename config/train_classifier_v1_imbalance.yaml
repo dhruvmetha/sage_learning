@@ -1,0 +1,44 @@
+# Variant V1: imbalance fix — pos_weight + focal loss
+# Tests hypothesis: model fails on hard buckets because BCE under-weights rare positives.
+# Inheritance is manual since hydra default merging across new yamls is finicky.
+# Run with:
+#   python src/train_classifier.py --config-name=train_classifier_v1_imbalance \
+#       data_dir=/common/users/dm1487/namo_data/f_characterization/classifier_train_npz
+
+name: v1_pos5_focal
+output_dir: /common/users/dm1487/scratch_namo/classifier_experiments/${name}
+
+data_dir: ???
+batch_size: 64
+num_workers: 4
+image_size: 64
+
+max_epochs: 60                # was 500; budget for partial training
+check_val_every_n_epoch: 1
+early_stopping_patience: 15
+log_every_n_steps: 50
+precision: 16-mixed
+
+base_lr: 0.0003
+end_lr: 0.000001
+warmup_steps: 500
+decay_steps: 60000
+weight_decay: 0.01
+
+use_local: true
+use_coord_grid: false
+context_channels: 5
+
+# CHANGE 1: amplify positive examples to fight per-cell class imbalance
+pos_weight: 5.0               # was 1.0
+
+# CHANGE 2: focal loss down-weights well-classified easy examples
+use_focal_loss: true          # was false
+focal_alpha: 0.25
+focal_gamma: 2.0
+dice_weight: 1.0              # keep dice as-is (sharpens boundaries)
+
+defaults:
+  - data: classifier_data
+  - model: classifier
+  - network: dit_classifier

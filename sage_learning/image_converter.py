@@ -385,6 +385,10 @@ class MLImageConverterAdapter:
             goal_circle_radius=goal_circle_radius
         )
 
+        # Skip if no region_goals_sampled available
+        if result is None:
+            return None
+
         # Extract local masks and convert to (H, W, 1) format for inference compatibility
         local_masks = {}
         if result['local'] is not None:

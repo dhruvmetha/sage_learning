@@ -21,18 +21,18 @@ hydra:
     subdir: ${hydra.job.num}
 
 defaults:
-  - _self_
   - data: mask_diffusion_data_cropped
   - model: generative_cropped_diffusion_crossattn
   - trainer: single_gpu
   - callbacks: default
+  - _self_
 
 # Random seed
 seed: 42
 
 # Data loading
-num_workers: 0
-batch_size: 64
+num_workers: 4
+batch_size: 128
 use_h5: true
 
 # Weighted sampling strategy: "none", "inverse_solutions", or "solution_depth"
@@ -50,7 +50,11 @@ decay_steps: 300000
 
 # Size configuration
 context_size: 64  # Full context for cross-attention encoder
-crop_size: 24     # Center crop for target prediction
+crop_size: 64     # Predict full crop (same as context, no center sub-crop)
+
+# Tight (0.5 m) crop. Action mask = local_tight_target_goal (byte-identical
+# to what goal_mask_a1 would be — see visualizer.py:1261 vs 1270).
+crop_prefix: local_tight
 
 # GPU (for legacy compatibility)
 gpu_id: 0
@@ -61,3 +65,10 @@ sampling_steps: 50
 # Paths
 paths:
   output_dir: ${output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+# Overrides composed on top of the defaults above (_self_ is last in defaults).
+trainer:
+  precision: bf16-mixed
+
+model:
+  use_min_snr: true

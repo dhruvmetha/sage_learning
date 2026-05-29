@@ -1,0 +1,3 @@
+_target_: src.model.classifier_module.PrimitiveClassifierCNN
+in_channels: ${context_channels}
+hidden_dim: 256

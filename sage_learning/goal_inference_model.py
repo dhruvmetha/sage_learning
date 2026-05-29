@@ -54,6 +54,17 @@ class GoalInferenceModel:
         # Default to True since all recent models use local masks
         self.use_local = getattr(self.data_cfg, 'use_local', True)
 
+        # Check if model uses BFS region masks or point masks for robot/goal
+        # True (default): use local_robot_region (BFS reachability)
+        # False: use local_robot (point position)
+        # Auto-detect from data_dir if not explicitly set
+        use_region_masks = getattr(self.data_cfg, 'use_region_masks', None)
+        if use_region_masks is None:
+            # Fallback: detect from data_dir path (if contains "non_region", use point masks)
+            data_dir = getattr(self.data_cfg, 'data_dir', '') or ''
+            use_region_masks = 'non_region' not in data_dir.lower()
+        self.use_region_masks = use_region_masks
+
         # Get image/context size - support both naming conventions
         # - image_size: used by older models
         # - context_size: used by newer cropped output models
@@ -353,12 +364,20 @@ class GoalInferenceModel:
             raise ValueError(f"Failed to generate local masks for object '{selected_object}'")
 
         # Stack input channels in TRAINING ORDER:
-        # static, movable, target_object, robot_region, goal_sample_region
+        # static, movable, target_object, robot_channel, goal_sample_region
+        # Channel 3 depends on use_region_masks setting
+        if self.use_region_masks:
+            # BFS reachability mask (default)
+            robot_channel = local_data['local_robot_region']
+        else:
+            # Point position mask
+            robot_channel = local_data['local_robot']
+
         input_channels = [
             local_data['local_static'],
             local_data['local_movable'],
             local_data['local_target_object'],
-            local_data['local_robot_region'],
+            robot_channel,
             local_data['local_goal_sample_region'],
         ]
 

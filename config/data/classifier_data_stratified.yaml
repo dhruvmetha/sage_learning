@@ -1,0 +1,9 @@
+_target_: src.data.classifier_data_stratified.ClassifierDataModuleStratified
+data_dir: ${data_dir}
+batch_size: ${batch_size}
+num_workers: ${num_workers}
+image_size: ${image_size}
+use_coord_grid: ${use_coord_grid}
+use_local: ${use_local}
+train_split: 0.9
+hard_share: 0.5    # 50% of each batch from (very_hard + hard)

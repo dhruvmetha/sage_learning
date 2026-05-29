@@ -1,0 +1,11 @@
+_target_: src.model.classifier_module.ClassifierModule
+base_lr: ${base_lr}
+weight_decay: ${weight_decay}
+warmup_steps: ${warmup_steps}
+decay_steps: ${decay_steps}
+end_lr: ${end_lr}
+pos_weight: ${pos_weight}
+use_focal_loss: ${use_focal_loss}
+focal_alpha: ${focal_alpha}
+focal_gamma: ${focal_gamma}
+dice_weight: ${dice_weight}
