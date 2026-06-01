@@ -66,7 +66,12 @@ class GoalInferenceModel:
         # Use data config
         self.data_cfg = self.cfg.data
         model_name = type(self.model).__name__
-        self.is_se2_model = model_name == "SE2DiffusionModule"
+        self.is_se2_model = model_name in {
+            "SE2DiffusionModule",
+            "SE2MultiHypothesisModule",
+            "SE2MultiHypothesisV2Module",
+        }
+        self.is_diffusion_se2_model = model_name == "SE2DiffusionModule"
         self.is_multihyp_model = model_name in {
             "SE2MultiHypothesisModule",
             "SE2MultiHypothesisV2Module",
@@ -209,6 +214,18 @@ class GoalInferenceModel:
         if "T" in hparams and "ddim_steps" in hparams and "feat_dim" in hparams:
             from src.model.se2_diffusion_module import SE2DiffusionModule
             model = SE2DiffusionModule(**hparams)
+            return model, cfg
+
+        if "hyp_dropout_prob" in hparams or "diversity_weight" in hparams or "best_idx_noise_scale" in hparams:
+            from src.model.se2_hypothesis_v2_module import SE2MultiHypothesisV2Module
+
+            model = SE2MultiHypothesisV2Module(**hparams)
+            return model, cfg
+
+        if "assignment_temp" in hparams:
+            from src.model.se2_hypothesis_module import SE2MultiHypothesisModule
+
+            model = SE2MultiHypothesisModule(**hparams)
             return model, cfg
 
         raise RuntimeError(
@@ -643,28 +660,41 @@ class GoalInferenceModel:
             torch.manual_seed(seed)
 
         with torch.no_grad():
-            ctx = self.model.encoder(inp_for_goal)
-            sampled = self.model.sample(
-                ctx,
-                n_per_scene=max(1, int(samples)),
-                sampler_method=self.sampler_method or "ddim",
-                num_steps=self.num_steps,
-            )[0]
-            selected_deltas = sampled.cpu().numpy()
+            if self.is_multihyp_model:
+                pred_real, probs = self.model.predict_hypotheses(inp_for_goal)
+                pred_real = pred_real[0]
+                probs = probs[0]
+                order = torch.argsort(probs, descending=True)
+                max_outputs = min(max(1, int(samples)), pred_real.shape[0])
+                order = order[:max_outputs]
+                selected_deltas = pred_real[order].cpu().numpy()
+                selected_weights = probs[order].cpu().numpy()
+                selected_indices = order.cpu().tolist()
+            else:
+                ctx = self.model.encoder(inp_for_goal)
+                sampled = self.model.sample(
+                    ctx,
+                    n_per_scene=max(1, int(samples)),
+                    sampler_method=self.sampler_method or "ddim",
+                    num_steps=self.num_steps,
+                )[0]
+                selected_deltas = sampled.cpu().numpy()
+                selected_weights = np.ones(len(selected_deltas), dtype=np.float32)
+                selected_indices = list(range(len(selected_deltas)))
 
         valid_goals = []
-        for out_idx, delta in enumerate(selected_deltas):
+        for out_idx, (slot_idx, delta, vote_weight) in enumerate(zip(selected_indices, selected_deltas, selected_weights)):
             dx, dy, dtheta = map(float, delta)
             goal_theta = self._wrap_angle(pre_theta + dtheta)
             valid_goals.append({
-                'index': int(out_idx),
+                'index': int(slot_idx),
                 'x': float(pre_x + dx),
                 'y': float(pre_y + dy),
                 'theta': float(goal_theta),
                 'delta_x': dx,
                 'delta_y': dy,
                 'delta_theta': dtheta,
-                'vote_weight': 1.0,
+                'vote_weight': float(vote_weight),
                 'input_channels': inp_for_goal_np,
                 'anchor_pose': [pre_x, pre_y, pre_theta],
                 'prediction_rank': int(out_idx),
@@ -693,7 +723,7 @@ class GoalInferenceModel:
                 if seed is not None:
                     torch.manual_seed(int(seed) + rep)
 
-                if self.is_se2_model:
+                if self.is_diffusion_se2_model:
                     ctx = self.model.encoder(dummy_context)
                     _ = self.model.sample(
                         ctx,
@@ -701,6 +731,8 @@ class GoalInferenceModel:
                         sampler_method=self.sampler_method or "ddim",
                         num_steps=warmup_steps,
                     )
+                elif self.is_multihyp_model:
+                    _ = self.model.predict_hypotheses(dummy_context)
                 else:
                     _ = self.model.sample_from_model(
                         dummy_context,

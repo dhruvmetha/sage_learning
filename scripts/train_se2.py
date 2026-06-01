@@ -121,6 +121,12 @@ def main():
     if args.ckpt_path and args.init_ckpt_path:
         raise ValueError("Use only one of --ckpt-path or --init-ckpt-path")
 
+    # The SE(2) path is currently defined over the local_tight crop contract.
+    use_local = True
+    use_region_masks = True
+    use_coord_grid = False
+    crop_size_meters = 0.5
+
     pl.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision('medium')
     try:
@@ -163,6 +169,10 @@ def main():
             lr=args.lr,
             weight_decay=args.weight_decay,
             warmup_steps=args.warmup_steps,
+            use_local=use_local,
+            use_region_masks=use_region_masks,
+            use_coord_grid=use_coord_grid,
+            crop_size_meters=crop_size_meters,
         )
     elif args.model_type == 'multihyp':
         from src.model.se2_hypothesis_module import SE2MultiHypothesisModule  # noqa: E402
@@ -180,6 +190,10 @@ def main():
             cls_loss_weight=args.cls_loss_weight,
             angle_loss_weight=args.angle_loss_weight,
             reg_beta=args.reg_beta,
+            use_local=use_local,
+            use_region_masks=use_region_masks,
+            use_coord_grid=use_coord_grid,
+            crop_size_meters=crop_size_meters,
         )
     else:
         from src.model.se2_hypothesis_v2_module import SE2MultiHypothesisV2Module  # noqa: E402
@@ -201,6 +215,10 @@ def main():
             diversity_margin=args.diversity_margin,
             use_hyp_self_attn=args.use_hyp_self_attn,
             best_idx_noise_scale=args.best_idx_noise_scale,
+            use_local=use_local,
+            use_region_masks=use_region_masks,
+            use_coord_grid=use_coord_grid,
+            crop_size_meters=crop_size_meters,
         )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model params: {n_params/1e6:.2f} M")
