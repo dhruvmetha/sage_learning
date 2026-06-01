@@ -24,9 +24,15 @@ class ConvGNBlock(nn.Module):
 
 
 class MultiScaleCoordContextEncoder(nn.Module):
-    def __init__(self, image_channels: int = 5, hidden_dim: int = 256):
+    def __init__(
+        self,
+        image_channels: int = 5,
+        hidden_dim: int = 256,
+        append_coord_channels: bool = True,
+    ):
         super().__init__()
-        in_channels = image_channels + 2
+        self.append_coord_channels = append_coord_channels
+        in_channels = image_channels + (2 if append_coord_channels else 0)
         self.stem = ConvGNBlock(in_channels, 64, stride=1)
         self.stage1 = ConvGNBlock(64, 96, stride=2)
         self.stage2 = ConvGNBlock(96, 128, stride=2)
@@ -89,8 +95,9 @@ class MultiScaleCoordContextEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch, _, height, width = x.shape
-        coords = self._coord_channels(batch, height, width, x.device, x.dtype)
-        x = torch.cat([x, coords], dim=1)
+        if self.append_coord_channels:
+            coords = self._coord_channels(batch, height, width, x.device, x.dtype)
+            x = torch.cat([x, coords], dim=1)
 
         x = self.stem(x)
         x = self.stage1(x)
@@ -155,12 +162,17 @@ class MultiScaleHypothesisPosePredictor(nn.Module):
         mlp_ratio: float = 4.0,
         use_self_attn: bool = True,
         per_slot_heads: bool = False,
+        append_coord_channels: bool = True,
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads.")
 
-        self.encoder = MultiScaleCoordContextEncoder(image_channels=image_channels, hidden_dim=hidden_dim)
+        self.encoder = MultiScaleCoordContextEncoder(
+            image_channels=image_channels,
+            hidden_dim=hidden_dim,
+            append_coord_channels=append_coord_channels,
+        )
         self.global_query_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),

@@ -40,13 +40,14 @@ class SE2MultiHypothesisV2Module(_SE2MultiHypothesisBase):
         super().__init__()
         self.save_hyperparameters()
         self.predictor = MultiScaleHypothesisPosePredictor(
-            image_channels=5,
+            image_channels=7 if use_coord_grid else 5,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_heads=num_heads,
             num_hypotheses=num_hypotheses,
             use_self_attn=use_hyp_self_attn,
             per_slot_heads=True,
+            append_coord_channels=not use_coord_grid,
         )
         self._init_shared_state(
             context_size=context_size,
