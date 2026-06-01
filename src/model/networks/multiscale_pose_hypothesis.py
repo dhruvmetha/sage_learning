@@ -4,6 +4,7 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ConvGNBlock(nn.Module):
@@ -57,6 +58,20 @@ class MultiScaleCoordContextEncoder(nn.Module):
             nn.init.normal_(pos, std=0.02)
 
     @staticmethod
+    def _resize_pos_embed(pos_embed: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        token_count = pos_embed.shape[1]
+        base_size = int(token_count ** 0.5)
+        if base_size * base_size != token_count:
+            raise ValueError(f"Expected square positional embedding, got {token_count} tokens")
+        if base_size == height and base_size == width:
+            return pos_embed
+
+        hidden_dim = pos_embed.shape[-1]
+        pos_grid = pos_embed.view(1, base_size, base_size, hidden_dim).permute(0, 3, 1, 2)
+        pos_grid = F.interpolate(pos_grid, size=(height, width), mode="bilinear", align_corners=False)
+        return pos_grid.permute(0, 2, 3, 1).reshape(1, height * width, hidden_dim)
+
+    @staticmethod
     def _coord_channels(
         batch: int,
         height: int,
@@ -88,7 +103,8 @@ class MultiScaleCoordContextEncoder(nn.Module):
         for idx, (feat, proj, pos_embed) in enumerate(zip(feats, self.proj_layers, self.pos_embeds)):
             proj_feat = proj(feat)
             tokens = proj_feat.flatten(2).transpose(1, 2)
-            tokens = tokens + pos_embed + self.scale_embeds[idx]
+            pos_tokens = self._resize_pos_embed(pos_embed, proj_feat.shape[-2], proj_feat.shape[-1])
+            tokens = tokens + pos_tokens + self.scale_embeds[idx]
             token_chunks.append(self.token_norm(tokens))
 
         context_tokens = torch.cat(token_chunks, dim=1)

@@ -379,7 +379,7 @@ class GoalInferenceModel:
         return image_converter, local_data, inp_tensor, inp_np
 
     def infer(self, json_message, xml_path, robot_goal, selected_object, samples=32, seed=None,
-              region_goals_sampled=None):
+              region_goals_sampled=None, episode_data=None):
         """
         Perform goal inference to get goal proposals.
 
@@ -396,6 +396,8 @@ class GoalInferenceModel:
             region_goals_sampled: Optional list of (x, y, theta) tuples representing
                                   goal samples for the target neighbor region.
                                   Used for computing goal_sample_region mask in ML inference.
+            episode_data: Compatibility placeholder for older planner call sites.
+                The current inference path rebuilds masks from json_message/xml_path.
 
         Returns:
             List of goal dictionaries, each containing:
