@@ -9,6 +9,7 @@ The adapter translates between the JSON message format expected by ML models and
 ObjectInfo format used by the UnifiedImageConverter.
 """
 
+import os
 import numpy as np
 from typing import Dict, List, Tuple, Any, Optional
 from sage_learning.unified_converter import UnifiedImageConverter, ObjectInfo, create_converter_from_xml
@@ -33,8 +34,8 @@ class MLImageConverterAdapter:
         self.xml_path = xml_path
         self.converter = create_converter_from_xml(xml_path)
         
-        # Load object sizes from XML for compatibility
-        self.object_sizes = self._load_object_sizes_from_xml(xml_path)
+        # Load object sizes and robot geometry for compatibility.
+        self.object_sizes, self.robot_static_info = self._load_object_sizes_from_xml(xml_path)
         
         # Store world bounds for compatibility
         self.world_bounds = self.converter.world_bounds
@@ -49,19 +50,13 @@ class MLImageConverterAdapter:
         # Store data_point for compatibility with create_object_mask
         self.data_point = None
     
-    def _load_object_sizes_from_xml(self, xml_path: str) -> Dict[str, np.ndarray]:
-        """Load object sizes from XML file for compatibility."""
-        import mujoco
-        import os
-        
-        # Handle relative paths
+    def _resolve_xml_path(self, xml_path: str) -> str:
+        """Resolve relative XML paths the same way as legacy inference code."""
         if not os.path.isabs(xml_path):
-            # Check if path starts with ../ and can be resolved directly first
             if xml_path.startswith("../ml4kp_ktamp"):
                 if os.path.exists(xml_path):
                     full_xml_path = os.path.abspath(xml_path)
                 else:
-                    # Fallback to hardcoded resource path
                     full_xml_path = os.path.join("/common/home/dm1487/robotics_research/ktamp/ml4kp_ktamp/resources/models", xml_path)
             elif os.path.exists(xml_path):
                 full_xml_path = os.path.abspath(xml_path)
@@ -69,7 +64,44 @@ class MLImageConverterAdapter:
                 full_xml_path = os.path.join("/common/home/dm1487/robotics_research/ktamp/ml4kp_ktamp/resources/models", xml_path)
         else:
             full_xml_path = xml_path
-        
+
+        return full_xml_path
+
+    @staticmethod
+    def _extract_robot_static_info(model, mujoco) -> Dict[str, float]:
+        """Mirror env.get_object_info()['robot'] geometry for local-mask generation."""
+        body_name = None
+        body_id = -1
+        for candidate in ("robot", "car"):
+            candidate_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, candidate)
+            if candidate_id >= 0:
+                body_name = candidate
+                body_id = candidate_id
+                break
+
+        robot_geom_id = -1
+        if body_name is not None:
+            robot_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, body_name)
+            if robot_geom_id < 0:
+                for geom_id in range(model.ngeom):
+                    if model.geom_bodyid[geom_id] == body_id:
+                        robot_geom_id = geom_id
+                        break
+
+        if robot_geom_id < 0:
+            return {}
+
+        half_extent = float(model.geom_size[robot_geom_id][0])
+        return {
+            "size_x": half_extent,
+            "size_y": half_extent,
+        }
+
+    def _load_object_sizes_from_xml(self, xml_path: str) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+        """Load object sizes and robot geometry from XML for compatibility."""
+        import mujoco
+
+        full_xml_path = self._resolve_xml_path(xml_path)
         model = mujoco.MjModel.from_xml_path(full_xml_path)
         geom_sizes = {}
         
@@ -78,9 +110,9 @@ class MLImageConverterAdapter:
             if geom_name is None:
                 geom_name = f"geom_{i}"
             geom_sizes[geom_name] = model.geom_size[i]
-        
+        robot_static_info = self._extract_robot_static_info(model, mujoco)
         del model
-        return geom_sizes
+        return geom_sizes, robot_static_info
     
     def print_bounds_info(self):
         """Print debugging information about bounds (for compatibility)."""
@@ -286,6 +318,9 @@ class MLImageConverterAdapter:
         # Build static_object_info from object_sizes
         # Include position info for static objects so they're correctly identified
         static_object_info = {}
+        robot_static_info = getattr(self, 'robot_static_info', None)
+        if robot_static_info:
+            static_object_info['robot'] = dict(robot_static_info)
         for obj_name, obj_info in data_point['objects'].items():
             if obj_name in self.object_sizes:
                 info = {
@@ -324,7 +359,6 @@ class MLImageConverterAdapter:
             'world_bounds': self.world_bounds,
             'algorithm_stats': {
                 'region_goals_sampled': region_goals_sampled,
-                'region_goal_used': (robot_goal_pos[0], robot_goal_pos[1], 0.0) if not region_goals_sampled else None
             }
         }
 
@@ -337,7 +371,7 @@ class MLImageConverterAdapter:
                            crop_size_meters: float = 5.0,
                            highres_size: int = 1024,
                            output_size: int = 224,
-                           goal_circle_radius: float = 0.1) -> Dict[str, Any]:
+                           goal_circle_radius: float = 0.05) -> Dict[str, Any]:
         """Create local masks centered on selected object using the SAME method as training.
 
         This method converts the data_point to episode format and calls
@@ -347,11 +381,12 @@ class MLImageConverterAdapter:
             data_point: JSON message from planning system
             selected_object: Name of the object to center on
             robot_goal_pos: Robot goal position [x, y]
-            region_goals_sampled: List of (x, y, theta) goal samples for goal_region mask
+            region_goals_sampled: List of (x, y, theta) goal samples for the
+                goal_sample_region mask. If omitted, the mask is left empty.
             crop_size_meters: Size of local crop in meters (default: 5.0)
-            highres_size: High-res render size (default: 2048)
+            highres_size: High-res render size (default: 1024)
             output_size: Output mask size (default: 224)
-            goal_circle_radius: Radius of goal region circles in meters (default: 0.1)
+            goal_circle_radius: Radius of goal region circles in meters (default: 0.05)
 
         Returns:
             Dictionary containing:
@@ -382,10 +417,12 @@ class MLImageConverterAdapter:
             global_output_size=output_size,
             local_output_size=output_size,
             local_crop_size_meters=crop_size_meters,
-            goal_circle_radius=goal_circle_radius
+            goal_circle_radius=goal_circle_radius,
+            allow_missing_region_goals=True,
         )
 
-        # Skip if no region_goals_sampled available
+        # Inference asks the visualizer to keep generating masks even when the
+        # goal-region channel is empty, so None here indicates a real failure.
         if result is None:
             return None
 

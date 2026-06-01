@@ -1,15 +1,17 @@
-from omegaconf import OmegaConf, DictConfig, ListConfig
-import hydra
-import torch
+import re
 from pathlib import Path
-import numpy as np
+
 import cv2
-import os
-from torchvision import transforms
-from sage_learning.utils.image_utils import find_rectangle_corners
-from sage_learning.image_converter import MLImageConverterAdapter as ImageConverter
-from scipy.spatial.transform import Rotation as R
+import hydra
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from omegaconf import DictConfig, ListConfig, OmegaConf
+from scipy.spatial.transform import Rotation as R
+from torchvision import transforms
+
+from sage_learning.image_converter import MLImageConverterAdapter as ImageConverter
+from sage_learning.utils.image_utils import find_rectangle_corners
 
 class GoalInferenceModel:
     """
@@ -17,7 +19,14 @@ class GoalInferenceModel:
     Generates goal proposals for a selected object in SE(2) space.
     """
 
-    def __init__(self, model_path, device="cuda", sampler_method=None, num_steps=None):
+    def __init__(
+        self,
+        model_path,
+        device="cuda",
+        sampler_method=None,
+        num_steps=None,
+        namo_config_path=None,
+    ):
         """
         Initialize the goal inference model.
 
@@ -26,12 +35,22 @@ class GoalInferenceModel:
             device: Device to load model on (default: "cuda")
             sampler_method: Override sampler method at inference time.
                 For Flow Matching: "euler", "midpoint", "rk4", "dopri5"
-                For Diffusion: "ddpm", "ddim"
+                For diffusion samplers: "ddpm", "ddim"
+                Not supported for direct multi-hypothesis SE(2) predictors.
                 If None, uses the method from training config.
             num_steps: Override number of sampling steps (default: uses training config or 20)
+            namo_config_path: Compatibility placeholder for planner call sites.
         """
         self.device = device
         self.model_path = Path(model_path)
+        self.namo_config_path = namo_config_path
+        self.checkpoint_override = None
+        if self.model_path.is_file() and self.model_path.suffix == ".ckpt":
+            self.checkpoint_override = self.model_path
+            if self.model_path.parent.name == "checkpoints":
+                self.model_path = self.model_path.parent.parent
+            else:
+                self.model_path = self.model_path.parent
         self.sampler_method = sampler_method
         self.num_steps = num_steps
 
@@ -43,9 +62,15 @@ class GoalInferenceModel:
             self._override_sampler(sampler_method)
 
         # Model loaded - sampler: {type(self.model.sampler).__name__} (method: {self._get_sampler_method()})
-        
+
         # Use data config
         self.data_cfg = self.cfg.data
+        model_name = type(self.model).__name__
+        self.is_se2_model = model_name == "SE2DiffusionModule"
+        self.is_multihyp_model = model_name in {
+            "SE2MultiHypothesisModule",
+            "SE2MultiHypothesisV2Module",
+        }
 
         # Check if model was trained with coord_grid
         self.use_coord_grid = getattr(self.data_cfg, 'use_coord_grid', False)
@@ -75,6 +100,18 @@ class GoalInferenceModel:
         # so we always use context_size for coordinate conversion
         self.crop_size = getattr(self.data_cfg, 'crop_size',
                                  getattr(self.cfg, 'crop_size', None))
+
+        # Current SE(2) models train on local_tight 0.5 m crops, while legacy
+        # local mask models use 5.0 m. Default to the SE(2) crop when no config
+        # field is available because script-trained SE(2) runs do not emit Hydra.
+        self.local_crop_size_meters = float(
+            getattr(
+                self.data_cfg,
+                "crop_size_meters",
+                getattr(self.cfg, "crop_size_meters", 0.5 if self.is_se2_model else 5.0),
+            )
+        )
+        self.local_render_size = 224
 
         # Setup image transform (resize to context_size)
         self.transform = transforms.Compose([
@@ -106,46 +143,96 @@ class GoalInferenceModel:
             for item in node:
                 self._remap_targets_recursive(item)
 
-    def _load_model(self):
-        """Load a model from the given output directory path."""
-        # Load config
-        config_path = self.model_path / ".hydra" / "config.yaml"
-        if not config_path.exists():
-            raise FileNotFoundError(f"Config file not found at {config_path}")
-        
-        cfg = OmegaConf.load(config_path)
-        if "model" in cfg:
-            self._remap_targets_recursive(cfg.model)
-        
-        # Find checkpoint
-        checkpoint_dir = self.model_path / "checkpoints"
+    @staticmethod
+    def _find_checkpoint_path(run_dir: Path, checkpoint_override: Path | None) -> Path:
+        if checkpoint_override is not None:
+            return checkpoint_override
+
+        checkpoint_dir = run_dir / "checkpoints"
         if not checkpoint_dir.exists():
             raise FileNotFoundError(f"Checkpoints directory not found at {checkpoint_dir}")
-            
-        checkpoint_files = list(checkpoint_dir.glob("*.ckpt"))
-        checkpoint_path = None
-        
-        # Look for epoch checkpoint first, then last.ckpt
-        for checkpoint_file in checkpoint_files:
-            if "epoch" in checkpoint_file.name:
-                checkpoint_path = checkpoint_file
-                break
-        
-        if checkpoint_path is None:
-            # Fallback to last.ckpt
-            last_ckpt = checkpoint_dir / "last.ckpt"
-            if last_ckpt.exists():
-                checkpoint_path = last_ckpt
-            else:
-                raise FileNotFoundError(f"No suitable checkpoint found in {checkpoint_dir}")
-        
-        # Load model
-        model = hydra.utils.instantiate(cfg.model)
+
+        last_ckpt = checkpoint_dir / "last.ckpt"
+        if last_ckpt.exists():
+            return last_ckpt
+
+        checkpoint_files = sorted(checkpoint_dir.glob("*.ckpt"))
+        epoch_candidates = [ckpt for ckpt in checkpoint_files if ckpt.name != "last.ckpt"]
+        if not epoch_candidates:
+            raise FileNotFoundError(f"No suitable checkpoint found in {checkpoint_dir}")
+
+        def sort_key(path: Path):
+            name = path.name
+            epoch = -1
+            val_loss = float("inf")
+
+            match = re.search(r"epoch=(\d+)-val_loss=([0-9]+(?:\.[0-9]+)?)\.ckpt$", name)
+            if match:
+                epoch = int(match.group(1))
+                val_loss = float(match.group(2))
+                return (0, val_loss, -epoch, name)
+
+            match = re.search(r"se2-(\d+)-([0-9]+(?:\.[0-9]+)?)\.ckpt$", name)
+            if match:
+                epoch = int(match.group(1))
+                val_loss = float(match.group(2))
+                return (0, val_loss, -epoch, name)
+
+            match = re.search(r"epoch[=_-](\d+)", name)
+            if match:
+                epoch = int(match.group(1))
+                return (1, -epoch, name)
+
+            return (2, name)
+
+        return min(epoch_candidates, key=sort_key)
+
+    def _build_checkpoint_only_model(self, checkpoint: dict):
+        """Reconstruct script-trained SE(2) models without a Hydra config."""
+        hparams = dict(checkpoint.get("hyper_parameters", {}))
+        if not hparams:
+            raise FileNotFoundError(
+                f"Config file not found at {self.model_path / '.hydra' / 'config.yaml'} "
+                "and checkpoint lacks hyper_parameters for reconstruction."
+            )
+
+        cfg = OmegaConf.create({
+            "data": {
+                "context_size": int(hparams.get("context_size", 64)),
+                "use_local": bool(hparams.get("use_local", True)),
+                "use_region_masks": bool(hparams.get("use_region_masks", True)),
+                "use_coord_grid": bool(hparams.get("use_coord_grid", False)),
+                "crop_size_meters": float(hparams.get("crop_size_meters", 0.5)),
+            }
+        })
+
+        if "T" in hparams and "ddim_steps" in hparams and "feat_dim" in hparams:
+            from src.model.se2_diffusion_module import SE2DiffusionModule
+            model = SE2DiffusionModule(**hparams)
+            return model, cfg
+
+        raise RuntimeError(
+            "Unable to reconstruct model without Hydra config. "
+            f"Checkpoint hyper_parameters keys: {sorted(hparams.keys())}"
+        )
+
+    def _load_model(self):
+        """Load a model from a Hydra run directory or checkpoint file."""
+        config_path = self.model_path / ".hydra" / "config.yaml"
+        checkpoint_path = self._find_checkpoint_path(self.model_path, self.checkpoint_override)
         checkpoint = torch.load(checkpoint_path, weights_only=False)
+
+        if config_path.exists():
+            cfg = OmegaConf.load(config_path)
+            if "model" in cfg:
+                self._remap_targets_recursive(cfg.model)
+            model = hydra.utils.instantiate(cfg.model)
+        else:
+            model, cfg = self._build_checkpoint_only_model(checkpoint)
+
         model.load_state_dict(checkpoint["state_dict"])
         model.to(self.device)
         model.eval()
-        
         return model, cfg
 
     def _override_sampler(self, method: str):
@@ -158,6 +245,20 @@ class GoalInferenceModel:
         """
         flow_matching_methods = {"euler", "midpoint", "rk4", "dopri5"}
         diffusion_methods = {"ddpm", "ddim"}
+        model_name = type(self.model).__name__
+
+        if model_name == "SE2DiffusionModule":
+            if method not in diffusion_methods:
+                raise ValueError(
+                    f"SE(2) diffusion models support sampler_method in {sorted(diffusion_methods)}, "
+                    f"got '{method}'."
+                )
+            return
+        if model_name in {"SE2MultiHypothesisModule", "SE2MultiHypothesisV2Module"}:
+            raise ValueError(
+                f"sampler_method is not supported for {model_name}; "
+                "this model predicts hypotheses directly and does not sample via DDPM/DDIM."
+            )
 
         if method in flow_matching_methods:
             from src.model.samplers.fb_ode_sampler import FBODESampler
@@ -181,7 +282,14 @@ class GoalInferenceModel:
 
     def _get_sampler_method(self) -> str:
         """Get the current sampler method as a string."""
-        sampler = self.model.sampler
+        if type(self.model).__name__ == "SE2DiffusionModule":
+            return self.sampler_method or "ddim"
+        if type(self.model).__name__ in {"SE2MultiHypothesisModule", "SE2MultiHypothesisV2Module"}:
+            return "not_applicable"
+
+        sampler = getattr(self.model, "sampler", None)
+        if sampler is None:
+            return "unknown"
         sampler_type = type(sampler).__name__
 
         if sampler_type == "FBODESampler":
@@ -190,6 +298,68 @@ class GoalInferenceModel:
             return getattr(sampler, "sampler_type", "unknown")
         else:
             return "unknown"
+
+    @staticmethod
+    def _wrap_angle(theta: float) -> float:
+        return float(np.arctan2(np.sin(theta), np.cos(theta)))
+
+    @staticmethod
+    def _make_coord_grid(size: int) -> np.ndarray:
+        ys, xs = np.meshgrid(
+            np.linspace(0, 1, size),
+            np.linspace(0, 1, size),
+            indexing='ij',
+        )
+        return np.stack([xs, ys], axis=-1).astype(np.float32)
+
+    def _build_local_context(
+        self,
+        json_message,
+        xml_path,
+        robot_goal,
+        selected_object,
+        region_goals_sampled=None,
+    ):
+        image_converter = ImageConverter(xml_path)
+        local_data = image_converter.create_local_masks(
+            data_point=json_message,
+            selected_object=selected_object,
+            robot_goal_pos=robot_goal,
+            region_goals_sampled=region_goals_sampled,
+            crop_size_meters=self.local_crop_size_meters,
+            highres_size=1024,
+            output_size=self.local_render_size,
+        )
+
+        if not local_data or 'local_static' not in local_data:
+            raise ValueError(f"Failed to generate local masks for object '{selected_object}'")
+
+        if self.use_region_masks:
+            robot_channel = local_data.get('local_robot_region')
+        else:
+            robot_channel = local_data.get('local_robot')
+        if robot_channel is None:
+            robot_channel = np.zeros_like(local_data['local_static'], dtype=np.float32)
+
+        goal_region = local_data.get('local_goal_sample_region')
+        if goal_region is None:
+            goal_region = np.zeros_like(local_data['local_static'], dtype=np.float32)
+
+        input_channels = [
+            local_data['local_static'],
+            local_data['local_movable'],
+            local_data['local_target_object'],
+            robot_channel,
+            goal_region,
+        ]
+
+        if self.use_coord_grid:
+            input_channels.append(self._make_coord_grid(input_channels[0].shape[0]))
+
+        inp = np.concatenate(input_channels, axis=-1)
+        inp_tensor = self.transform(inp).unsqueeze(0).to(self.device)
+        inp_np = inp_tensor.detach().cpu().squeeze(0).numpy()
+        return image_converter, local_data, inp_tensor, inp_np
 
     def infer(self, json_message, xml_path, robot_goal, selected_object, samples=32, seed=None,
               region_goals_sampled=None):
@@ -218,6 +388,17 @@ class GoalInferenceModel:
             - x, y, theta: SE(2) pose components
             - goal_sample: Raw goal sample array
         """
+        if self.is_se2_model:
+            return self._infer_se2(
+                json_message,
+                xml_path,
+                robot_goal,
+                selected_object,
+                samples,
+                seed=seed,
+                region_goals_sampled=region_goals_sampled,
+            )
+
         # Auto-route to local inference if model was trained with use_local=True
         if self.use_local:
             return self._infer_local(json_message, xml_path, robot_goal, selected_object, samples, seed=seed,
@@ -347,60 +528,19 @@ class GoalInferenceModel:
             - goal_sample: Raw goal sample array
             - input_channels: Input tensor for visualization
         """
-        # Create ImageConverter and generate local masks
-        image_converter = ImageConverter(xml_path)
-        local_data = image_converter.create_local_masks(
-            data_point=json_message,
-            selected_object=selected_object,
-            robot_goal_pos=robot_goal,
-            region_goals_sampled=region_goals_sampled,  # Use provided region goals for goal_sample_region mask
-            crop_size_meters=5.0,
-            highres_size=1024,
-            output_size=224
+        image_converter, local_data, inp_for_goal, inp_for_goal_np = self._build_local_context(
+            json_message,
+            xml_path,
+            robot_goal,
+            selected_object,
+            region_goals_sampled=region_goals_sampled,
         )
-
-        # Check if local masks were generated successfully
-        if 'local_static' not in local_data:
-            raise ValueError(f"Failed to generate local masks for object '{selected_object}'")
-
-        # Stack input channels in TRAINING ORDER:
-        # static, movable, target_object, robot_channel, goal_sample_region
-        # Channel 3 depends on use_region_masks setting
-        if self.use_region_masks:
-            # BFS reachability mask (default)
-            robot_channel = local_data['local_robot_region']
-        else:
-            # Point position mask
-            robot_channel = local_data['local_robot']
-
-        input_channels = [
-            local_data['local_static'],
-            local_data['local_movable'],
-            local_data['local_target_object'],
-            robot_channel,
-            local_data['local_goal_sample_region'],
-        ]
-
-        # Add coordinate grid if model was trained with it
-        if self.use_coord_grid:
-            orig_size = local_data['local_static'].shape[0]
-            ys, xs = np.meshgrid(np.linspace(0, 1, orig_size),
-                                 np.linspace(0, 1, orig_size),
-                                 indexing='ij')
-            coord_grid = np.stack([xs, ys], axis=-1).astype(np.float32)
-            input_channels.append(coord_grid)
-
-        # Concatenate and transform
-        inp_for_goal = np.concatenate(input_channels, axis=-1)
-        inp_for_goal = self.transform(inp_for_goal).unsqueeze(0).to(self.device)
 
         # Generate goal samples
         num_steps = self.num_steps if self.num_steps is not None else 20
         with torch.no_grad():
             goal_samples = (self.model.sample_from_model(inp_for_goal, samples=samples, num_steps=num_steps, seed=seed)
                           .permute(0, 2, 3, 1).cpu().numpy() + 1) / 2
-
-        inp_for_goal_np = inp_for_goal.cpu().squeeze(0).numpy()
 
         # Get metadata for coordinate conversion
         object_center = local_data['object_center']
@@ -476,3 +616,98 @@ class GoalInferenceModel:
             })
 
         return valid_goals
+
+    def _infer_se2(
+        self,
+        json_message,
+        xml_path,
+        robot_goal,
+        selected_object,
+        samples=32,
+        seed=None,
+        region_goals_sampled=None,
+    ):
+        """Infer world-frame SE(2) goals from direct delta-pose models."""
+        _, local_data, inp_for_goal, inp_for_goal_np = self._build_local_context(
+            json_message,
+            xml_path,
+            robot_goal,
+            selected_object,
+            region_goals_sampled=region_goals_sampled,
+        )
+
+        pre_x, pre_y = map(float, local_data['object_center'])
+        pre_theta = float(local_data['object_theta'])
+
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        with torch.no_grad():
+            ctx = self.model.encoder(inp_for_goal)
+            sampled = self.model.sample(
+                ctx,
+                n_per_scene=max(1, int(samples)),
+                sampler_method=self.sampler_method or "ddim",
+                num_steps=self.num_steps,
+            )[0]
+            selected_deltas = sampled.cpu().numpy()
+
+        valid_goals = []
+        for out_idx, delta in enumerate(selected_deltas):
+            dx, dy, dtheta = map(float, delta)
+            goal_theta = self._wrap_angle(pre_theta + dtheta)
+            valid_goals.append({
+                'index': int(out_idx),
+                'x': float(pre_x + dx),
+                'y': float(pre_y + dy),
+                'theta': float(goal_theta),
+                'delta_x': dx,
+                'delta_y': dy,
+                'delta_theta': dtheta,
+                'vote_weight': 1.0,
+                'input_channels': inp_for_goal_np,
+                'anchor_pose': [pre_x, pre_y, pre_theta],
+                'prediction_rank': int(out_idx),
+            })
+
+        return valid_goals
+
+    def warmup(self, samples: int = 32, num_steps: int | None = None,
+               seed: int | None = None, repeats: int = 3) -> None:
+        """Run dummy inference passes to compile kernels without env inputs."""
+        if repeats <= 0:
+            return
+
+        channels = 5 + (2 if self.use_coord_grid else 0)
+        dummy_context = torch.zeros(
+            1,
+            channels,
+            self.context_size,
+            self.context_size,
+            device=self.device,
+        )
+        warmup_steps = num_steps if num_steps is not None else self.num_steps
+
+        with torch.no_grad():
+            for rep in range(int(repeats)):
+                if seed is not None:
+                    torch.manual_seed(int(seed) + rep)
+
+                if self.is_se2_model:
+                    ctx = self.model.encoder(dummy_context)
+                    _ = self.model.sample(
+                        ctx,
+                        n_per_scene=max(1, int(samples)),
+                        sampler_method=self.sampler_method or "ddim",
+                        num_steps=warmup_steps,
+                    )
+                else:
+                    _ = self.model.sample_from_model(
+                        dummy_context,
+                        samples=max(1, int(samples)),
+                        num_steps=warmup_steps if warmup_steps is not None else 20,
+                        seed=None if seed is None else int(seed) + rep,
+                    )
+
+        if isinstance(self.device, str) and self.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()

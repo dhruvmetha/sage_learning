@@ -1045,7 +1045,8 @@ class NAMODataVisualizer:
                                    global_output_size: int = 224,
                                    local_output_size: int = 224,
                                    local_crop_size_meters: float = 5.0,
-                                   goal_circle_radius: float = 0.05) -> Optional[Dict[str, Any]]:
+                                   goal_circle_radius: float = 0.05,
+                                   allow_missing_region_goals: bool = False) -> Optional[Dict[str, Any]]:
         """Generate both global and local masks from a single high-resolution render.
 
         This is more efficient than calling generate_episode_masks and
@@ -1059,9 +1060,13 @@ class NAMODataVisualizer:
             local_output_size: Size of local output masks (default: 224)
             local_crop_size_meters: Size of local crop region in meters (default: 5.0)
             goal_circle_radius: Radius of robot goal circle in meters (default: 0.05, ~10px)
+            allow_missing_region_goals: When True, keep generating masks if
+                region_goals_sampled is unavailable and leave goal_sample_region
+                empty. Default False preserves training-time skip behavior.
 
         Returns:
-            None if region_goals_sampled is not available (datapoint should be skipped).
+            None if region_goals_sampled is not available and
+            allow_missing_region_goals is False (datapoint should be skipped).
             Dictionary containing:
             - 'global': Dict of global masks (resized from full highres)
                 - robot, goal, movable, static, reachable, target_object, target_goal,
@@ -1236,8 +1241,9 @@ class NAMODataVisualizer:
             if region_goal_used:
                 region_goals_sampled = [region_goal_used]
 
-        # No fallback - if no region_goals_sampled, skip this datapoint
-        if not region_goals_sampled:
+        # Training skips datapoints without region_goals_sampled, but inference
+        # may still need the remaining context channels for a fresh prediction.
+        if not region_goals_sampled and not allow_missing_region_goals:
             return None
 
         # Draw goal_samples mask (circles at all sampled goal positions)

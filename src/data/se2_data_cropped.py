@@ -192,6 +192,7 @@ class SE2CroppedDataModule(pl.LightningDataModule):
         batch_size: int = 256,
         num_workers: int = 4,
         pin_memory: bool = True,
+        persistent_workers: Optional[bool] = None,
         train_split: float = 0.95,
         use_h5: bool = True,
         h5_path: Optional[str] = None,
@@ -209,6 +210,7 @@ class SE2CroppedDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.persistent_workers = num_workers > 0 if persistent_workers is None else persistent_workers
         self.train_split = train_split
         self.use_h5 = use_h5
         self.h5_path = h5_path
@@ -301,7 +303,7 @@ class SE2CroppedDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             shuffle=True,
-            persistent_workers=self.num_workers > 0,
+            persistent_workers=self.persistent_workers and self.num_workers > 0,
         )
 
     def val_dataloader(self):
@@ -311,5 +313,5 @@ class SE2CroppedDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             shuffle=False,
-            persistent_workers=self.num_workers > 0,
+            persistent_workers=self.persistent_workers and self.num_workers > 0,
         )

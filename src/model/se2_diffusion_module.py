@@ -185,7 +185,7 @@ class SE2DiffusionModule(pl.LightningModule):
 
     Batch contract (from SE2CroppedDataModule):
         context: (B, 5, H, W)  float in [-1, 1]
-        target:  (B, 4)        ground-truth (Δx, Δy, cos Δθ, sin Δθ)
+        target:  (B, 3)        ground-truth (Δx, Δy, Δθ)
 
     Outputs at sample time: (B, 3) decoded back to (Δx, Δy, Δθ).
     """
@@ -201,8 +201,19 @@ class SE2DiffusionModule(pl.LightningModule):
         lr: float = 1e-4,
         weight_decay: float = 0.0,
         warmup_steps: int = 0,
+        loss_mode: str = "epsilon_mse",
+        target_mean: Optional[List[float]] = None,
+        target_std: Optional[List[float]] = None,
+        x0_loss_weight: float = 0.25,
+        x0_huber_delta: float = 0.25,
+        use_local: bool = True,
+        use_region_masks: bool = True,
+        use_coord_grid: bool = False,
+        crop_size_meters: float = 0.5,
     ):
         super().__init__()
+        if loss_mode not in {"epsilon_mse", "normalized_hybrid"}:
+            raise ValueError(f"Unknown loss_mode: {loss_mode}")
         self.save_hyperparameters()
 
         self.encoder = ContextEncoder(in_channels=5, feat_dim=feat_dim)
@@ -215,11 +226,22 @@ class SE2DiffusionModule(pl.LightningModule):
         self.register_buffer('alpha_bars', sched.alpha_bars)
         self.register_buffer('sqrt_alpha_bars', sched.sqrt_alpha_bars)
         self.register_buffer('sqrt_one_minus_alpha_bars', sched.sqrt_one_minus_alpha_bars)
+        mean = torch.tensor(target_mean if target_mean is not None else [0.0, 0.0, 0.0],
+                            dtype=torch.float32)
+        std = torch.tensor(target_std if target_std is not None else [1.0, 1.0, 1.0],
+                           dtype=torch.float32)
+        std = torch.clamp(std, min=1e-6)
+        self.register_buffer('target_mean', mean)
+        self.register_buffer('target_std', std)
         self.T = T
         self.ddim_steps = ddim_steps
 
         self.train_loss = MeanMetric()
+        self.train_eps_loss = MeanMetric()
+        self.train_x0_loss = MeanMetric()
         self.val_loss = MeanMetric()
+        self.val_eps_loss = MeanMetric()
+        self.val_x0_loss = MeanMetric()
         self.val_loss_best = MinMetric()
         # Decoded-pose validation metrics (in real units)
         self.val_xy_mae_m = MeanMetric()
@@ -234,6 +256,53 @@ class SE2DiffusionModule(pl.LightningModule):
         # output_size = context_size (model's native resolution, same as mask DiT)
         self.viz_output_size = context_size
 
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        state_dict = checkpoint.setdefault("state_dict", {})
+        state_dict.setdefault("target_mean", self.target_mean.detach().clone())
+        state_dict.setdefault("target_std", self.target_std.detach().clone())
+
+    def _target_to_model_space(self, x_real: torch.Tensor) -> torch.Tensor:
+        if self.hparams.loss_mode == "normalized_hybrid":
+            return (x_real - self.target_mean) / self.target_std
+        return x_real
+
+    def _target_from_model_space(self, x_model: torch.Tensor) -> torch.Tensor:
+        if self.hparams.loss_mode == "normalized_hybrid":
+            return x_model * self.target_std + self.target_mean
+        return x_model
+
+    def _compute_diffusion_losses(
+        self,
+        x_0_model: torch.Tensor,
+        ctx: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        B = x_0_model.shape[0]
+        t = torch.randint(0, self.T, (B,), device=x_0_model.device)
+        eps = torch.randn_like(x_0_model)
+        sab = self.sqrt_alpha_bars[t][:, None]
+        somab = self.sqrt_one_minus_alpha_bars[t][:, None]
+        x_t = sab * x_0_model + somab * eps
+
+        eps_pred = self.denoiser(x_t, t, ctx)
+        eps_loss = F.mse_loss(eps_pred, eps)
+        total_loss = eps_loss
+
+        out = {
+            'loss': total_loss,
+            'eps_loss': eps_loss,
+        }
+        if self.hparams.loss_mode == "normalized_hybrid":
+            x0_pred = (x_t - somab * eps_pred) / sab.clamp(min=1e-8)
+            x0_loss = F.smooth_l1_loss(
+                x0_pred,
+                x_0_model,
+                beta=self.hparams.x0_huber_delta,
+            )
+            total_loss = total_loss + self.hparams.x0_loss_weight * x0_loss
+            out['loss'] = total_loss
+            out['x0_loss'] = x0_loss
+        return out
+
     # ----- visualization helpers -----
 
     @staticmethod
@@ -244,7 +313,7 @@ class SE2DiffusionModule(pl.LightningModule):
 
         Args:
             delta: (3,) (Δx, Δy, Δθ) world-frame, relative to pre_pose (= crop center)
-            obj_size_xy: (2,) (sx, sy) physical object size in meters
+            obj_size_xy: (2,) (sx, sy) physical object half-extents in meters
             crop_size_meters: side length of the crop (= 0.5 m for local_tight)
             output_size: pixel side length (e.g., 64 or 224)
 
@@ -260,8 +329,8 @@ class SE2DiffusionModule(pl.LightningModule):
         # The crop is world-axis-aligned around pre_pose (= crop center).
         cx = output_size / 2 + dx * scale
         cy = output_size / 2 + dy * scale
-        w_px = sx * scale
-        h_px = sy * scale
+        w_px = sx * scale * 2.0
+        h_px = sy * scale * 2.0
         # Δθ is the rotation FROM pre_pose.θ; the object's absolute orientation
         # in the world frame would be pre_pose.θ + Δθ, but the crop's axes are
         # not aligned to the object's body frame — they're world-axis-aligned.
@@ -281,21 +350,18 @@ class SE2DiffusionModule(pl.LightningModule):
     # ----- training -----
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
-        x_0 = batch['target']                       # [B, 4]
+        x_0 = self._target_to_model_space(batch['target'])   # [B, 3] in model space
         ctx = self.encoder(batch['context'])         # [B, feat_dim]
-
-        B = x_0.shape[0]
-        t = torch.randint(0, self.T, (B,), device=x_0.device)
-        eps = torch.randn_like(x_0)
-        sab = self.sqrt_alpha_bars[t][:, None]
-        somab = self.sqrt_one_minus_alpha_bars[t][:, None]
-        x_t = sab * x_0 + somab * eps
-
-        eps_pred = self.denoiser(x_t, t, ctx)
-        loss = F.mse_loss(eps_pred, eps)
+        losses = self._compute_diffusion_losses(x_0, ctx)
+        loss = losses['loss']
 
         self.train_loss(loss)
         self.log('train/loss', self.train_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.train_eps_loss(losses['eps_loss'])
+        self.log('train/loss_eps', self.train_eps_loss, on_step=True, on_epoch=True, prog_bar=False)
+        if 'x0_loss' in losses:
+            self.train_x0_loss(losses['x0_loss'])
+            self.log('train/loss_x0', self.train_x0_loss, on_step=True, on_epoch=True, prog_bar=False)
         return loss
 
     # ----- validation -----
@@ -305,25 +371,25 @@ class SE2DiffusionModule(pl.LightningModule):
         if batch_idx == 0:
             self._viz_batch = {k: v.detach() for k, v in batch.items()}
 
-        x_0 = batch['target']
+        x_0_real = batch['target']
+        x_0 = self._target_to_model_space(x_0_real)
         ctx = self.encoder(batch['context'])
-        B = x_0.shape[0]
-        t = torch.randint(0, self.T, (B,), device=x_0.device)
-        eps = torch.randn_like(x_0)
-        sab = self.sqrt_alpha_bars[t][:, None]
-        somab = self.sqrt_one_minus_alpha_bars[t][:, None]
-        x_t = sab * x_0 + somab * eps
-        eps_pred = self.denoiser(x_t, t, ctx)
-        loss = F.mse_loss(eps_pred, eps)
+        losses = self._compute_diffusion_losses(x_0, ctx)
+        loss = losses['loss']
         self.val_loss(loss)
-        self.log('val/loss', self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val/loss', self.val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.val_eps_loss(losses['eps_loss'])
+        self.log('val/loss_eps', self.val_eps_loss, on_epoch=True, prog_bar=False, sync_dist=True)
+        if 'x0_loss' in losses:
+            self.val_x0_loss(losses['x0_loss'])
+            self.log('val/loss_x0', self.val_x0_loss, on_epoch=True, prog_bar=False, sync_dist=True)
 
         # Sample one prediction per scene with DDIM, compare to gt in real units.
         if batch_idx < 4:
             with torch.no_grad():
                 pred = self.sample(ctx, n_per_scene=1)        # [B, 1, 3]
             pred = pred.squeeze(1)
-            gt_dx, gt_dy, gt_dth = x_0[:, 0], x_0[:, 1], x_0[:, 2]
+            gt_dx, gt_dy, gt_dth = x_0_real[:, 0], x_0_real[:, 1], x_0_real[:, 2]
             pr_dx, pr_dy, pr_dth = pred[:, 0], pred[:, 1], pred[:, 2]
             xy_err = torch.sqrt((pr_dx - gt_dx) ** 2 + (pr_dy - gt_dy) ** 2).mean()
             th_diff = pr_dth - gt_dth
@@ -331,19 +397,22 @@ class SE2DiffusionModule(pl.LightningModule):
             th_err = th_diff.abs().mean() * (180.0 / math.pi)
             self.val_xy_mae_m(xy_err)
             self.val_th_mae_deg(th_err)
-            self.log('val/xy_mae_m', self.val_xy_mae_m, on_epoch=True, prog_bar=True)
-            self.log('val/th_mae_deg', self.val_th_mae_deg, on_epoch=True, prog_bar=True)
+            self.log('val/xy_mae_m', self.val_xy_mae_m, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log('val/th_mae_deg', self.val_th_mae_deg, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def on_validation_epoch_end(self):
         self.val_loss_best.update(self.val_loss.compute())
-        self.log('val/loss_best', self.val_loss_best.compute(), prog_bar=False)
+        self.log('val/loss_best', self.val_loss_best.compute(), prog_bar=False, sync_dist=True)
 
         # Match cropped mask-DiT val sample layout: one wandb image per scene,
         # 7-panel row of [Scene | Reach | GT | Pred1..Pred4] at context_size.
         import sys
         if self._viz_batch is None:
             print(f"[se2 viz] skip — _viz_batch is None (epoch {self.current_epoch})", flush=True, file=sys.stderr)
+            return
+        if self.trainer is not None and not self.trainer.is_global_zero:
+            self._viz_batch = None
             return
         if not hasattr(self.logger, 'experiment'):
             print(f"[se2 viz] skip — no logger.experiment", flush=True, file=sys.stderr)
@@ -439,11 +508,20 @@ class SE2DiffusionModule(pl.LightningModule):
     # ----- inference -----
 
     @torch.no_grad()
-    def sample(self, ctx: torch.Tensor, n_per_scene: int = 1) -> torch.Tensor:
-        """DDIM sampling. Returns (B, N, 3) — N candidate samples per scene.
+    def sample(
+        self,
+        ctx: torch.Tensor,
+        n_per_scene: int = 1,
+        sampler_method: str = "ddim",
+        num_steps: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Diffusion sampling. Returns (B, N, 3) — N candidate samples per scene.
 
         Use n_per_scene > 1 to capture multi-modal goal distribution.
         """
+        if sampler_method not in {"ddim", "ddpm"}:
+            raise ValueError(f"Unknown sampler_method '{sampler_method}'")
+
         B, F_dim = ctx.shape
         device = ctx.device
         N = n_per_scene
@@ -452,23 +530,34 @@ class SE2DiffusionModule(pl.LightningModule):
 
         x = torch.randn(B * N, 3, device=device)
 
-        # DDIM timestep subsequence: T-1 → 0 in ddim_steps strides
-        timesteps = torch.linspace(self.T - 1, 0, self.ddim_steps + 1, device=device).long()
-        for i in range(self.ddim_steps):
-            t = timesteps[i]
-            t_prev = timesteps[i + 1]
+        steps = int(self.ddim_steps if num_steps is None else num_steps)
+        steps = max(1, min(steps, self.T))
+        schedule = torch.linspace(self.T - 1, 0, steps, device=device).round().long()
+        schedule = torch.unique_consecutive(schedule)
+        eta = 0.0 if sampler_method == "ddim" else 1.0
+
+        for i, t in enumerate(schedule):
+            t_prev = int(schedule[i + 1].item()) if i + 1 < schedule.numel() else -1
             t_batch = torch.full((B * N,), int(t), device=device, dtype=torch.long)
 
             eps_pred = self.denoiser(x, t_batch, ctx_rep)
 
             alpha_bar = self.alpha_bars[t]
-            alpha_bar_prev = self.alpha_bars[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=device)
+            alpha_bar_prev = (
+                self.alpha_bars[t_prev]
+                if t_prev >= 0
+                else torch.tensor(1.0, device=device, dtype=alpha_bar.dtype)
+            )
 
             x0_pred = (x - torch.sqrt(1 - alpha_bar) * eps_pred) / torch.sqrt(alpha_bar)
-            # DDIM η = 0 (deterministic given x_T)
-            x = torch.sqrt(alpha_bar_prev) * x0_pred + torch.sqrt(1 - alpha_bar_prev) * eps_pred
+            sigma = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+            sigma = sigma * torch.sqrt(torch.clamp(1 - alpha_bar / alpha_bar_prev, min=0.0))
+            dir_coeff = torch.sqrt(torch.clamp(1 - alpha_bar_prev - sigma ** 2, min=0.0))
+            noise = torch.randn_like(x) if sigma.item() > 0 else torch.zeros_like(x)
+            x = torch.sqrt(alpha_bar_prev) * x0_pred + dir_coeff * eps_pred + sigma * noise
 
-        return x.reshape(B, N, 3)
+        x = x.reshape(B, N, 3)
+        return self._target_from_model_space(x)
 
     @torch.no_grad()
     def predict_se3_world_delta(self, context: torch.Tensor, n_per_scene: int = 1) -> torch.Tensor:
