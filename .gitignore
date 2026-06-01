@@ -3,3 +3,14 @@ test/
 *.pyc
 *.egg-info/
 namo/
+data.h5
+scripts/se2_*18h*.sbatch
+scripts/monitor_se2_jobs_3h.sh
+scripts/run_train_se2_resume_ilab.sh
+scripts/stage_xattn_rlab6_memfix.sh
+scripts/sync_remote_run.sh
+src/model/_impl_cache/
+src/model/networks/_impl_cache/
+src/model/_pyc_loader.py
+src/model/networks/cross_attention_vector_denoiser.py
+src/model/networks/multiscale_cross_attention_vector_denoiser.py
