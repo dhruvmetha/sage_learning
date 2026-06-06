@@ -1,0 +1,6 @@
+_target_: src.data.scorer_data.ScorerDataModule
+data_dir: ${data_dir}
+batch_size: ${batch_size}
+num_workers: ${num_workers}
+image_size: ${image_size}
+train_split: 0.9

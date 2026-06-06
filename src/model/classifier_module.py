@@ -109,8 +109,8 @@ class ClassifierModule(pl.LightningModule):
         # Dice loss weight (set to 0 to disable)
         self.dice_weight = dice_weight
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
+    def forward(self, x: torch.Tensor, contact_px=None) -> torch.Tensor:
+        return self.network(x, contact_px)
 
     def _compute_masked_loss(self, logits: torch.Tensor,
                               labels: torch.Tensor,
@@ -253,7 +253,7 @@ class ClassifierModule(pl.LightningModule):
         f_labels = batch['f_labels']    # (B, 60, 10)
         r_mask = batch['r_mask']        # (B, 60, 10)
 
-        logits = self(context)          # (B, 60, 10)
+        logits = self(context, batch.get('contact_px'))  # (B, 60, num_depths)
         loss = self._compute_masked_loss(logits, f_labels, r_mask)
 
         self.train_loss(loss)
@@ -267,7 +267,7 @@ class ClassifierModule(pl.LightningModule):
         r_mask = batch['r_mask']
         ratios = batch.get('ratio', None)
 
-        logits = self(context)
+        logits = self(context, batch.get('contact_px'))
         loss = self._compute_masked_loss(logits, f_labels, r_mask)
 
         self.val_loss(loss)

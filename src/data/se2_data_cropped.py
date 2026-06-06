@@ -249,27 +249,36 @@ class SE2CroppedDataModule(pl.LightningDataModule):
             print(f"[se2 setup] Using HDF5: {h5_path}")
             with h5py.File(h5_path, 'r') as h5:
                 n_samples = h5.attrs.get('n_samples', len(h5[list(h5.keys())[0]]))
+                xml_col = h5['xml_file'][:]
+                def _xml(i):
+                    v = xml_col[i][0] if xml_col[i].shape else xml_col[i]
+                    return v.decode('utf-8', errors='ignore') if isinstance(v, bytes) else str(v)
                 # Apply env_family_filter via xml_file substring match.
                 if self.env_family_filter:
                     print(f"[se2 setup] Filtering by xml_file substring: '{self.env_family_filter}'")
-                    xml_col = h5['xml_file'][:]
-                    keep = []
-                    for i in range(n_samples):
-                        v = xml_col[i][0] if xml_col[i].shape else xml_col[i]
-                        if isinstance(v, bytes):
-                            v = v.decode('utf-8', errors='ignore')
-                        if self.env_family_filter in str(v):
-                            keep.append(i)
-                    print(f"[se2 setup] Kept {len(keep)}/{n_samples} samples after filter")
-                    indices = keep
+                    indices = [i for i in range(n_samples) if self.env_family_filter in _xml(i)]
+                    print(f"[se2 setup] Kept {len(indices)}/{n_samples} samples after filter")
                 else:
                     indices = list(range(n_samples))
-            print(f"[se2 setup] n_samples (post-filter): {len(indices)}")
+                # Group samples by room (xml). A scene with several movable objects yields one sample
+                # per pushed object; a per-ROW split scatters those siblings across train/val (~42% of
+                # val rooms also appear in train -> optimistic val_loss). Split by ROOM so a scene is
+                # wholly in train or wholly in val.
+                groups = {}
+                for i in indices:
+                    groups.setdefault(_xml(i), []).append(i)
+            print(f"[se2 setup] n_samples (post-filter): {len(indices)}  rooms: {len(groups)}")
+            room_keys = sorted(groups)
             rng = random.Random(0)
-            rng.shuffle(indices)
-            split = max(1, min(int(len(indices) * self.train_split), len(indices) - 1))
-            train_idx, val_idx = indices[:split], indices[split:]
-            print(f"[se2 setup] Train: {len(train_idx)}  Val: {len(val_idx)}")
+            rng.shuffle(room_keys)
+            target = int(len(indices) * self.train_split)
+            train_idx, val_idx, cum = [], [], 0
+            for k in room_keys:
+                if cum < target:
+                    train_idx += groups[k]; cum += len(groups[k])
+                else:
+                    val_idx += groups[k]
+            print(f"[se2 setup] Train: {len(train_idx)}  Val: {len(val_idx)}  (room-grouped, no scene straddles the split)")
             self.train_dataset = SE2CroppedHDF5Dataset(h5_path, train_idx, context_size=self.context_size)
             self.val_dataset = SE2CroppedHDF5Dataset(h5_path, val_idx, context_size=self.context_size)
         else:

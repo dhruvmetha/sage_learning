@@ -444,6 +444,7 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
                 print(f"[setup] H5 file opened, reading n_samples...", flush=True)
                 n_samples = h5f.attrs.get('n_samples', len(h5f[list(h5f.keys())[0]]))
                 print(f"[setup] n_samples: {n_samples}", flush=True)
+                xml_col = h5f['xml_file'][:] if 'xml_file' in h5f else None
 
                 # Load fields for weighted sampling
                 all_solutions_found = None
@@ -459,19 +460,35 @@ class MaskDiffusionCroppedDataModule(pl.LightningDataModule):
                         all_solution_depth = h5f['solution_depth'][:].flatten()
                         print(f"[setup] Loaded solution_depth: {len(all_solution_depth)} values", flush=True)
 
-            print(f"[setup] Shuffling indices...", flush=True)
-            rng = random.Random(0)
-            all_indices = list(range(n_samples))
-            rng.shuffle(all_indices)
-
-            if n_samples == 1:
-                train_indices = all_indices
-                val_indices = all_indices
+            # Split by ROOM (xml), never by row: a scene with several pushed-object episodes must not
+            # straddle train/val (else ~42% of val rooms also appear in train -> optimistic val_loss).
+            # See docs/pipeline/multi_episode_rooms.md.
+            if n_samples == 1 or xml_col is None:
+                rng = random.Random(0)
+                all_indices = list(range(n_samples)); rng.shuffle(all_indices)
+                if n_samples == 1:
+                    train_indices = val_indices = all_indices
+                else:
+                    split_idx = max(1, min(int(n_samples * self.train_split), n_samples - 1))
+                    train_indices, val_indices = all_indices[:split_idx], all_indices[split_idx:]
+                if xml_col is None:
+                    print("[setup] WARNING: no xml_file in H5 -> row-level split (val may leak rooms)", flush=True)
             else:
-                split_idx = int(n_samples * self.train_split)
-                split_idx = max(1, min(split_idx, n_samples - 1))
-                train_indices = all_indices[:split_idx]
-                val_indices = all_indices[split_idx:]
+                def _xml(i):
+                    v = xml_col[i][0] if xml_col[i].shape else xml_col[i]
+                    return v.decode('utf-8', 'ignore') if isinstance(v, bytes) else str(v)
+                groups = {}
+                for i in range(n_samples):
+                    groups.setdefault(_xml(i), []).append(i)
+                keys = sorted(groups); random.Random(0).shuffle(keys)
+                target = int(n_samples * self.train_split); cum = 0
+                train_indices, val_indices = [], []
+                for k in keys:
+                    if cum < target:
+                        train_indices += groups[k]; cum += len(groups[k])
+                    else:
+                        val_indices += groups[k]
+                print(f"[setup] room-grouped split: {len(groups)} rooms, no scene straddles", flush=True)
 
             print(f"[setup] Train: {len(train_indices)}, Val: {len(val_indices)}", flush=True)
 

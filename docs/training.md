@@ -359,3 +359,23 @@ outputs/<run_name>/
 └── wandb/
     └── run-*/                # WandB run files
 ```
+
+## GPU resources (Amarel)
+
+Full policy + grounding: **`namo_cpp/docs/cluster_resources.md`**. Short version:
+
+- **Partitions:** submit to `gpu,gpu-redhat` (both). **Never Camden** (`cgpu-redhat`).
+- **A100 = `ampere`, L40S = `adalovelace`.** Request either: `--constraint=ampere|adalovelace`.
+- **Prefer multi-GPU, fall back to single** (`trainer=multi_gpu` is `devices=auto`, so one script does both):
+
+```bash
+# preferred — 2x A100/L40S
+GPU_TAG=mg sbatch --partition=gpu,gpu-redhat --constraint=ampere|adalovelace \
+  --gres=gpu:2 --cpus-per-task=16 --mem=120G --time=08:00:00 \
+  scripts/train_crossattn_v3_multigpu.slurm
+
+# fallback — 1x A100/L40S (if 2-GPU stays pending, don't wait — use this)
+sbatch --partition=gpu,gpu-redhat --constraint=ampere|adalovelace \
+  --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=09:00:00 \
+  scripts/train_crossattn_v3.slurm
+```

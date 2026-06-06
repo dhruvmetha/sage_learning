@@ -1,0 +1,87 @@
+# Multi-GPU Trainer Configuration
+# PyTorch Lightning best practices for distributed training
+#
+# Usage:
+#   python src/train_generative.py trainer=multi_gpu ...
+#
+# Notes:
+#   - Uses DDP (DistributedDataParallel) strategy - most stable for multi-GPU
+#   - Effective batch size = batch_size * num_gpus
+#   - Learning rate may need scaling: lr * num_gpus (linear scaling rule)
+
+_target_: lightning.pytorch.trainer.Trainer
+
+# Hardware
+accelerator: gpu
+devices: auto  # Use all available GPUs, or set to specific number (e.g., 4)
+
+# Distributed strategy
+# DDP is the most common and stable strategy for multi-GPU training
+strategy:
+  _target_: lightning.pytorch.strategies.DDPStrategy
+  find_unused_parameters: false  # Set to true if model has unused params
+  static_graph: false  # Disabled - can cause hangs with some configurations
+  gradient_as_bucket_view: false  # Avoids stride mismatch warnings with ConvTranspose2d
+
+# Training duration
+min_epochs: 1
+max_epochs: ${max_epochs}
+
+# Mixed precision for faster training and lower memory
+precision: 16-mixed
+
+# Gradient clipping for stable training
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm
+
+# Validation frequency
+check_val_every_n_epoch: ${check_val_every_n_epoch}
+
+# Logging (reduce frequency for multi-GPU to avoid log spam)
+log_every_n_steps: 50
+enable_progress_bar: true
+
+# Sanity check before training
+num_sanity_val_steps: 2
+
+# Reproducibility
+deterministic: false
+
+# Sync batch norm across GPUs (important if using BatchNorm layers)
+# DiT uses LayerNorm, so this is optional but doesn't hurt
+sync_batchnorm: true
+
+# Callbacks
+callbacks:
+  - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch{epoch:03d}-val_loss{val_loss:.4f}"
+    monitor: val_loss
+    mode: min
+    save_top_k: 3
+    save_last: true
+    auto_insert_metric_name: false
+    verbose: true
+
+  # Periodic snapshots every 100 epochs (epoch-quality study — keep ALL, not val-loss-gated)
+  - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "periodic-epoch{epoch:03d}"
+    every_n_epochs: 100
+    save_top_k: -1
+    save_last: false
+    auto_insert_metric_name: false
+
+  - _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+  - _target_: lightning.pytorch.callbacks.RichProgressBar
+    refresh_rate: 10
+
+# Logger - Weights & Biases
+logger:
+  - _target_: lightning.pytorch.loggers.WandbLogger
+    project: sage_learning
+    save_dir: ${paths.output_dir}
+    log_model: false  # Don't upload model checkpoints to wandb
+    tags: ["flow_matching", "multi_gpu"]

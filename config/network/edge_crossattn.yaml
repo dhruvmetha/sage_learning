@@ -1,0 +1,9 @@
+_target_: src.model.dit.edge_crossattn.EdgeCrossAttn
+img_size: ${image_size}
+patch: 4
+in_channels: ${context_channels}
+dim: 192
+scene_depth: 4
+edge_depth: 4
+heads: 6
+num_depths: ${num_depths}

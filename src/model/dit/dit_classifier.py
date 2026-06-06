@@ -68,9 +68,11 @@ class DiTClassifier(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         hidden_dim: int = 512,
+        num_depths: int = 10,
     ):
         super().__init__()
         assert img_size % patch == 0
+        self.num_depths = num_depths
         num_patches = (img_size // patch) ** 2  # 256 for 64/4
 
         self.patch_embed = PatchEmbed(in_channels, patch, dim)
@@ -89,10 +91,10 @@ class DiTClassifier(nn.Module):
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 600),
+            nn.Linear(hidden_dim, 60 * num_depths),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, contact_px=None) -> torch.Tensor:  # contact_px ignored (global readout)
         B = x.size(0)
 
         # Patch embed + positional embedding
@@ -110,6 +112,6 @@ class DiTClassifier(nn.Module):
 
         # CLS token output → classification head
         cls_out = tok[:, 0]  # (B, D)
-        logits = self.head(cls_out)  # (B, 600)
+        logits = self.head(cls_out)  # (B, 60*num_depths)
 
-        return logits.view(B, 60, 10)
+        return logits.view(B, 60, self.num_depths)
