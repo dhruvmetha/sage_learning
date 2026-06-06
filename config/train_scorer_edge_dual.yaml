@@ -1,0 +1,37 @@
+# E7: dual-crop scorer (wide context + zoom local gather). Same recipe as E4/train_scorer_edge,
+# data points at the dual H5 (has context_zoom + contact_px_zoom), network = edge_crossattn_dual.
+#   python src/train_classifier.py --config-name=train_scorer_edge_dual data_dir=/scratch/dm1487/h5/v3_scorer_e4_dual +seed=1
+name: scorer_edge_dual
+output_dir: /scratch/dm1487/sage_outputs/scorer/${name}
+
+data_dir: /scratch/dm1487/h5/v3_scorer_e4_dual
+batch_size: 128
+num_workers: 8
+image_size: 64
+num_depths: 5
+
+max_epochs: 200
+check_val_every_n_epoch: 1
+early_stopping_patience: 25
+log_every_n_steps: 50
+precision: 16-mixed
+
+base_lr: 0.0003
+end_lr: 0.000001
+warmup_steps: 500
+decay_steps: 100000
+weight_decay: 0.01
+
+use_local: true
+use_coord_grid: false
+context_channels: 5
+pos_weight: 1.0
+use_focal_loss: false
+focal_alpha: 0.25
+focal_gamma: 2.0
+dice_weight: 1.0
+
+defaults:
+  - data: scorer_data
+  - model: classifier
+  - network: edge_crossattn_dual

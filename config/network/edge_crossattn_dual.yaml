@@ -1,0 +1,15 @@
+# E7 dual-crop: per-edge LOCAL feature gathered from a tight zoom crop (de-aliased),
+# context (cross-attn to wide scene) + positional id unchanged. use_zoom turns on the zoom stem.
+_target_: src.model.dit.edge_crossattn.EdgeCrossAttn
+img_size: ${image_size}      # wide crop size (64) — context, unchanged
+patch: 4
+in_channels: ${context_channels}
+dim: 192
+scene_depth: 4
+edge_depth: 4
+heads: 6
+num_depths: ${num_depths}
+use_zoom: true
+zoom_size: 128               # tight 0.24 m crop @ 128 px -> ~1 contact point / feature cell
+zoom_patch: 4
+zoom_depth: 2

@@ -52,6 +52,9 @@ class ScorerH5Dataset(Dataset):
         }
         if "contact_px" in f:   # (60,2) pixel coords of each edge's contact point (for per-edge models)
             out["contact_px"] = torch.from_numpy(f["contact_px"][i].astype(np.float32))
+        if "context_zoom" in f:  # dual-crop: tight object crop + its contact pixels (for use_zoom models)
+            out["context_zoom"] = torch.from_numpy(f["context_zoom"][i].astype(np.float32))
+            out["contact_px_zoom"] = torch.from_numpy(f["contact_px_zoom"][i].astype(np.float32))
         return out
 
 
