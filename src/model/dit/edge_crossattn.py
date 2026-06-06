@@ -51,7 +51,8 @@ class CrossBlock(nn.Module):
 
 class EdgeCrossAttn(nn.Module):
     def __init__(self, img_size=64, patch=4, in_channels=5, dim=192, scene_depth=4, edge_depth=4,
-                 heads=6, num_depths=5, num_edges=60, dropout=0.0):
+                 heads=6, num_depths=5, num_edges=60, dropout=0.0,
+                 use_zoom=False, zoom_size=128, zoom_patch=4, zoom_depth=2):
         super().__init__()
         self.dim = dim; self.num_depths = num_depths; self.S = img_size; self.grid = img_size // patch
         npatch = self.grid ** 2
@@ -64,20 +65,42 @@ class EdgeCrossAttn(nn.Module):
         self.edge_blocks = nn.ModuleList([CrossBlock(dim, heads, drop=dropout) for _ in range(edge_depth)])
         self.edge_norm = nn.LayerNorm(dim)
         self.head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, num_depths))
+        # OPTIONAL dual-crop: a second light stem over a tight zoom crop, from which the per-edge LOCAL
+        # feature is gathered (de-aliased). OFF by default -> forward is byte-identical to the single-crop
+        # model, so E2/E4 reproduce exactly. Context (cross-attn to the wide scene tokens) is unchanged;
+        # the positional id stays in the WIDE frame (the shared coordinate that glues zoom-local to wide-context).
+        self.use_zoom = use_zoom; self.zoom_size = zoom_size
+        if use_zoom:
+            self.zgrid = zoom_size // zoom_patch
+            self.zoom_patch = PatchEmbed(in_channels, zoom_patch, dim)
+            self.zoom_pos = nn.Parameter(torch.randn(1, self.zgrid ** 2, dim) * 0.02)
+            self.zoom_blocks = nn.ModuleList([SelfBlock(dim, heads, drop=dropout) for _ in range(zoom_depth)])
+            self.zoom_norm = nn.LayerNorm(dim)
 
-    def forward(self, x, contact_px):
-        """x: (B,5,H,W);  contact_px: (B,60,2) pixel coords (px=x/col, py=y/row) in the HxW frame."""
+    def forward(self, x, contact_px, x_zoom=None, contact_px_zoom=None):
+        """x: (B,5,H,W); contact_px: (B,60,2) px in the HxW (wide) frame.
+        Dual-crop (use_zoom): x_zoom (B,5,Z,Z) tight object crop + contact_px_zoom (B,60,2) px in the ZZ frame —
+        the LOCAL feature is gathered from the zoom map; positional id + context still use the wide frame."""
         B = x.size(0)
         tok = self.patch(x) + self.scene_pos                       # B, Np, D
         for blk in self.scene_blocks:
             tok = blk(tok)
-        tok = self.scene_norm(tok)                                 # scene tokens
-        fmap = tok.transpose(1, 2).reshape(B, self.dim, self.grid, self.grid)  # B,D,16,16
-        grid = (contact_px / self.S) * 2 - 1                       # B,60,2 in [-1,1], (x,y)
-        gathered = F.grid_sample(fmap, grid.unsqueeze(1), align_corners=False, mode="bilinear", padding_mode="border")
+        tok = self.scene_norm(tok)                                 # scene tokens (context)
+        grid = (contact_px / self.S) * 2 - 1                       # B,60,2 in [-1,1] (WIDE frame; the shared pos)
+        if self.use_zoom:
+            zt = self.zoom_patch(x_zoom) + self.zoom_pos           # zoom stem
+            for blk in self.zoom_blocks:
+                zt = blk(zt)
+            zt = self.zoom_norm(zt)
+            src = zt.transpose(1, 2).reshape(B, self.dim, self.zgrid, self.zgrid)
+            gg = (contact_px_zoom / self.zoom_size) * 2 - 1        # gather in the ZOOM frame
+        else:
+            src = tok.transpose(1, 2).reshape(B, self.dim, self.grid, self.grid)
+            gg = grid                                              # gather in the WIDE frame (original)
+        gathered = F.grid_sample(src, gg.unsqueeze(1), align_corners=False, mode="bilinear", padding_mode="border")
         gathered = gathered.squeeze(2).transpose(1, 2)             # B,60,D  (local feature per edge)
-        e = self.local_proj(gathered) + self.edge_pos(grid)        # B,60,D  (+ positional id)
+        e = self.local_proj(gathered) + self.edge_pos(grid)        # B,60,D  (+ positional id, WIDE frame)
         for blk in self.edge_blocks:
-            e = blk(e, tok)
+            e = blk(e, tok)                                        # cross-attend WIDE scene + self-attend edges
         e = self.edge_norm(e)
         return self.head(e)                                        # B,60,num_depths

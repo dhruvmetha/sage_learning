@@ -89,6 +89,7 @@ class ClassifierModule(pl.LightningModule):
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
         dice_weight: float = 1.0,
+        bce_reachable_only: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['network'])
@@ -109,7 +110,15 @@ class ClassifierModule(pl.LightningModule):
         # Dice loss weight (set to 0 to disable)
         self.dice_weight = dice_weight
 
-    def forward(self, x: torch.Tensor, contact_px=None) -> torch.Tensor:
+        # Ablation: if True, the BCE term is computed ONLY on reachable primitives
+        # (no supervision to suppress unreachable cells) — tests whether reachability
+        # supervision is a useful auxiliary task or wasted capacity (we mask at inference anyway).
+        self.bce_reachable_only = bce_reachable_only
+
+    def forward(self, x: torch.Tensor, contact_px=None, x_zoom=None, contact_px_zoom=None) -> torch.Tensor:
+        # dual-crop fields are passed only when present -> single-crop path is unchanged (DiT + EdgeCrossAttn)
+        if x_zoom is not None:
+            return self.network(x, contact_px, x_zoom, contact_px_zoom)
         return self.network(x, contact_px)
 
     def _compute_masked_loss(self, logits: torch.Tensor,
@@ -132,12 +141,17 @@ class ClassifierModule(pl.LightningModule):
         labels_flat = labels.reshape(B, -1)   # (B, 600)
         mask_flat = mask.reshape(B, -1)       # (B, 600)
 
-        # BCE on all 600: learn unreachable=0 + reachable labels
+        # BCE: on all 600 (default — also supervises unreachable=0), or reachable-only (ablation).
         if self.use_focal_loss:
             bce = self._focal_loss(logits_flat, labels_flat)
         else:
             pw = torch.tensor([self.pos_weight], device=logits.device)
-            bce = F.binary_cross_entropy_with_logits(logits_flat, labels_flat, pos_weight=pw)
+            if self.bce_reachable_only:
+                per = F.binary_cross_entropy_with_logits(
+                    logits_flat, labels_flat, pos_weight=pw, reduction='none')
+                bce = (per * mask_flat).sum() / mask_flat.sum().clamp(min=1.0)
+            else:
+                bce = F.binary_cross_entropy_with_logits(logits_flat, labels_flat, pos_weight=pw)
 
         # Dice on reachable only: sharp F boundaries where it matters
         if self.dice_weight > 0:
@@ -253,7 +267,7 @@ class ClassifierModule(pl.LightningModule):
         f_labels = batch['f_labels']    # (B, 60, 10)
         r_mask = batch['r_mask']        # (B, 60, 10)
 
-        logits = self(context, batch.get('contact_px'))  # (B, 60, num_depths)
+        logits = self(context, batch.get('contact_px'), batch.get('context_zoom'), batch.get('contact_px_zoom'))  # (B, 60, num_depths)
         loss = self._compute_masked_loss(logits, f_labels, r_mask)
 
         self.train_loss(loss)
@@ -267,7 +281,7 @@ class ClassifierModule(pl.LightningModule):
         r_mask = batch['r_mask']
         ratios = batch.get('ratio', None)
 
-        logits = self(context, batch.get('contact_px'))
+        logits = self(context, batch.get('contact_px'), batch.get('context_zoom'), batch.get('contact_px_zoom'))
         loss = self._compute_masked_loss(logits, f_labels, r_mask)
 
         self.val_loss(loss)
