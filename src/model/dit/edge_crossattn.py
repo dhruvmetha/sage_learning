@@ -62,7 +62,8 @@ class EdgeCrossAttn(nn.Module):
     def __init__(self, img_size=64, patch=4, in_channels=5, dim=192, scene_depth=4, edge_depth=4,
                  heads=6, num_depths=5, num_edges=60, dropout=0.0,
                  use_zoom=False, zoom_size=128, zoom_patch=4, zoom_depth=2, use_local=True,
-                 pos_fourier=False, fourier_L=8, use_edge_embed=False):
+                 pos_fourier=False, fourier_L=8, use_edge_embed=False,
+                 fine_stem=False, fine_stride=2):
         super().__init__()
         self.dim = dim; self.num_depths = num_depths; self.S = img_size; self.grid = img_size // patch
         self.num_edges = num_edges
@@ -87,6 +88,14 @@ class EdgeCrossAttn(nn.Module):
         self.use_local = use_local
         if use_local:
             self.local_proj = nn.Linear(dim, dim)
+        # DE-ALIASED gather (lit: aliasing agent's specific fix). Gather the per-edge local feature from a
+        # FINE stride-2 conv map (img_size/2 = 32x32) instead of the coarse 16x16 patch map. A sharper map
+        # means the bilinear sample at the contact pixel mixes in less of the neighbouring edges' content,
+        # so two nearby edges get more distinct local features. Cheap: one conv, no extra self-attn tokens.
+        self.fine_stem = fine_stem
+        if fine_stem:
+            self.fine_conv = nn.Conv2d(in_channels, dim, fine_stride, fine_stride)
+            self.fine_grid = img_size // fine_stride
         self.edge_blocks = nn.ModuleList([CrossBlock(dim, heads, drop=dropout) for _ in range(edge_depth)])
         self.edge_norm = nn.LayerNorm(dim)
         self.head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, num_depths))
@@ -125,6 +134,9 @@ class EdgeCrossAttn(nn.Module):
                 zt = self.zoom_norm(zt)
                 src = zt.transpose(1, 2).reshape(B, self.dim, self.zgrid, self.zgrid)
                 gg = (contact_px_zoom / self.zoom_size) * 2 - 1    # gather in the ZOOM frame
+            elif self.fine_stem:
+                src = self.fine_conv(x)                            # B,D,32,32 (de-aliased fine map)
+                gg = grid                                          # same [-1,1] WIDE coords, sharper sampling
             else:
                 src = tok.transpose(1, 2).reshape(B, self.dim, self.grid, self.grid)
                 gg = grid                                          # gather in the WIDE frame (original)
