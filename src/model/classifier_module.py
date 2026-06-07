@@ -76,6 +76,15 @@ class ClassifierModule(pl.LightningModule):
     - Validation logging
     """
 
+    # Precomputed same-face arc-neighbor lookup (edge -> list of (neighbor_edge, arc_distance)).
+    # Edge layout: 60 edges, 4 faces × 15 pts, interleaved parity.
+    #   even e <30: top face,   positions j = e//2     (e in {0,2,4,...,28})
+    #   odd  e <30: bottom face, positions j = e//2     (e in {1,3,5,...,29})
+    #   even e>=30: right face, positions j = (e-30)//2 (e in {30,32,...,58})
+    #   odd  e>=30: left face,  positions j = (e-30)//2 (e in {31,33,...,59})
+    # Same-face neighbors are e±2 (same parity, within [0,59]), arc distance = 1 per step.
+    _FACE_NEIGHBORS: list  # set in __init_subclass__ below; built once as a class-level cache
+
     def __init__(
         self,
         network: nn.Module,
@@ -90,6 +99,8 @@ class ClassifierModule(pl.LightningModule):
         focal_gamma: float = 2.0,
         dice_weight: float = 1.0,
         bce_reachable_only: bool = False,
+        soft_edge_sigma: float = 0.0,
+        soft_depth_sigma: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['network'])
@@ -115,6 +126,121 @@ class ClassifierModule(pl.LightningModule):
         # supervision is a useful auxiliary task or wasted capacity (we mask at inference anyway).
         self.bce_reachable_only = bce_reachable_only
 
+        # Soft Gaussian edge labels (CenterNet-style, sigma=0 → hard one-hot, identical to current).
+        # soft_edge_sigma  > 0 → spread credit to same-face arc-neighbors.
+        # soft_depth_sigma > 0 → spread credit to adjacent depths.
+        # Both must be > 0 to activate (guard against accidentally enabling only one axis).
+        self.soft_edge_sigma = soft_edge_sigma
+        self.soft_depth_sigma = soft_depth_sigma
+
+        # Build neighbor table once (class-level cache pattern)
+        ClassifierModule._build_face_neighbors()
+
+    @staticmethod
+    def _build_face_neighbors():
+        """Build same-face arc-neighbor table if not already built.
+
+        For each edge index e in [0,59], returns a list of (neighbor_e, arc_distance) tuples
+        for all in-face neighbors reachable within a generous radius (up to 7 steps covers the
+        full 15-point face). Stored as ClassifierModule._FACE_NEIGHBORS.
+        """
+        if hasattr(ClassifierModule, '_FACE_NEIGHBORS') and isinstance(
+                getattr(ClassifierModule, '_FACE_NEIGHBORS', None), list):
+            return  # already built
+
+        neighbors = []  # neighbors[e] = list of (neighbor_e, arc_dist)
+        for e in range(60):
+            nbrs = []
+            # Walk along the face in both directions (step = ±2 keeps same parity/face)
+            for direction in (+2, -2):
+                ne = e + direction
+                arc_dist = 1
+                while True:
+                    # Must stay in [0,59], same parity (same face within top/bottom or right/left)
+                    if ne < 0 or ne >= 60:
+                        break
+                    if ne % 2 != e % 2:
+                        break  # crossed face boundary (parity changed — impossible with ±2 steps but guard)
+                    # Check same half: {0..29} vs {30..59}
+                    if (ne < 30) != (e < 30):
+                        break  # crossed the top/bottom ↔ right/left boundary
+                    nbrs.append((ne, arc_dist))
+                    ne += direction
+                    arc_dist += 1
+            neighbors.append(nbrs)
+
+        ClassifierModule._FACE_NEIGHBORS = neighbors
+
+    def _build_soft_target(self, f_grid: torch.Tensor) -> torch.Tensor:
+        """Build soft Gaussian target from hard binary f_grid.
+
+        When soft_edge_sigma == soft_depth_sigma == 0 this is a no-op (returns f_grid unchanged).
+
+        Args:
+            f_grid: (B, 60, D) binary success labels in {0, 1}.
+
+        Returns:
+            soft_target: (B, 60, D) float in [0, 1] with same positives and smoothed neighbors.
+        """
+        if self.soft_edge_sigma <= 0.0 or self.soft_depth_sigma <= 0.0:
+            return f_grid  # identity — preserves E9 exact reproducibility
+
+        B, E, D = f_grid.shape  # E=60, D=5
+        device = f_grid.device
+
+        # We accumulate the maximum Gaussian weight over all positives.
+        # spread[b, e, d] = max over all positive (ep, dp) of gaussian(Δedge) * gaussian(Δdepth)
+        spread = torch.zeros_like(f_grid)
+
+        # Precompute depth Gaussian weights for all Δd = 0..D-1
+        depth_range = torch.arange(D, device=device, dtype=torch.float32)  # (D,)
+        # gaussian(Δd) for each source depth dp and each target depth d: shape (D, D)
+        # depth_gauss[dp, d] = exp(-(d - dp)^2 / (2 * sigma_d^2))
+        sigma_d = self.soft_depth_sigma
+        depth_delta = depth_range.unsqueeze(0) - depth_range.unsqueeze(1)  # (D, D): [dp, d]
+        depth_gauss = torch.exp(-(depth_delta ** 2) / (2.0 * sigma_d ** 2))  # (D, D)
+
+        sigma_e = self.soft_edge_sigma
+
+        for ep in range(E):
+            # Check if any sample has a positive at this edge (batched)
+            has_positive = (f_grid[:, ep, :] > 0.5)  # (B, D)
+            if not has_positive.any():
+                continue
+
+            # For the source edge ep itself: arc distance 0 → Gaussian weight = 1.0
+            # Combine with depth Gaussian: contribution[b, d] = sum over dp of positive[b,dp]*depth_gauss[dp,d]
+            # Then take max with existing spread.
+            # Arc weight for ep itself = exp(0) = 1.0
+            # contribution_ep[b, d] = 1.0 * sum_dp( f_grid[b,ep,dp] * depth_gauss[dp,d] )
+            # But we want elementwise max over positives, so weight per (dp) positive separately:
+            for dp in range(D):
+                pos_mask = f_grid[:, ep, dp] > 0.5  # (B,) bool
+                if not pos_mask.any():
+                    continue
+                # Contribution from positive at (ep, dp) to all (e_target, d_target):
+                # edge_weight(ep→e_target) * depth_gauss[dp, d_target]
+                # For source edge ep: edge_weight = 1.0 (arc_dist=0)
+                depth_contrib = depth_gauss[dp]  # (D,) weights for d=0..D-1
+                # Update spread for ep itself
+                contrib_ep = depth_contrib.unsqueeze(0)  # (1, D)
+                spread[:, ep, :] = torch.max(
+                    spread[:, ep, :],
+                    pos_mask.float().unsqueeze(1) * contrib_ep
+                )
+                # Update same-face arc-neighbors
+                for (ne, arc_dist) in ClassifierModule._FACE_NEIGHBORS[ep]:
+                    edge_weight = np.exp(-(arc_dist ** 2) / (2.0 * sigma_e ** 2))
+                    contrib = edge_weight * depth_contrib  # (D,)
+                    spread[:, ne, :] = torch.max(
+                        spread[:, ne, :],
+                        pos_mask.float().unsqueeze(1) * contrib.unsqueeze(0)
+                    )
+
+        # Positives always stay exactly 1.0; neighbors get partial credit in [0,1)
+        soft_target = torch.max(f_grid, spread)
+        return soft_target
+
     def forward(self, x: torch.Tensor, contact_px=None, x_zoom=None, contact_px_zoom=None) -> torch.Tensor:
         # dual-crop fields are passed only when present -> single-crop path is unchanged (DiT + EdgeCrossAttn)
         if x_zoom is not None:
@@ -131,11 +257,18 @@ class ClassifierModule(pl.LightningModule):
         (~67% positive among reachable), avoiding the collapse that happens when
         dice sees 93% zeros on all 600.
 
+        When soft_edge_sigma > 0 and soft_depth_sigma > 0, builds a soft Gaussian
+        target (same-face arc-neighbors and adjacent depths get partial credit) before
+        computing BCE. The Dice term still uses the soft target. When both sigmas are 0
+        (the default) behaviour is identical to the original hard-label BCE+Dice.
+
         Args:
-            logits: (B, 60, 10) raw predictions
-            labels: (B, 60, 10) binary labels (0=fail or unreachable, 1=success)
-            mask: (B, 60, 10) reachability mask (1=reachable, 0=unreachable)
+            logits: (B, 60, D) raw predictions
+            labels: (B, 60, D) binary labels (0=fail or unreachable, 1=success)
+            mask:   (B, 60, D) reachability mask (1=reachable, 0=unreachable)
         """
+        # Build soft target (no-op when sigmas are 0)
+        labels = self._build_soft_target(labels)
         B = logits.shape[0]
         logits_flat = logits.reshape(B, -1)   # (B, 600)
         labels_flat = labels.reshape(B, -1)   # (B, 600)

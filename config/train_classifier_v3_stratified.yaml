@@ -32,6 +32,8 @@ use_focal_loss: true
 focal_alpha: 0.25
 focal_gamma: 2.0
 dice_weight: 1.0
+soft_edge_sigma: 0.0
+soft_depth_sigma: 0.0
 
 defaults:
   - data: classifier_data_stratified   # ← key change vs V1b

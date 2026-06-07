@@ -1,6 +1,6 @@
-# E2b: bigger/longer per-edge cross-attention scorer (capacity lever).
-#   python src/train_classifier.py --config-name=train_scorer_edge_big data_dir=/scratch/dm1487/h5/v3_scorer_1push
-name: scorer_edge_e2b
+# E2: HACMan-faithful per-EDGE cross-attention scorer (60-edge "point cloud").
+#   python src/train_classifier.py --config-name=train_scorer_edge data_dir=/scratch/dm1487/h5/v3_scorer_1push
+name: scorer_edge_e3fine
 output_dir: /scratch/dm1487/sage_outputs/scorer/${name}
 
 data_dir: /scratch/dm1487/h5/v3_scorer_1push
@@ -9,16 +9,16 @@ num_workers: 8
 image_size: 64
 num_depths: 5
 
-max_epochs: 300
+max_epochs: 200
 check_val_every_n_epoch: 1
-early_stopping_patience: 30
+early_stopping_patience: 25
 log_every_n_steps: 50
 precision: 16-mixed
 
-base_lr: 0.0002        # slightly lower for the larger model
+base_lr: 0.0003
 end_lr: 0.000001
-warmup_steps: 800
-decay_steps: 150000
+warmup_steps: 500
+decay_steps: 100000
 weight_decay: 0.01
 
 use_local: true
@@ -35,4 +35,4 @@ soft_depth_sigma: 0.0
 defaults:
   - data: scorer_data
   - model: classifier
-  - network: edge_crossattn_big
+  - network: edge_crossattn_fine

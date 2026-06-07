@@ -37,6 +37,8 @@ use_focal_loss: false
 focal_alpha: 0.25
 focal_gamma: 2.0
 dice_weight: 1.0      # BCE-on-all + Dice-on-reachable
+soft_edge_sigma: 0.0
+soft_depth_sigma: 0.0
 
 defaults:
   - data: scorer_data
