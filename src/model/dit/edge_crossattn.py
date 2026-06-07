@@ -52,7 +52,7 @@ class CrossBlock(nn.Module):
 class EdgeCrossAttn(nn.Module):
     def __init__(self, img_size=64, patch=4, in_channels=5, dim=192, scene_depth=4, edge_depth=4,
                  heads=6, num_depths=5, num_edges=60, dropout=0.0,
-                 use_zoom=False, zoom_size=128, zoom_patch=4, zoom_depth=2):
+                 use_zoom=False, zoom_size=128, zoom_patch=4, zoom_depth=2, use_local=True):
         super().__init__()
         self.dim = dim; self.num_depths = num_depths; self.S = img_size; self.grid = img_size // patch
         npatch = self.grid ** 2
@@ -61,7 +61,13 @@ class EdgeCrossAttn(nn.Module):
         self.scene_blocks = nn.ModuleList([SelfBlock(dim, heads, drop=dropout) for _ in range(scene_depth)])
         self.scene_norm = nn.LayerNorm(dim)
         self.edge_pos = nn.Sequential(nn.Linear(2, dim), nn.GELU(), nn.Linear(dim, dim))  # positional id of contact (x,y)
-        self.local_proj = nn.Linear(dim, dim)
+        # ABLATION: use_local=False drops the per-edge LOCAL gather entirely -> edge token = positional-id
+        # (coordinate) + cross-attention to the scene only (the most HACMan-faithful "point = coord + context",
+        # no rasterized gather -> no aliasing). local_proj is created ONLY when use_local, so a no-gather ckpt
+        # has no local_proj keys and eval can auto-detect the variant.
+        self.use_local = use_local
+        if use_local:
+            self.local_proj = nn.Linear(dim, dim)
         self.edge_blocks = nn.ModuleList([CrossBlock(dim, heads, drop=dropout) for _ in range(edge_depth)])
         self.edge_norm = nn.LayerNorm(dim)
         self.head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, num_depths))
@@ -87,19 +93,22 @@ class EdgeCrossAttn(nn.Module):
             tok = blk(tok)
         tok = self.scene_norm(tok)                                 # scene tokens (context)
         grid = (contact_px / self.S) * 2 - 1                       # B,60,2 in [-1,1] (WIDE frame; the shared pos)
-        if self.use_zoom:
-            zt = self.zoom_patch(x_zoom) + self.zoom_pos           # zoom stem
-            for blk in self.zoom_blocks:
-                zt = blk(zt)
-            zt = self.zoom_norm(zt)
-            src = zt.transpose(1, 2).reshape(B, self.dim, self.zgrid, self.zgrid)
-            gg = (contact_px_zoom / self.zoom_size) * 2 - 1        # gather in the ZOOM frame
+        if self.use_local:
+            if self.use_zoom:
+                zt = self.zoom_patch(x_zoom) + self.zoom_pos       # zoom stem
+                for blk in self.zoom_blocks:
+                    zt = blk(zt)
+                zt = self.zoom_norm(zt)
+                src = zt.transpose(1, 2).reshape(B, self.dim, self.zgrid, self.zgrid)
+                gg = (contact_px_zoom / self.zoom_size) * 2 - 1    # gather in the ZOOM frame
+            else:
+                src = tok.transpose(1, 2).reshape(B, self.dim, self.grid, self.grid)
+                gg = grid                                          # gather in the WIDE frame (original)
+            gathered = F.grid_sample(src, gg.unsqueeze(1), align_corners=False, mode="bilinear", padding_mode="border")
+            gathered = gathered.squeeze(2).transpose(1, 2)         # B,60,D  (local feature per edge)
+            e = self.local_proj(gathered) + self.edge_pos(grid)    # B,60,D  (local + positional id)
         else:
-            src = tok.transpose(1, 2).reshape(B, self.dim, self.grid, self.grid)
-            gg = grid                                              # gather in the WIDE frame (original)
-        gathered = F.grid_sample(src, gg.unsqueeze(1), align_corners=False, mode="bilinear", padding_mode="border")
-        gathered = gathered.squeeze(2).transpose(1, 2)             # B,60,D  (local feature per edge)
-        e = self.local_proj(gathered) + self.edge_pos(grid)        # B,60,D  (+ positional id, WIDE frame)
+            e = self.edge_pos(grid)                                # NO-GATHER: positional id (coordinate) only
         for blk in self.edge_blocks:
             e = blk(e, tok)                                        # cross-attend WIDE scene + self-attend edges
         e = self.edge_norm(e)
