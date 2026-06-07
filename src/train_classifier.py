@@ -26,8 +26,8 @@ except ImportError:
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
 
-    # Seed
-    pl.seed_everything(42, workers=True)
+    # Seed (configurable for seed-variance runs; data split stays fixed at 0 in the datamodule)
+    pl.seed_everything(int(cfg.get("seed", 42)), workers=True)
 
     # Data
     data_module = hydra.utils.instantiate(cfg.data)
@@ -84,8 +84,8 @@ def main(cfg: DictConfig):
         default_root_dir=cfg.get('output_dir', 'outputs'),
     )
 
-    # Train
-    trainer.fit(model, data_module)
+    # Train (optional warm-start: +resume_from=/path/to.ckpt restores weights+optimizer+epoch)
+    trainer.fit(model, data_module, ckpt_path=cfg.get("resume_from", None))
 
     print(f"\nTraining complete!")
     print(f"Best model: {trainer.checkpoint_callback.best_model_path}")
