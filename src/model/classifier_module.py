@@ -101,6 +101,7 @@ class ClassifierModule(pl.LightningModule):
         bce_reachable_only: bool = False,
         soft_edge_sigma: float = 0.0,
         soft_depth_sigma: float = 0.0,
+        head_mode: str = "sigmoid_bce",
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['network'])
@@ -132,6 +133,17 @@ class ClassifierModule(pl.LightningModule):
         # Both must be > 0 to activate (guard against accidentally enabling only one axis).
         self.soft_edge_sigma = soft_edge_sigma
         self.soft_depth_sigma = soft_depth_sigma
+
+        # H1 FRAMING ablation (policy_framework journal): how the (60,D) head is trained.
+        #   sigmoid_bce (default) — per-cell independent value (the scorer; BCE+Dice, unchanged).
+        #   softmax_ce            — POLICY: one distribution over cells (AlphaZero-style). Target =
+        #     f_grid (optionally soft-blurred) normalized over the loss_mask cells; logits masked to
+        #     -inf outside loss_mask (legal-move masking); loss = cross-entropy. Dice not applicable.
+        #     Samples with no positive cell are skipped (a policy needs a target distribution).
+        # Ranking metrics are head-agnostic: softmax is monotone in logits, so eval_scorer's
+        # argmax/top-k read the same either way.
+        assert head_mode in ("sigmoid_bce", "softmax_ce"), head_mode
+        self.head_mode = head_mode
 
         # Build neighbor table once (class-level cache pattern)
         ClassifierModule._build_face_neighbors()
@@ -273,6 +285,21 @@ class ClassifierModule(pl.LightningModule):
         logits_flat = logits.reshape(B, -1)   # (B, 600)
         labels_flat = labels.reshape(B, -1)   # (B, 600)
         mask_flat = mask.reshape(B, -1)       # (B, 600)
+
+        if self.head_mode == "softmax_ce":
+            # POLICY framing: cross-entropy between the normalized target distribution and a
+            # softmax over the masked (legal) cells. Multimodal targets are fine (several 1s →
+            # uniform over solutions; soft blur → smeared distribution over the contact manifold).
+            masked_logits = logits_flat.masked_fill(mask_flat <= 0, float("-inf"))
+            logp = torch.log_softmax(masked_logits, dim=1)
+            tgt = labels_flat * mask_flat
+            tgt_sum = tgt.sum(dim=1, keepdim=True)
+            valid = (tgt_sum.squeeze(1) > 0)              # need >=1 positive to define a distribution
+            if not valid.any():
+                return logits_flat.sum() * 0.0            # keep graph; no defined target this batch
+            p = tgt[valid] / tgt_sum[valid]
+            ce = -(p * logp[valid].clamp(min=-30.0)).sum(dim=1)   # clamp guards -inf*0 -> nan
+            return ce.mean()
 
         # BCE: on all 600 (default — also supervises unreachable=0), or reachable-only (ablation).
         if self.use_focal_loss:
