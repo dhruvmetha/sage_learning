@@ -399,9 +399,12 @@ class ClassifierModule(pl.LightningModule):
         context = batch['context']      # (B, C, H, W)
         f_labels = batch['f_labels']    # (B, 60, 10)
         r_mask = batch['r_mask']        # (B, 60, 10)
+        # H5-sampling ablation: loss_mask = the cells actually "tried" (== r_mask when exhaustive).
+        # Requires bce_reachable_only=true when loss_mask != r_mask (else the all-600 BCE leaks).
+        loss_mask = batch.get('loss_mask', r_mask)
 
         logits = self(context, batch.get('contact_px'), batch.get('context_zoom'), batch.get('contact_px_zoom'))  # (B, 60, num_depths)
-        loss = self._compute_masked_loss(logits, f_labels, r_mask)
+        loss = self._compute_masked_loss(logits, f_labels, loss_mask)
 
         self.train_loss(loss)
         self.log('train_loss', self.train_loss, on_step=True, on_epoch=True,

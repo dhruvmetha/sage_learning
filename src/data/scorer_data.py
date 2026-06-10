@@ -20,9 +20,23 @@ from torch.utils.data import Dataset, DataLoader
 
 
 class ScorerH5Dataset(Dataset):
-    def __init__(self, h5_path: str, indices: List[int]):
+    def __init__(self, h5_path: str, indices: List[int],
+                 sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0):
+        """sample_k / unsampled_negative: the H5 sampling ablation (policy_framework journal).
+
+        Simulates NON-exhaustive collection: per row, only `sample_k` of the reachable cells were
+        "tried" (deterministic per (sample_seed,row)); the rest are UNKNOWN, not negative.
+          sample_k=0 (default)            -> exhaustive (current behavior); loss_mask = r_mask.
+          sample_k>0, masked              -> loss_mask = the k sampled cells (labels untouched).
+          sample_k>0 + unsampled_negative -> the PU-bug baseline: unsampled cells stay IN the loss
+                                             (loss_mask = r_mask) with label forced to 0 (false negs).
+        Train-time only (the datamodule never passes sample_k to the val split). Such runs MUST set
+        bce_reachable_only=true so the BCE respects loss_mask (the all-600 BCE would leak labels)."""
         self.h5_path = h5_path
         self.indices = indices
+        self.sample_k = int(sample_k)
+        self.unsampled_negative = bool(unsampled_negative)
+        self.sample_seed = int(sample_seed)
         self._h5 = None  # opened lazily per worker (h5py is not fork-safe)
 
     def __len__(self):
@@ -43,10 +57,26 @@ class ScorerH5Dataset(Dataset):
         # candidates at inference (robot can reach that contact point). Used by the realistic eval mask.
         cp = np.zeros_like(r_mask)
         cp[(r_mask.sum(axis=1) > 0)] = 1.0
+        loss_mask = r_mask
+        if self.sample_k > 0:
+            # deterministic per (sample_seed, row) so every epoch sees the SAME sampled subset
+            rng = np.random.default_rng(self.sample_seed * 1_000_003 + i)
+            reach = np.argwhere(r_mask > 0)
+            kk = min(self.sample_k, len(reach))
+            smask = np.zeros_like(r_mask)
+            if kk > 0:
+                pick = reach[rng.choice(len(reach), size=kk, replace=False)]
+                smask[pick[:, 0], pick[:, 1]] = 1.0
+            if self.unsampled_negative:
+                f_grid = f_grid * smask     # unsampled positives become 0 = FALSE negatives (the bug)
+                loss_mask = r_mask          # ...and stay in the loss
+            else:
+                loss_mask = smask           # masked: loss only on what was actually tried
         out = {
             "context": ctx,
             "f_labels": torch.from_numpy(f_grid),
             "r_mask": torch.from_numpy(r_mask),
+            "loss_mask": torch.from_numpy(loss_mask),
             "cp_reachable": torch.from_numpy(cp),
             "ratio": float(f["ratio"][i]),
         }
@@ -60,13 +90,19 @@ class ScorerH5Dataset(Dataset):
 
 class ScorerDataModule(pl.LightningDataModule):
     def __init__(self, data_dir: str, batch_size: int = 64, num_workers: int = 4,
-                 image_size: int = 64, train_split: float = 0.9, pin_memory: bool = True, **_):
+                 image_size: int = 64, train_split: float = 0.9, pin_memory: bool = True,
+                 sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0, **_):
         super().__init__()
         self.h5_path = data_dir if data_dir.endswith(".h5") else f"{data_dir}/data.h5"
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.train_split = train_split
         self.pin_memory = pin_memory
+        # H5 sampling ablation — applied to the TRAIN split only (val stays exhaustive so
+        # val_loss/val metrics are comparable across sampling conditions).
+        self.sample_k = sample_k
+        self.unsampled_negative = unsampled_negative
+        self.sample_seed = sample_seed
         self.train_dataset = None
         self.val_dataset = None
 
@@ -89,7 +125,14 @@ class ScorerDataModule(pl.LightningDataModule):
                 val_idx += groups[k]
         print(f"[scorer setup] n={n} rooms={len(groups)} train={len(train_idx)} val={len(val_idx)} "
               f"(room-grouped, 0 scenes straddle)", flush=True)
-        self.train_dataset = ScorerH5Dataset(self.h5_path, train_idx)
+        if self.sample_k > 0:
+            print(f"[scorer setup] H5-SAMPLING ablation: sample_k={self.sample_k} "
+                  f"unsampled_negative={self.unsampled_negative} sample_seed={self.sample_seed} "
+                  f"(train split only)", flush=True)
+        self.train_dataset = ScorerH5Dataset(self.h5_path, train_idx,
+                                             sample_k=self.sample_k,
+                                             unsampled_negative=self.unsampled_negative,
+                                             sample_seed=self.sample_seed)
         self.val_dataset = ScorerH5Dataset(self.h5_path, val_idx)
 
     def train_dataloader(self):
