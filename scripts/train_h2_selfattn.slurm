@@ -16,7 +16,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=06:00:00
-#SBATCH --array=0-5
+#SBATCH --array=0-8
 #SBATCH --output=/scratch/dm1487/logs/h2attn-%A_%a.out
 #SBATCH --error=/scratch/dm1487/logs/h2attn-%A_%a.err
 
@@ -33,6 +33,7 @@ SEED=$(( IDX % 3 + 1 ))
 case $COND in
   0) NAME="h2_noattn_exh"; EXTRA="+data.sample_k=0" ;;
   1) NAME="h2_noattn_k15"; EXTRA="+data.sample_k=15" ;;
+  2) NAME="h2_noattn_k30"; EXTRA="+data.sample_k=30" ;;   # [USER] operating-point arm (ON baseline = h5samp_B30)
 esac
 RUN="${NAME}_s${SEED}"
 EPOCHS=${EPOCHS:-200}
