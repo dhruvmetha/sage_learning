@@ -44,17 +44,24 @@ class SelfBlock(nn.Module):
 
 
 class CrossBlock(nn.Module):
-    """edge tokens: cross-attend to scene, then self-attend among edges, then MLP."""
-    def __init__(self, dim, heads, mlp=4.0, drop=0.0):
+    """edge tokens: cross-attend to scene, then (optionally) self-attend among edges, then MLP.
+
+    self_attn=False (H2 ablation) -> edges are scored INDEPENDENTLY given the scene: no inter-edge
+    information flow anywhere in the network (the module is not even constructed). [USER] hypothesis:
+    under sparse/masked labels, independent edges should hold up better (no co-adaptation channel)."""
+    def __init__(self, dim, heads, mlp=4.0, drop=0.0, self_attn=True):
         super().__init__()
         self.n1 = nn.LayerNorm(dim); self.cross = nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
-        self.n2 = nn.LayerNorm(dim); self.slf = nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
+        self.self_attn = self_attn
+        if self_attn:
+            self.n2 = nn.LayerNorm(dim); self.slf = nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
         self.n3 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(nn.Linear(dim, int(dim * mlp)), nn.GELU(), nn.Linear(int(dim * mlp), dim))
 
     def forward(self, e, scene):
         h = self.n1(e); e = e + self.cross(h, scene, scene)[0]
-        h = self.n2(e); e = e + self.slf(h, h, h)[0]
+        if self.self_attn:
+            h = self.n2(e); e = e + self.slf(h, h, h)[0]
         e = e + self.mlp(self.n3(e)); return e
 
 
@@ -63,7 +70,7 @@ class EdgeCrossAttn(nn.Module):
                  heads=6, num_depths=5, num_edges=60, dropout=0.0,
                  use_zoom=False, zoom_size=128, zoom_patch=4, zoom_depth=2, use_local=True,
                  pos_fourier=False, fourier_L=8, use_edge_embed=False,
-                 fine_stem=False, fine_stride=2):
+                 fine_stem=False, fine_stride=2, edge_self_attn=True):
         super().__init__()
         self.dim = dim; self.num_depths = num_depths; self.S = img_size; self.grid = img_size // patch
         self.num_edges = num_edges
@@ -96,7 +103,8 @@ class EdgeCrossAttn(nn.Module):
         if fine_stem:
             self.fine_conv = nn.Conv2d(in_channels, dim, fine_stride, fine_stride)
             self.fine_grid = img_size // fine_stride
-        self.edge_blocks = nn.ModuleList([CrossBlock(dim, heads, drop=dropout) for _ in range(edge_depth)])
+        self.edge_blocks = nn.ModuleList([CrossBlock(dim, heads, drop=dropout, self_attn=edge_self_attn)
+                                          for _ in range(edge_depth)])
         self.edge_norm = nn.LayerNorm(dim)
         self.head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, num_depths))
         # OPTIONAL dual-crop: a second light stem over a tight zoom crop, from which the per-edge LOCAL
