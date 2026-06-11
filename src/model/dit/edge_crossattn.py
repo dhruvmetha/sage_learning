@@ -70,10 +70,17 @@ class EdgeCrossAttn(nn.Module):
                  heads=6, num_depths=5, num_edges=60, dropout=0.0,
                  use_zoom=False, zoom_size=128, zoom_patch=4, zoom_depth=2, use_local=True,
                  pos_fourier=False, fourier_L=8, use_edge_embed=False,
-                 fine_stem=False, fine_stride=2, edge_self_attn=True):
+                 fine_stem=False, fine_stride=2, edge_self_attn=True,
+                 budget_cond=False, max_budget=3, value_bins=0):
         super().__init__()
         self.dim = dim; self.num_depths = num_depths; self.S = img_size; self.grid = img_size // patch
         self.num_edges = num_edges
+        # BUDGET-CONDITIONED HORIZON-Q (horizon_q_build_journal.md): the same map answers Q(s,a,H) for a
+        # remaining push budget H. budget_cond=True adds an H embedding to every edge token (UVFA/Decision-
+        # Transformer-style conditioning). value_bins>0 switches the per-(edge,depth) head from a single
+        # sigmoid logit to a HL-Gauss classification over `value_bins` bins of [0,1] (Stop-Regressing 2403.03950
+        # — classification value heads beat regression). Both default OFF -> forward is byte-identical to E2/E4.
+        self.budget_cond = budget_cond; self.value_bins = value_bins; self.max_budget = max_budget
         npatch = self.grid ** 2
         self.patch = PatchEmbed(in_channels, patch, dim)
         self.scene_pos = nn.Parameter(torch.randn(1, npatch, dim) * 0.02)
@@ -88,6 +95,8 @@ class EdgeCrossAttn(nn.Module):
         self.use_edge_embed = use_edge_embed
         if use_edge_embed:
             self.edge_embed = nn.Embedding(num_edges, dim)
+        if budget_cond:
+            self.budget_embed = nn.Embedding(max_budget + 1, dim)   # H in {0..max_budget}; index by remaining budget
         # ABLATION: use_local=False drops the per-edge LOCAL gather entirely -> edge token = positional-id
         # (coordinate) + cross-attention to the scene only (the most HACMan-faithful "point = coord + context",
         # no rasterized gather -> no aliasing). local_proj is created ONLY when use_local, so a no-gather ckpt
@@ -106,7 +115,8 @@ class EdgeCrossAttn(nn.Module):
         self.edge_blocks = nn.ModuleList([CrossBlock(dim, heads, drop=dropout, self_attn=edge_self_attn)
                                           for _ in range(edge_depth)])
         self.edge_norm = nn.LayerNorm(dim)
-        self.head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, num_depths))
+        head_out = num_depths * value_bins if value_bins > 0 else num_depths
+        self.head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, head_out))
         # OPTIONAL dual-crop: a second light stem over a tight zoom crop, from which the per-edge LOCAL
         # feature is gathered (de-aliased). OFF by default -> forward is byte-identical to the single-crop
         # model, so E2/E4 reproduce exactly. Context (cross-attn to the wide scene tokens) is unchanged;
@@ -119,8 +129,8 @@ class EdgeCrossAttn(nn.Module):
             self.zoom_blocks = nn.ModuleList([SelfBlock(dim, heads, drop=dropout) for _ in range(zoom_depth)])
             self.zoom_norm = nn.LayerNorm(dim)
 
-    def forward(self, x, contact_px, x_zoom=None, contact_px_zoom=None):
-        """x: (B,5,H,W); contact_px: (B,60,2) px in the HxW (wide) frame.
+    def forward(self, x, contact_px, x_zoom=None, contact_px_zoom=None, H=None):
+        """x: (B,5,H,W); contact_px: (B,60,2) px in the HxW (wide) frame. H: (B,) long remaining-budget (budget_cond).
         Dual-crop (use_zoom): x_zoom (B,5,Z,Z) tight object crop + contact_px_zoom (B,60,2) px in the ZZ frame —
         the LOCAL feature is gathered from the zoom map; positional id + context still use the wide frame."""
         B = x.size(0)
@@ -153,7 +163,12 @@ class EdgeCrossAttn(nn.Module):
             e = self.local_proj(gathered) + pos                    # B,60,D  (local + positional id)
         else:
             e = pos                                                # NO-GATHER: positional id only
+        if self.budget_cond and H is not None:
+            e = e + self.budget_embed(H).unsqueeze(1)              # (B,1,D) remaining-budget id, broadcast over 60 edges
         for blk in self.edge_blocks:
             e = blk(e, tok)                                        # cross-attend WIDE scene + self-attend edges
         e = self.edge_norm(e)
-        return self.head(e)                                        # B,60,num_depths
+        out = self.head(e)                                         # B,60,(num_depths | num_depths*value_bins)
+        if self.value_bins > 0:
+            out = out.view(B, self.num_edges, self.num_depths, self.value_bins)  # B,60,nd,bins (HL-Gauss logits)
+        return out                                                 # B,60,nd  or  B,60,nd,bins
