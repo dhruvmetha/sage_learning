@@ -59,4 +59,51 @@ for v in [0.0, 0.9, 1.0]:
     recon = (t * hl.bin_centers).sum().item()
     print(f"  y={v:.2f} -> soft-hist E[bin]={recon:.4f}")
 
+print("\n=== (D) FULL TRAINING PATH: ClassifierModule(head_mode=hl_gauss) train+val steps ===")
+from src.model.classifier_module import ClassifierModule
+mod = ClassifierModule(network=EdgeCrossAttn(pos_fourier=True, use_edge_embed=True, edge_self_attn=True,
+                                             budget_cond=True, max_budget=3, value_bins=BINS),
+                       head_mode="hl_gauss", bce_reachable_only=True)
+batch = {"context": x, "f_labels": y, "r_mask": mask, "loss_mask": mask,
+         "contact_px": cpx, "H": Hbud, "ratio": torch.full((B,), 0.5)}
+tl = mod.training_step(batch, 0)
+tl.backward()
+assert torch.isfinite(tl), tl
+print(f"  training_step loss = {tl.item():.4f}, backward OK")
+with torch.no_grad():
+    vl = mod.validation_step(batch, 0)
+assert torch.isfinite(vl), vl
+print(f"  validation_step loss = {vl.item():.4f} (metrics ranked on E[bin] values)")
+
+print("\n=== (E) backward-compat: default ClassifierModule batch path unchanged (no H key) ===")
+mod0 = ClassifierModule(network=EdgeCrossAttn(pos_fourier=True, use_edge_embed=True, edge_self_attn=True),
+                        bce_reachable_only=True)
+batch0 = {"context": x, "f_labels": (y > 0).float(), "r_mask": mask, "loss_mask": mask,
+          "contact_px": cpx, "ratio": torch.full((B,), 0.5)}
+tl0 = mod0.training_step(batch0, 0)
+assert torch.isfinite(tl0), tl0
+print(f"  default sigmoid_bce training_step loss = {tl0.item():.4f} — H absent, path unchanged")
+
+print("\n=== (F) scorer_data budget_h flag (H from H5 'H' dataset, else 1) ===")
+import tempfile, h5py, numpy as np
+from src.data.scorer_data import ScorerH5Dataset
+with tempfile.NamedTemporaryFile(suffix=".h5") as tf:
+    with h5py.File(tf.name, "w") as f:
+        f["ctx"] = np.random.rand(3, 5, 64, 64).astype(np.float32)
+        f["f_grid"] = np.random.randint(0, 2, (3, 60, 5)).astype(np.float32)
+        f["r_mask"] = np.ones((3, 60, 5), np.float32)
+        f["ratio"] = np.full(3, 0.5, np.float32)
+        f["contact_px"] = np.random.rand(3, 60, 2).astype(np.float32)
+    d_off = ScorerH5Dataset(tf.name, [0, 1, 2])
+    assert "H" not in d_off[0], "budget_h off must not emit H"
+    d_on = ScorerH5Dataset(tf.name, [0, 1, 2], budget_h=True)
+    assert d_on[0]["H"].item() == 1, "no H5 'H' dataset -> default 1"
+    d_off._h5.close(); d_on._h5.close()
+    with h5py.File(tf.name, "a") as f:
+        f["H"] = np.array([1, 2, 2], np.int8)
+    d_on2 = ScorerH5Dataset(tf.name, [0, 1, 2], budget_h=True)
+    assert [d_on2[k]["H"].item() for k in range(3)] == [1, 2, 2], "per-row H from H5"
+    d_on2._h5.close()
+print("  budget_h off: no H key | on: H=1 default | on+H5 'H': per-row values — OK")
+
 print("\nSMOKE TEST PASSED ✓")

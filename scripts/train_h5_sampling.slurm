@@ -42,7 +42,7 @@ case $COND in
 esac
 RUN="${NAME}_s${SEED}"
 EPOCHS=${EPOCHS:-200}
-if [ "${SMOKE:-0}" = "1" ]; then RUN="${RUN}_smoke"; EPOCHS=2; fi
+if [ "${SMOKE:-0}" = "1" ]; then RUN="${RUN}_smoke"; EPOCHS=${SMOKE_EPOCHS:-2}; fi   # SMOKE_EPOCHS: keep the real LR horizon (e.g. 200) for schedule-matched smokes; cap wall-time to stop early
 OUT=/scratch/dm1487/sage_outputs/scorer/${RUN}
 mkdir -p "$OUT" /scratch/dm1487/logs
 

@@ -13,6 +13,8 @@ from torchmetrics import MeanMetric
 from typing import Dict, Any, Optional
 import numpy as np
 
+from src.model.hl_gauss import HLGauss
+
 
 class ConvBlock(nn.Module):
     """Conv2d + BatchNorm + ReLU + MaxPool."""
@@ -140,10 +142,15 @@ class ClassifierModule(pl.LightningModule):
         #     f_grid (optionally soft-blurred) normalized over the loss_mask cells; logits masked to
         #     -inf outside loss_mask (legal-move masking); loss = cross-entropy. Dice not applicable.
         #     Samples with no positive cell are skipped (a policy needs a target distribution).
+        #   hl_gauss              — BUDGET-Q VALUE (horizon_q_build_journal.md §4): network must emit
+        #     (B,60,nd,bins) (EdgeCrossAttn value_bins>0); labels are gamma-discounted targets in [0,1]
+        #     (H=1: == f_grid); loss = masked CE to the Gaussian-smoothed histogram (Stop-Regressing
+        #     2403.03950). Inference value = E[bin]; rankings unchanged under the monotone map.
         # Ranking metrics are head-agnostic: softmax is monotone in logits, so eval_scorer's
         # argmax/top-k read the same either way.
-        assert head_mode in ("sigmoid_bce", "softmax_ce"), head_mode
+        assert head_mode in ("sigmoid_bce", "softmax_ce", "hl_gauss"), head_mode
         self.head_mode = head_mode
+        self._hl_gauss: Optional[HLGauss] = None   # built lazily from the head's bin count
 
         # Build neighbor table once (class-level cache pattern)
         ClassifierModule._build_face_neighbors()
@@ -253,11 +260,13 @@ class ClassifierModule(pl.LightningModule):
         soft_target = torch.max(f_grid, spread)
         return soft_target
 
-    def forward(self, x: torch.Tensor, contact_px=None, x_zoom=None, contact_px_zoom=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, contact_px=None, x_zoom=None, contact_px_zoom=None, H=None) -> torch.Tensor:
         # dual-crop fields are passed only when present -> single-crop path is unchanged (DiT + EdgeCrossAttn)
+        # H (B,) long: remaining push budget, passed only when present (budget-conditioned EdgeCrossAttn)
+        kw = {} if H is None else {"H": H}
         if x_zoom is not None:
-            return self.network(x, contact_px, x_zoom, contact_px_zoom)
-        return self.network(x, contact_px)
+            return self.network(x, contact_px, x_zoom, contact_px_zoom, **kw)
+        return self.network(x, contact_px, **kw)
 
     def _compute_masked_loss(self, logits: torch.Tensor,
                               labels: torch.Tensor,
@@ -279,6 +288,13 @@ class ClassifierModule(pl.LightningModule):
             labels: (B, 60, D) binary labels (0=fail or unreachable, 1=success)
             mask:   (B, 60, D) reachability mask (1=reachable, 0=unreachable)
         """
+        if self.head_mode == "hl_gauss":
+            # logits (B,60,nd,bins); labels = gamma targets in [0,1] (NOT soft-blurred — they are
+            # already real-valued); masked CE to the Gaussian-smoothed histogram.
+            if self._hl_gauss is None or self._hl_gauss.num_bins != logits.shape[-1]:
+                self._hl_gauss = HLGauss(num_bins=logits.shape[-1])
+            return self._hl_gauss.loss(logits, labels, mask)
+
         # Build soft target (no-op when sigmas are 0)
         labels = self._build_soft_target(labels)
         B = logits.shape[0]
@@ -430,7 +446,8 @@ class ClassifierModule(pl.LightningModule):
         # Requires bce_reachable_only=true when loss_mask != r_mask (else the all-600 BCE leaks).
         loss_mask = batch.get('loss_mask', r_mask)
 
-        logits = self(context, batch.get('contact_px'), batch.get('context_zoom'), batch.get('contact_px_zoom'))  # (B, 60, num_depths)
+        logits = self(context, batch.get('contact_px'), batch.get('context_zoom'), batch.get('contact_px_zoom'),
+                      H=batch.get('H'))  # (B, 60, num_depths) — or (B, 60, nd, bins) for hl_gauss
         loss = self._compute_masked_loss(logits, f_labels, loss_mask)
 
         self.train_loss(loss)
@@ -444,13 +461,17 @@ class ClassifierModule(pl.LightningModule):
         r_mask = batch['r_mask']
         ratios = batch.get('ratio', None)
 
-        logits = self(context, batch.get('contact_px'), batch.get('context_zoom'), batch.get('contact_px_zoom'))
+        logits = self(context, batch.get('contact_px'), batch.get('context_zoom'), batch.get('contact_px_zoom'),
+                      H=batch.get('H'))
         loss = self._compute_masked_loss(logits, f_labels, r_mask)
 
         self.val_loss(loss)
         self.log('val_loss', self.val_loss, on_epoch=True, prog_bar=True)
 
-        # Top-k accuracy overall + per difficulty
+        # Top-k accuracy overall + per difficulty. hl_gauss: rank by E[bin] values — _compute_metrics
+        # applies sigmoid internally, which is monotone, so top-k over values is unchanged.
+        if self.head_mode == "hl_gauss":
+            logits = self._hl_gauss.value(logits)
         metrics = self._compute_metrics(logits, f_labels, r_mask, ratios=ratios)
         for k, v in metrics.items():
             prog = k in ('top1_acc', 'top5_acc')

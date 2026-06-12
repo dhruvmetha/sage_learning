@@ -21,7 +21,8 @@ from torch.utils.data import Dataset, DataLoader
 
 class ScorerH5Dataset(Dataset):
     def __init__(self, h5_path: str, indices: List[int],
-                 sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0):
+                 sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0,
+                 budget_h: bool = False):
         """sample_k / unsampled_negative: the H5 sampling ablation (policy_framework journal).
 
         Simulates NON-exhaustive collection: per row, only `sample_k` of the reachable cells were
@@ -31,12 +32,17 @@ class ScorerH5Dataset(Dataset):
           sample_k>0 + unsampled_negative -> the PU-bug baseline: unsampled cells stay IN the loss
                                              (loss_mask = r_mask) with label forced to 0 (false negs).
         Train-time only (the datamodule never passes sample_k to the val split). Such runs MUST set
-        bce_reachable_only=true so the BCE respects loss_mask (the all-600 BCE would leak labels)."""
+        bce_reachable_only=true so the BCE respects loss_mask (the all-600 BCE would leak labels).
+
+        budget_h (horizon-Q): emit batch['H'] = the row's remaining push budget — from the H5's 'H'
+        dataset when present (mixed-H training sets), else 1 (pure H=1 sets, where the gamma target
+        equals f_grid). Default off = batch dict unchanged."""
         self.h5_path = h5_path
         self.indices = indices
         self.sample_k = int(sample_k)
         self.unsampled_negative = bool(unsampled_negative)
         self.sample_seed = int(sample_seed)
+        self.budget_h = bool(budget_h)
         self._h5 = None  # opened lazily per worker (h5py is not fork-safe)
 
     def __len__(self):
@@ -80,6 +86,9 @@ class ScorerH5Dataset(Dataset):
             "cp_reachable": torch.from_numpy(cp),
             "ratio": float(f["ratio"][i]),
         }
+        if self.budget_h:       # horizon-Q: remaining push budget for this row (H-conditioned forward)
+            h_val = int(f["H"][i]) if "H" in f else 1
+            out["H"] = torch.tensor(h_val, dtype=torch.long)
         if "contact_px" in f:   # (60,2) pixel coords of each edge's contact point (for per-edge models)
             out["contact_px"] = torch.from_numpy(f["contact_px"][i].astype(np.float32))
         if "context_zoom" in f:  # dual-crop: tight object crop + its contact pixels (for use_zoom models)
@@ -91,7 +100,8 @@ class ScorerH5Dataset(Dataset):
 class ScorerDataModule(pl.LightningDataModule):
     def __init__(self, data_dir: str, batch_size: int = 64, num_workers: int = 4,
                  image_size: int = 64, train_split: float = 0.9, pin_memory: bool = True,
-                 sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0, **_):
+                 sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0,
+                 budget_h: bool = False, **_):
         super().__init__()
         self.h5_path = data_dir if data_dir.endswith(".h5") else f"{data_dir}/data.h5"
         self.batch_size = batch_size
@@ -103,6 +113,7 @@ class ScorerDataModule(pl.LightningDataModule):
         self.sample_k = sample_k
         self.unsampled_negative = unsampled_negative
         self.sample_seed = sample_seed
+        self.budget_h = budget_h   # horizon-Q: emit batch['H'] (train AND val — the model is H-conditioned)
         self.train_dataset = None
         self.val_dataset = None
 
@@ -132,8 +143,9 @@ class ScorerDataModule(pl.LightningDataModule):
         self.train_dataset = ScorerH5Dataset(self.h5_path, train_idx,
                                              sample_k=self.sample_k,
                                              unsampled_negative=self.unsampled_negative,
-                                             sample_seed=self.sample_seed)
-        self.val_dataset = ScorerH5Dataset(self.h5_path, val_idx)
+                                             sample_seed=self.sample_seed,
+                                             budget_h=self.budget_h)
+        self.val_dataset = ScorerH5Dataset(self.h5_path, val_idx, budget_h=self.budget_h)
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True,
