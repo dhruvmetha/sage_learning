@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 class ScorerH5Dataset(Dataset):
     def __init__(self, h5_path: str, indices: List[int],
                  sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0,
-                 budget_h: bool = False):
+                 budget_h: bool = False, unreachable_k: int = 0, emit_reach_flag: bool = False):
         """sample_k / unsampled_negative: the H5 sampling ablation (policy_framework journal).
 
         Simulates NON-exhaustive collection: per row, only `sample_k` of the reachable cells were
@@ -36,13 +36,26 @@ class ScorerH5Dataset(Dataset):
 
         budget_h (horizon-Q): emit batch['H'] = the row's remaining push budget — from the H5's 'H'
         dataset when present (mixed-H training sets), else 1 (pure H=1 sets, where the gamma target
-        equals f_grid). Default off = batch dict unchanged."""
+        equals f_grid). Default off = batch dict unchanged.
+
+        unreachable_k (M2c, [USER] hypothesis: reachability supervision sharpens the encoder): ADD k
+        uniformly-sampled UNREACHABLE cells (r_mask==0) to the loss mask with target 0 — executability is
+        a KNOWN fact (f_grid already stores 0 there). Applied AFTER sample_k, so the reachable-side
+        supervision is byte-identical to the base recipe (e.g. B30): mask = S30 ∪ S20. Deterministic per
+        (sample_seed,row) like B30. ONLY valid when tried == reachable (exhaustive-over-reachable rows);
+        under sampled rows the complement holds reachable-but-untried cells (zeroing = the C15 bug).
+        Distinct from unsampled_negative (which falsely zeroes sampled-REACHABLE cells — the bug arm).
+
+        emit_reach_flag (M2d): emit batch['reach_edges'] (60,) long — 1 iff ANY depth of the edge is in
+        r_mask (contact point reachable) — for the reachability-input-flag network variant."""
         self.h5_path = h5_path
         self.indices = indices
         self.sample_k = int(sample_k)
         self.unsampled_negative = bool(unsampled_negative)
         self.sample_seed = int(sample_seed)
         self.budget_h = bool(budget_h)
+        self.unreachable_k = int(unreachable_k)
+        self.emit_reach_flag = bool(emit_reach_flag)
         self._h5 = None  # opened lazily per worker (h5py is not fork-safe)
 
     def __len__(self):
@@ -78,6 +91,15 @@ class ScorerH5Dataset(Dataset):
                 loss_mask = r_mask          # ...and stay in the loss
             else:
                 loss_mask = smask           # masked: loss only on what was actually tried
+        if self.unreachable_k > 0:
+            # M2c: union in k sampled UNREACHABLE cells (target 0) — after sample_k, so S30 stays identical
+            rng_u = np.random.default_rng(self.sample_seed * 2_000_003 + i)
+            unreach = np.argwhere(r_mask <= 0)
+            ku = min(self.unreachable_k, len(unreach))
+            if ku > 0:
+                pick = unreach[rng_u.choice(len(unreach), size=ku, replace=False)]
+                loss_mask = loss_mask.copy()
+                loss_mask[pick[:, 0], pick[:, 1]] = 1.0
         out = {
             "context": ctx,
             "f_labels": torch.from_numpy(f_grid),
@@ -89,6 +111,8 @@ class ScorerH5Dataset(Dataset):
         if self.budget_h:       # horizon-Q: remaining push budget for this row (H-conditioned forward)
             h_val = int(f["H"][i]) if "H" in f else 1
             out["H"] = torch.tensor(h_val, dtype=torch.long)
+        if self.emit_reach_flag:  # M2d: per-edge contact-point reachability bit
+            out["reach_edges"] = torch.from_numpy((r_mask.sum(axis=1) > 0).astype(np.int64))
         if "contact_px" in f:   # (60,2) pixel coords of each edge's contact point (for per-edge models)
             out["contact_px"] = torch.from_numpy(f["contact_px"][i].astype(np.float32))
         if "context_zoom" in f:  # dual-crop: tight object crop + its contact pixels (for use_zoom models)
@@ -101,7 +125,7 @@ class ScorerDataModule(pl.LightningDataModule):
     def __init__(self, data_dir: str, batch_size: int = 64, num_workers: int = 4,
                  image_size: int = 64, train_split: float = 0.9, pin_memory: bool = True,
                  sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0,
-                 budget_h: bool = False, **_):
+                 budget_h: bool = False, unreachable_k: int = 0, emit_reach_flag: bool = False, **_):
         super().__init__()
         self.h5_path = data_dir if data_dir.endswith(".h5") else f"{data_dir}/data.h5"
         self.batch_size = batch_size
@@ -114,6 +138,8 @@ class ScorerDataModule(pl.LightningDataModule):
         self.unsampled_negative = unsampled_negative
         self.sample_seed = sample_seed
         self.budget_h = budget_h   # horizon-Q: emit batch['H'] (train AND val — the model is H-conditioned)
+        self.unreachable_k = unreachable_k       # M2c: TRAIN-only loss-mask change (val stays full-R, comparable)
+        self.emit_reach_flag = emit_reach_flag   # M2d: input feature — train AND val (the model consumes it)
         self.train_dataset = None
         self.val_dataset = None
 
@@ -144,8 +170,11 @@ class ScorerDataModule(pl.LightningDataModule):
                                              sample_k=self.sample_k,
                                              unsampled_negative=self.unsampled_negative,
                                              sample_seed=self.sample_seed,
-                                             budget_h=self.budget_h)
-        self.val_dataset = ScorerH5Dataset(self.h5_path, val_idx, budget_h=self.budget_h)
+                                             budget_h=self.budget_h,
+                                             unreachable_k=self.unreachable_k,
+                                             emit_reach_flag=self.emit_reach_flag)
+        self.val_dataset = ScorerH5Dataset(self.h5_path, val_idx, budget_h=self.budget_h,
+                                           emit_reach_flag=self.emit_reach_flag)
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True,

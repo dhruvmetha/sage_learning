@@ -106,4 +106,40 @@ with tempfile.NamedTemporaryFile(suffix=".h5") as tf:
     d_on2._h5.close()
 print("  budget_h off: no H key | on: H=1 default | on+H5 'H': per-row values — OK")
 
+print("\n=== (G) M2c: unreachable_k mask = S30 ∪ S20, S30 unchanged ===")
+with tempfile.NamedTemporaryFile(suffix=".h5") as tf:
+    with h5py.File(tf.name, "w") as f:
+        f["ctx"] = np.random.rand(2, 5, 64, 64).astype(np.float32)
+        f["f_grid"] = np.zeros((2, 60, 5), np.float32)
+        rmk = np.zeros((2, 60, 5), np.float32); rmk[:, :10, :] = 1.0   # R=50, U=250
+        f["r_mask"] = rmk; f["ratio"] = np.full(2, .5, np.float32)
+    base = ScorerH5Dataset(tf.name, [0, 1], sample_k=30, sample_seed=1)
+    m2c = ScorerH5Dataset(tf.name, [0, 1], sample_k=30, sample_seed=1, unreachable_k=20)
+    b0, c0 = base[0], m2c[0]
+    s30_base = b0["loss_mask"].numpy(); m_c = c0["loss_mask"].numpy(); rm = b0["r_mask"].numpy()
+    assert int(m_c.sum()) == 50, m_c.sum()
+    assert np.array_equal(m_c * rm, s30_base), "S30 changed under unreachable_k!"
+    assert int((m_c * (1 - rm)).sum()) == 20, "S20 not on unreachable cells"
+    base._h5.close(); m2c._h5.close()
+print("  mask = 30 reachable (identical draw) + 20 unreachable: OK")
+
+print("\n=== (H) M2d: reach_flag_input forward + module path ===")
+md = EdgeCrossAttn(pos_fourier=True, use_edge_embed=True, edge_self_attn=True,
+                   budget_cond=True, max_budget=3, value_bins=BINS, reach_flag_input=True)
+rbits = (torch.rand(B, NE) > 0.7).long()
+outd = md(x, cpx, H=Hbud, reach_edges=rbits)
+assert outd.shape == (B, NE, ND, BINS)
+hl.loss(outd, y, mask).backward()
+assert md.reach_embed.weight.grad is not None and md.reach_embed.weight.grad.abs().sum() > 0
+modd = ClassifierModule(network=EdgeCrossAttn(pos_fourier=True, use_edge_embed=True, edge_self_attn=True,
+                                              budget_cond=True, max_budget=3, value_bins=BINS, reach_flag_input=True),
+                        head_mode="hl_gauss", bce_reachable_only=True)
+bd = dict(batch); bd["reach_edges"] = rbits
+tld = modd.training_step(bd, 0); tld.backward()
+assert torch.isfinite(tld)
+print(f"  reach-flag forward+grads+training_step OK (loss={tld.item():.4f})")
+out_no = md(x, cpx, H=Hbud)   # flag model, bit absent -> still runs (embedding skipped)
+assert out_no.shape == (B, NE, ND, BINS)
+print("  bit-absent forward OK (graceful)")
+
 print("\nSMOKE TEST PASSED ✓")

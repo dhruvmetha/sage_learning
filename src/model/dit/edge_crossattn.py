@@ -71,7 +71,7 @@ class EdgeCrossAttn(nn.Module):
                  use_zoom=False, zoom_size=128, zoom_patch=4, zoom_depth=2, use_local=True,
                  pos_fourier=False, fourier_L=8, use_edge_embed=False,
                  fine_stem=False, fine_stride=2, edge_self_attn=True,
-                 budget_cond=False, max_budget=3, value_bins=0):
+                 budget_cond=False, max_budget=3, value_bins=0, reach_flag_input=False):
         super().__init__()
         self.dim = dim; self.num_depths = num_depths; self.S = img_size; self.grid = img_size // patch
         self.num_edges = num_edges
@@ -81,6 +81,11 @@ class EdgeCrossAttn(nn.Module):
         # sigmoid logit to a HL-Gauss classification over `value_bins` bins of [0,1] (Stop-Regressing 2403.03950
         # — classification value heads beat regression). Both default OFF -> forward is byte-identical to E2/E4.
         self.budget_cond = budget_cond; self.value_bins = value_bins; self.max_budget = max_budget
+        # M2d ([USER] hypothesis: reachability sharpens the encoder): per-edge contact-point-reachable
+        # bit, embedded and added to each contact token. The bit = the same wavefront the robot computes
+        # at deploy (and the robot_region channel renders) — handed over exactly instead of re-derived
+        # from pixels. Default OFF -> byte-identical.
+        self.reach_flag_input = reach_flag_input
         npatch = self.grid ** 2
         self.patch = PatchEmbed(in_channels, patch, dim)
         self.scene_pos = nn.Parameter(torch.randn(1, npatch, dim) * 0.02)
@@ -97,6 +102,8 @@ class EdgeCrossAttn(nn.Module):
             self.edge_embed = nn.Embedding(num_edges, dim)
         if budget_cond:
             self.budget_embed = nn.Embedding(max_budget + 1, dim)   # H in {0..max_budget}; index by remaining budget
+        if reach_flag_input:
+            self.reach_embed = nn.Embedding(2, dim)                 # per-edge reachable bit (M2d)
         # ABLATION: use_local=False drops the per-edge LOCAL gather entirely -> edge token = positional-id
         # (coordinate) + cross-attention to the scene only (the most HACMan-faithful "point = coord + context",
         # no rasterized gather -> no aliasing). local_proj is created ONLY when use_local, so a no-gather ckpt
@@ -129,7 +136,7 @@ class EdgeCrossAttn(nn.Module):
             self.zoom_blocks = nn.ModuleList([SelfBlock(dim, heads, drop=dropout) for _ in range(zoom_depth)])
             self.zoom_norm = nn.LayerNorm(dim)
 
-    def forward(self, x, contact_px, x_zoom=None, contact_px_zoom=None, H=None):
+    def forward(self, x, contact_px, x_zoom=None, contact_px_zoom=None, H=None, reach_edges=None):
         """x: (B,5,H,W); contact_px: (B,60,2) px in the HxW (wide) frame. H: (B,) long remaining-budget (budget_cond).
         Dual-crop (use_zoom): x_zoom (B,5,Z,Z) tight object crop + contact_px_zoom (B,60,2) px in the ZZ frame —
         the LOCAL feature is gathered from the zoom map; positional id + context still use the wide frame."""
@@ -165,6 +172,8 @@ class EdgeCrossAttn(nn.Module):
             e = pos                                                # NO-GATHER: positional id only
         if self.budget_cond and H is not None:
             e = e + self.budget_embed(H).unsqueeze(1)              # (B,1,D) remaining-budget id, broadcast over 60 edges
+        if self.reach_flag_input and reach_edges is not None:
+            e = e + self.reach_embed(reach_edges)                  # (B,60,D) per-edge reachable bit (M2d)
         for blk in self.edge_blocks:
             e = blk(e, tok)                                        # cross-attend WIDE scene + self-attend edges
         e = self.edge_norm(e)
