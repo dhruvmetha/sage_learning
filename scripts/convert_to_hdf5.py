@@ -119,7 +119,7 @@ MINIMAL_KEYS = [
 
 def convert_npz_to_hdf5(input_dir: str, output_file: str, compression: str = "gzip",
                         compression_opts=4, minimal: bool = False,
-                        tight_only: bool = False):
+                        tight_only: bool = False, npz_list: str = None):
     """Convert directory of NPZ files to single HDF5 file.
 
     Args:
@@ -129,18 +129,24 @@ def convert_npz_to_hdf5(input_dir: str, output_file: str, compression: str = "gz
         compression_opts: Only used for 'gzip' (1-9, ignored for 'lzf').
         minimal: If True, only keep the MINIMAL_KEYS list.
         tight_only: If True (and minimal), drop local_wide_* keys.
+        npz_list: Path to a text file of npz paths (one per line) — packs exactly
+            these files instead of scanning input_dir. For packs that subsample or
+            span several roots (e.g. the 65:35 feb:aug9 M1 pack).
     """
-    input_path = Path(input_dir)
     output_path = Path(output_file)
 
-    # Find all NPZ files
-    print(f"Scanning {input_path} for .npz files...")
-    npz_files = sorted(glob.glob(f"{input_path}/**/*.npz", recursive=True))
+    if npz_list:
+        print(f"Reading npz list {npz_list}...")
+        npz_files = sorted(ln.strip() for ln in open(npz_list) if ln.strip())
+    else:
+        input_path = Path(input_dir)
+        print(f"Scanning {input_path} for .npz files...")
+        npz_files = sorted(glob.glob(f"{input_path}/**/*.npz", recursive=True))
     n_samples = len(npz_files)
     print(f"Found {n_samples} NPZ files")
 
     if n_samples == 0:
-        raise ValueError(f"No NPZ files found in {input_dir}")
+        raise ValueError(f"No NPZ files found in {npz_list or input_dir}")
 
     # Find a representative file with all keys (important for multi-horizon data)
     print("Analyzing data structure...")
@@ -220,7 +226,7 @@ def convert_npz_to_hdf5(input_dir: str, output_file: str, compression: str = "gz
             print(f"  Created string dataset '{key}': {shape}")
 
         # Store file paths as metadata (useful for debugging)
-        h5f.attrs['source_dir'] = str(input_path)
+        h5f.attrs['source_dir'] = str(npz_list) if npz_list else str(input_path)
         h5f.attrs['n_samples'] = n_samples
 
         # Copy data from NPZ files
@@ -261,8 +267,12 @@ def convert_npz_to_hdf5(input_dir: str, output_file: str, compression: str = "gz
 
 def main():
     parser = argparse.ArgumentParser(description="Convert NPZ files to HDF5")
-    parser.add_argument("input_dir", help="Directory containing NPZ files")
+    parser.add_argument("input_dir", nargs="?", default=None,
+                        help="Directory containing NPZ files (or use --npz-list)")
     parser.add_argument("output_file", help="Output HDF5 file path")
+    parser.add_argument("--npz-list", default=None,
+                        help="Text file of npz paths (one per line); packs exactly these "
+                             "instead of scanning input_dir (subsampled / multi-root packs).")
     parser.add_argument("--no-compression", action="store_true",
                         help="Disable compression (faster writes, larger file)")
     parser.add_argument("--compression", choices=("gzip", "lzf"), default="gzip",
@@ -274,11 +284,14 @@ def main():
     parser.add_argument("--minimal", action="store_true",
                         help="Only keep local masks and xml_file (smaller file)")
     args = parser.parse_args()
+    if not args.input_dir and not args.npz_list:
+        parser.error("need input_dir or --npz-list")
 
     compression = None if args.no_compression else args.compression
     convert_npz_to_hdf5(args.input_dir, args.output_file, compression,
                         compression_opts=args.compression_opts,
-                        minimal=args.minimal, tight_only=args.tight_only)
+                        minimal=args.minimal, tight_only=args.tight_only,
+                        npz_list=args.npz_list)
 
 
 if __name__ == "__main__":
