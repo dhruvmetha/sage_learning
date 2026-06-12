@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 
 
 class ScorerH5Dataset(Dataset):
-    def __init__(self, h5_path: str, indices: List[int],
+    def __init__(self, h5_path, indices: List,
                  sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0,
                  budget_h: bool = False, unreachable_k: int = 0, emit_reach_flag: bool = False):
         """sample_k / unsampled_negative: the H5 sampling ablation (policy_framework journal).
@@ -48,8 +48,10 @@ class ScorerH5Dataset(Dataset):
 
         emit_reach_flag (M2d): emit batch['reach_edges'] (60,) long — 1 iff ANY depth of the edge is in
         r_mask (contact point reachable) — for the reachability-input-flag network variant."""
-        self.h5_path = h5_path
-        self.indices = indices
+        # MIXED-H training (Q-full): h5_path may be a LIST of H5s; indices are then (file_idx, row)
+        # pairs. Single-path callers are unchanged (str -> [str], int indices -> file 0).
+        self.h5_paths = [h5_path] if isinstance(h5_path, str) else list(h5_path)
+        self.indices = [(0, i) if isinstance(i, (int, np.integer)) else tuple(i) for i in indices]
         self.sample_k = int(sample_k)
         self.unsampled_negative = bool(unsampled_negative)
         self.sample_seed = int(sample_seed)
@@ -61,14 +63,16 @@ class ScorerH5Dataset(Dataset):
     def __len__(self):
         return len(self.indices)
 
-    def _f(self):
+    def _f(self, fi=0):
         if self._h5 is None:
-            self._h5 = h5py.File(self.h5_path, "r")
-        return self._h5
+            self._h5 = [None] * len(self.h5_paths)
+        if self._h5[fi] is None:
+            self._h5[fi] = h5py.File(self.h5_paths[fi], "r")
+        return self._h5[fi]
 
     def __getitem__(self, k):
-        i = self.indices[k]
-        f = self._f()
+        fi, i = self.indices[k]
+        f = self._f(fi)
         ctx = torch.from_numpy(f["ctx"][i].astype(np.float32))           # (5, H, W)
         f_grid = f["f_grid"][i].astype(np.float32)                        # (60, nd) 1=valid 0=fail-or-unreach
         r_mask = f["r_mask"][i].astype(np.float32)                        # (60, nd) 1=reachable
@@ -127,7 +131,11 @@ class ScorerDataModule(pl.LightningDataModule):
                  sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0,
                  budget_h: bool = False, unreachable_k: int = 0, emit_reach_flag: bool = False, **_):
         super().__init__()
-        self.h5_path = data_dir if data_dir.endswith(".h5") else f"{data_dir}/data.h5"
+        # MIXED-H (Q-full): data_dir may be ';'-separated H5 paths/dirs — rooms are grouped ACROSS
+        # files (same scene in two files lands on the same split side; xml paths are realpath-normalized
+        # because H=1 and H=2 renders reference the same scenes through different shard symlinks).
+        self.h5_paths = [(d if d.endswith(".h5") else f"{d}/data.h5") for d in str(data_dir).split(";")]
+        self.h5_path = self.h5_paths[0]   # legacy single-file attr
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.train_split = train_split
@@ -144,13 +152,20 @@ class ScorerDataModule(pl.LightningDataModule):
         self.val_dataset = None
 
     def setup(self, stage: Optional[str] = None):
-        with h5py.File(self.h5_path, "r") as h5:
-            n = int(h5.attrs.get("n_samples", h5["f_grid"].shape[0]))
-            xml = [x.decode() if isinstance(x, bytes) else str(x) for x in h5["xml"][:]]
-        # group rows by ROOM, shuffle rooms, fill train to the target fraction of SAMPLES
+        import os as _os
         groups = {}
-        for i in range(n):
-            groups.setdefault(xml[i], []).append(i)
+        n = 0
+        _rp = {}
+        for fi, path in enumerate(self.h5_paths):
+            with h5py.File(path, "r") as h5:
+                nf = int(h5.attrs.get("n_samples", h5["f_grid"].shape[0]))
+                xml = [x.decode() if isinstance(x, bytes) else str(x) for x in h5["xml"][:]]
+            for i in range(nf):
+                k = xml[i]
+                if k not in _rp:
+                    _rp[k] = _os.path.realpath(k)
+                groups.setdefault(_rp[k], []).append((fi, i))
+            n += nf
         keys = sorted(groups)
         random.Random(0).shuffle(keys)
         target = int(n * self.train_split)
@@ -166,14 +181,14 @@ class ScorerDataModule(pl.LightningDataModule):
             print(f"[scorer setup] H5-SAMPLING ablation: sample_k={self.sample_k} "
                   f"unsampled_negative={self.unsampled_negative} sample_seed={self.sample_seed} "
                   f"(train split only)", flush=True)
-        self.train_dataset = ScorerH5Dataset(self.h5_path, train_idx,
+        self.train_dataset = ScorerH5Dataset(self.h5_paths, train_idx,
                                              sample_k=self.sample_k,
                                              unsampled_negative=self.unsampled_negative,
                                              sample_seed=self.sample_seed,
                                              budget_h=self.budget_h,
                                              unreachable_k=self.unreachable_k,
                                              emit_reach_flag=self.emit_reach_flag)
-        self.val_dataset = ScorerH5Dataset(self.h5_path, val_idx, budget_h=self.budget_h,
+        self.val_dataset = ScorerH5Dataset(self.h5_paths, val_idx, budget_h=self.budget_h,
                                            emit_reach_flag=self.emit_reach_flag)
 
     def train_dataloader(self):
