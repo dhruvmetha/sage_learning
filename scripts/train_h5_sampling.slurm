@@ -63,7 +63,7 @@ PYTHONPATH="$SAGE_REPO" python "$SAGE_REPO/src/train_classifier.py" \
     +model.bce_reachable_only=true \
     +network.pos_fourier=true \
     +network.use_edge_embed=true \
-    $EXTRA
+    $EXTRA ${EXTRA_OVERRIDES:-}
 
 echo "end=$(date -Is)"
 ls "$OUT"/*/*/checkpoints/*.ckpt 2>/dev/null | tail -3 || true
