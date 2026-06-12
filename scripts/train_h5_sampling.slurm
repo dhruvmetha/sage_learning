@@ -40,7 +40,7 @@ case $COND in
   3) NAME="h5samp_B30";  EXTRA="+data.sample_k=30" ;;
   4) NAME="h5samp_C15";  EXTRA="+data.sample_k=15 +data.unsampled_negative=true" ;;
 esac
-RUN="${NAME}_s${SEED}"
+RUN="${RUN_PREFIX:-$NAME}_s${SEED}"   # RUN_PREFIX: reuse the recipe on NEW data without colliding with the h5samp registry (e.g. m1_v4hq)
 EPOCHS=${EPOCHS:-200}
 if [ "${SMOKE:-0}" = "1" ]; then RUN="${RUN}_smoke"; EPOCHS=${SMOKE_EPOCHS:-2}; fi   # SMOKE_EPOCHS: keep the real LR horizon (e.g. 200) for schedule-matched smokes; cap wall-time to stop early
 OUT=/scratch/dm1487/sage_outputs/scorer/${RUN}
@@ -55,7 +55,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1 || true
 PYTHONPATH="$SAGE_REPO" python "$SAGE_REPO/src/train_classifier.py" \
     --config-name=train_scorer_edge \
     name="$RUN" \
-    data_dir=/scratch/dm1487/h5/v3_scorer_e4_data \
+    data_dir="${DATA_DIR:-/scratch/dm1487/h5/v3_scorer_e4_data}" \
     output_dir="$OUT" \
     max_epochs="$EPOCHS" \
     +seed="$SEED" \
