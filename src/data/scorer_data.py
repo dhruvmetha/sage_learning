@@ -192,9 +192,13 @@ class ScorerDataModule(pl.LightningDataModule):
                                            emit_reach_flag=self.emit_reach_flag)
 
     def train_dataloader(self):
+        # persistent_workers + prefetch: pure THROUGHPUT (dataloader-bound — GPU starves on h5py/lzf
+        # reads). No math change (same batch/order/LR) -> fair vs M2b; just feeds the GPU faster.
+        kw = dict(persistent_workers=True, prefetch_factor=4) if self.num_workers > 0 else {}
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True,
-                          num_workers=self.num_workers, pin_memory=self.pin_memory, drop_last=True)
+                          num_workers=self.num_workers, pin_memory=self.pin_memory, drop_last=True, **kw)
 
     def val_dataloader(self):
+        kw = dict(persistent_workers=True, prefetch_factor=4) if self.num_workers > 0 else {}
         return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False,
-                          num_workers=self.num_workers, pin_memory=self.pin_memory)
+                          num_workers=self.num_workers, pin_memory=self.pin_memory, **kw)
