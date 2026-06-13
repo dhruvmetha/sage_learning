@@ -152,19 +152,19 @@ class ScorerDataModule(pl.LightningDataModule):
         self.val_dataset = None
 
     def setup(self, stage: Optional[str] = None):
-        import os as _os
+        # group by raw xml string (FAST, no filesystem). Within an H5, a scene's episodes share the
+        # symlink path -> grouped. Cross-H5 (same scene in two files via different shard symlinks) may
+        # straddle, a MILD leak in the INTERNAL val split only -> the real eval is the disjoint test set,
+        # never this split (M1/M2x all relied on this). realpath() here = ~250k networked stats = a >1h
+        # setup hang (the v1 false-start, 56013312), removed.
         groups = {}
         n = 0
-        _rp = {}
         for fi, path in enumerate(self.h5_paths):
             with h5py.File(path, "r") as h5:
                 nf = int(h5.attrs.get("n_samples", h5["f_grid"].shape[0]))
                 xml = [x.decode() if isinstance(x, bytes) else str(x) for x in h5["xml"][:]]
             for i in range(nf):
-                k = xml[i]
-                if k not in _rp:
-                    _rp[k] = _os.path.realpath(k)
-                groups.setdefault(_rp[k], []).append((fi, i))
+                groups.setdefault(xml[i], []).append((fi, i))
             n += nf
         keys = sorted(groups)
         random.Random(0).shuffle(keys)
