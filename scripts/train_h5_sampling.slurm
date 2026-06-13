@@ -55,7 +55,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1 || true
 PYTHONPATH="$SAGE_REPO" python "$SAGE_REPO/src/train_classifier.py" \
     --config-name=train_scorer_edge \
     name="$RUN" \
-    data_dir="${DATA_DIR:-/scratch/dm1487/h5/v3_scorer_e4_data}" \
+    data_dir="'${DATA_DIR:-/scratch/dm1487/h5/v3_scorer_e4_data}'" \
     output_dir="$OUT" \
     max_epochs="$EPOCHS" \
     +seed="$SEED" \
