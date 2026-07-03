@@ -22,7 +22,8 @@ from torch.utils.data import Dataset, DataLoader
 class ScorerH5Dataset(Dataset):
     def __init__(self, h5_path, indices: List,
                  sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0,
-                 budget_h: bool = False, unreachable_k: int = 0, emit_reach_flag: bool = False):
+                 budget_h: bool = False, unreachable_k: int = 0, emit_reach_flag: bool = False,
+                 target_scheme: str = "gamma"):
         """sample_k / unsampled_negative: the H5 sampling ablation (policy_framework journal).
 
         Simulates NON-exhaustive collection: per row, only `sample_k` of the reachable cells were
@@ -47,7 +48,13 @@ class ScorerH5Dataset(Dataset):
         Distinct from unsampled_negative (which falsely zeroes sampled-REACHABLE cells — the bug arm).
 
         emit_reach_flag (M2d): emit batch['reach_edges'] (60,) long — 1 iff ANY depth of the edge is in
-        r_mask (contact point reachable) — for the reachability-input-flag network variant."""
+        r_mask (contact point reachable) — for the reachability-input-flag network variant.
+
+        target_scheme (_step_penalty experiment): "gamma" (default) leaves f_grid as-is (gamma-discounted
+        value in [0,1]); "signed" remaps it to a 3-value RANKING signal — immediate open (f==1) -> +1;
+        valid setup with a future finish (0<f<1, any gamma power) -> 0; reachable-but-never (f==0) -> -1.
+        The -1 target needs the HL-Gauss head range to include negatives (model.value_vmin=-1), else
+        HLGauss.target clamps -1 up to 0 (== the old "no success" 0) and the scheme collapses."""
         # MIXED-H training (Q-full): h5_path may be a LIST of H5s; indices are then (file_idx, row)
         # pairs. Single-path callers are unchanged (str -> [str], int indices -> file 0).
         self.h5_paths = [h5_path] if isinstance(h5_path, str) else list(h5_path)
@@ -58,6 +65,8 @@ class ScorerH5Dataset(Dataset):
         self.budget_h = bool(budget_h)
         self.unreachable_k = int(unreachable_k)
         self.emit_reach_flag = bool(emit_reach_flag)
+        self.target_scheme = str(target_scheme)
+        assert self.target_scheme in ("gamma", "signed"), self.target_scheme
         self._h5 = None  # opened lazily per worker (h5py is not fork-safe)
 
     def __len__(self):
@@ -75,6 +84,13 @@ class ScorerH5Dataset(Dataset):
         f = self._f(fi)
         ctx = torch.from_numpy(f["ctx"][i].astype(np.float32))           # (5, H, W)
         f_grid = f["f_grid"][i].astype(np.float32)                        # (60, nd) 1=valid 0=fail-or-unreach
+        if self.target_scheme == "signed":
+            # STEP-PENALTY relabel: gamma-discounted target -> 3-value ranking signal.
+            #   f==1 immediate open -> +1 | 0<f<1 valid setup (any gamma power) -> 0 | f==0 never -> -1.
+            # Unreachable cells are also f==0 -> -1 but loss_mask (r_mask) excludes them, so they never
+            # enter the loss. Applied BEFORE sample_k so masked/unreachable_k logic is unchanged.
+            f_grid = np.where(f_grid >= 1.0 - 1e-6, 1.0,
+                              np.where(f_grid <= 1e-6, -1.0, 0.0)).astype(np.float32)
         r_mask = f["r_mask"][i].astype(np.float32)                        # (60, nd) 1=reachable
         # contact-point-level reachability: if ANY depth of an edge is reachable, all depths are
         # candidates at inference (robot can reach that contact point). Used by the realistic eval mask.
@@ -129,7 +145,8 @@ class ScorerDataModule(pl.LightningDataModule):
     def __init__(self, data_dir: str, batch_size: int = 64, num_workers: int = 4,
                  image_size: int = 64, train_split: float = 0.9, pin_memory: bool = True,
                  sample_k: int = 0, unsampled_negative: bool = False, sample_seed: int = 0,
-                 budget_h: bool = False, unreachable_k: int = 0, emit_reach_flag: bool = False, **_):
+                 budget_h: bool = False, unreachable_k: int = 0, emit_reach_flag: bool = False,
+                 target_scheme: str = "gamma", **_):
         super().__init__()
         # MIXED-H (Q-full): data_dir may be ';'-separated H5 paths/dirs — rooms are grouped ACROSS
         # files (same scene in two files lands on the same split side; xml paths are realpath-normalized
@@ -148,6 +165,7 @@ class ScorerDataModule(pl.LightningDataModule):
         self.budget_h = budget_h   # horizon-Q: emit batch['H'] (train AND val — the model is H-conditioned)
         self.unreachable_k = unreachable_k       # M2c: TRAIN-only loss-mask change (val stays full-R, comparable)
         self.emit_reach_flag = emit_reach_flag   # M2d: input feature — train AND val (the model consumes it)
+        self.target_scheme = target_scheme       # _step_penalty: "signed" relabels f_grid to {-1,0,1} (train AND val)
         self.train_dataset = None
         self.val_dataset = None
 
@@ -187,9 +205,11 @@ class ScorerDataModule(pl.LightningDataModule):
                                              sample_seed=self.sample_seed,
                                              budget_h=self.budget_h,
                                              unreachable_k=self.unreachable_k,
-                                             emit_reach_flag=self.emit_reach_flag)
+                                             emit_reach_flag=self.emit_reach_flag,
+                                             target_scheme=self.target_scheme)
         self.val_dataset = ScorerH5Dataset(self.h5_paths, val_idx, budget_h=self.budget_h,
-                                           emit_reach_flag=self.emit_reach_flag)
+                                           emit_reach_flag=self.emit_reach_flag,
+                                           target_scheme=self.target_scheme)
 
     def train_dataloader(self):
         # persistent_workers + prefetch: pure THROUGHPUT (dataloader-bound — GPU starves on h5py/lzf

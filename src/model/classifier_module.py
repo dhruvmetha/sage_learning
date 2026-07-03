@@ -104,6 +104,8 @@ class ClassifierModule(pl.LightningModule):
         soft_edge_sigma: float = 0.0,
         soft_depth_sigma: float = 0.0,
         head_mode: str = "sigmoid_bce",
+        value_vmin: float = 0.0,
+        value_vmax: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['network'])
@@ -151,6 +153,11 @@ class ClassifierModule(pl.LightningModule):
         assert head_mode in ("sigmoid_bce", "softmax_ce", "hl_gauss"), head_mode
         self.head_mode = head_mode
         self._hl_gauss: Optional[HLGauss] = None   # built lazily from the head's bin count
+        # HL-Gauss value range. Default [0,1] = gamma-discounted targets (all registered horizon-Q models).
+        # The _step_penalty experiment sets [-1,1] so the "never opens" -1 target is representable; otherwise
+        # HLGauss.target clamps -1 up to 0 and the signed scheme silently collapses onto the old 0.
+        self.value_vmin = float(value_vmin)
+        self.value_vmax = float(value_vmax)
 
         # Build neighbor table once (class-level cache pattern)
         ClassifierModule._build_face_neighbors()
@@ -294,7 +301,8 @@ class ClassifierModule(pl.LightningModule):
             # logits (B,60,nd,bins); labels = gamma targets in [0,1] (NOT soft-blurred — they are
             # already real-valued); masked CE to the Gaussian-smoothed histogram.
             if self._hl_gauss is None or self._hl_gauss.num_bins != logits.shape[-1]:
-                self._hl_gauss = HLGauss(num_bins=logits.shape[-1])
+                self._hl_gauss = HLGauss(num_bins=logits.shape[-1],
+                                         vmin=self.value_vmin, vmax=self.value_vmax)
             return self._hl_gauss.loss(logits, labels, mask)
 
         # Build soft target (no-op when sigmas are 0)
