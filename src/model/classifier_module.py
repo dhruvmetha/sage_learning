@@ -267,12 +267,15 @@ class ClassifierModule(pl.LightningModule):
         soft_target = torch.max(f_grid, spread)
         return soft_target
 
-    def forward(self, x: torch.Tensor, contact_px=None, x_zoom=None, contact_px_zoom=None, H=None, reach_edges=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, contact_px=None, x_zoom=None, contact_px_zoom=None, H=None,
+                reach_edges=None, action_motion=None) -> torch.Tensor:
         # dual-crop fields are passed only when present -> single-crop path is unchanged (DiT + EdgeCrossAttn)
         # H (B,) long: remaining push budget; reach_edges (B,60) long: contact-point-reachable bit (M2d)
         kw = {} if H is None else {"H": H}
         if reach_edges is not None:
             kw["reach_edges"] = reach_edges
+        if action_motion is not None:
+            kw["action_motion"] = action_motion
         if x_zoom is not None:
             return self.network(x, contact_px, x_zoom, contact_px_zoom, **kw)
         return self.network(x, contact_px, **kw)
@@ -457,7 +460,8 @@ class ClassifierModule(pl.LightningModule):
         loss_mask = batch.get('loss_mask', r_mask)
 
         logits = self(context, batch.get('contact_px'), batch.get('context_zoom'), batch.get('contact_px_zoom'),
-                      H=batch.get('H'), reach_edges=batch.get('reach_edges'))  # (B,60,nd) — or (B,60,nd,bins) for hl_gauss
+                      H=batch.get('H'), reach_edges=batch.get('reach_edges'),
+                      action_motion=batch.get('action_motion'))  # (B,60,nd) — or (B,60,nd,bins) for hl_gauss
         loss = self._compute_masked_loss(logits, f_labels, loss_mask)
 
         self.train_loss(loss)
@@ -472,7 +476,8 @@ class ClassifierModule(pl.LightningModule):
         ratios = batch.get('ratio', None)
 
         logits = self(context, batch.get('contact_px'), batch.get('context_zoom'), batch.get('contact_px_zoom'),
-                      H=batch.get('H'), reach_edges=batch.get('reach_edges'))
+                      H=batch.get('H'), reach_edges=batch.get('reach_edges'),
+                      action_motion=batch.get('action_motion'))
         loss = self._compute_masked_loss(logits, f_labels, r_mask)
 
         self.val_loss(loss)
