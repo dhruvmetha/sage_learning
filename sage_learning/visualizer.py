@@ -1071,7 +1071,8 @@ class NAMODataVisualizer:
                                    local_output_size: int = 224,
                                    wide_crop_size_meters: Optional[float] = None,
                                    tight_crop_size_meters: Optional[float] = None,
-                                   goal_circle_radius: float = 0.05) -> Optional[Dict[str, Any]]:
+                                   goal_circle_radius: float = 0.05,
+                                   fast_scorer: bool = False) -> Optional[Dict[str, Any]]:
         """Generate global masks + dual-crop local masks + SE(2) targets.
 
         Renders the env once at high resolution, then crops twice around the
@@ -1493,10 +1494,11 @@ class NAMODataVisualizer:
 
         # === Create global masks (resize full highres to output size) ===
         global_masks = {}
-        for name, hr_mask in highres.items():
-            resized = cv2.resize(hr_mask, (global_output_size, global_output_size),
-                                interpolation=cv2.INTER_AREA)
-            global_masks[name] = resized.astype(np.float32)
+        if not fast_scorer:  # render_ctx discards globals; skip the 11 full-canvas resizes
+            for name, hr_mask in highres.items():
+                resized = cv2.resize(hr_mask, (global_output_size, global_output_size),
+                                    interpolation=cv2.INTER_AREA)
+                global_masks[name] = resized.astype(np.float32)
 
         # === Sampling helpers (hoisted so the dual-crop loop reuses them) ===
         def circle_fully_within_region(px, py, radius_px, region_mask):
@@ -1578,7 +1580,7 @@ class NAMODataVisualizer:
             robot_crop_view = highres['robot'][y1:y2, x1:x2]
             robot_in_region = mask_fully_within_region(
                 highres['robot'], highres['robot_region'], y1, y2, x1, x2)
-            if np.count_nonzero(robot_crop_view) == 0 or not robot_in_region:
+            if (not fast_scorer) and (np.count_nonzero(robot_crop_view) == 0 or not robot_in_region):
                 highres['robot'][y1:y2, x1:x2] = 0
                 samples = sample_from_region_in_crop(
                     highres['robot_region'], y1, y2, x1, x2,
@@ -1591,7 +1593,7 @@ class NAMODataVisualizer:
             goal_crop_view = highres['goal'][y1:y2, x1:x2]
             goal_in_region = mask_fully_within_region(
                 highres['goal'], highres['goal_sample_region'], y1, y2, x1, x2)
-            if np.count_nonzero(goal_crop_view) == 0 or not goal_in_region:
+            if (not fast_scorer) and (np.count_nonzero(goal_crop_view) == 0 or not goal_in_region):
                 highres['goal'][y1:y2, x1:x2] = 0
                 samples = sample_from_region_in_crop(
                     highres['goal_sample_region'], y1, y2, x1, x2,
@@ -1612,7 +1614,7 @@ class NAMODataVisualizer:
             circle_area = max(1, np.pi * goal_radius_px**2)
             existing_approx = int(np.count_nonzero(goal_samples_view) / circle_area)
             n_needed = max(0, min_goal_samples - existing_approx)
-            if n_needed > 0:
+            if (not fast_scorer) and n_needed > 0:
                 samples = sample_from_region_in_crop(
                     highres['goal_sample_region'], y1, y2, x1, x2,
                     n_samples=n_needed, radius_px=goal_radius_px)
@@ -1657,14 +1659,15 @@ class NAMODataVisualizer:
         local_tight_metadata = None
 
         if obj_x is not None and obj_y is not None:
-            # Wide crop first (canonical: includes goal masks for supervision)
-            local_wide, local_wide_metadata = extract_local_crop(
-                wide_crop_size_meters, 'local_wide', include_goal_masks=True)
+            if not fast_scorer:  # render_ctx uses only local_tight; skip the discarded wide crop and rewind
+                # Wide crop first (canonical: includes goal masks for supervision)
+                local_wide, local_wide_metadata = extract_local_crop(
+                    wide_crop_size_meters, 'local_wide', include_goal_masks=True)
 
-            # Rewind sampler-mutated channels before the second crop
-            highres['robot'][:] = _orig_robot
-            highres['goal'][:] = _orig_goal
-            highres['goal_samples'][:] = _orig_goal_samples
+                # Rewind sampler-mutated channels before the second crop
+                highres['robot'][:] = _orig_robot
+                highres['goal'][:] = _orig_goal
+                highres['goal_samples'][:] = _orig_goal_samples
 
             local_tight, local_tight_metadata = extract_local_crop(
                 tight_crop_size_meters, 'local_tight', include_goal_masks=False)
