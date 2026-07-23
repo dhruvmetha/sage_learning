@@ -71,7 +71,9 @@ class EdgeCrossAttn(nn.Module):
                  use_zoom=False, zoom_size=128, zoom_patch=4, zoom_depth=2, use_local=True,
                  pos_fourier=False, fourier_L=8, use_edge_embed=False,
                  fine_stem=False, fine_stride=2, edge_self_attn=True,
-                 budget_cond=False, max_budget=3, value_bins=0, reach_flag_input=False):
+                 budget_cond=False, max_budget=3, value_bins=0, reach_flag_input=False,
+                 action_motion_dim=0, action_motion_fourier=False, action_motion_fourier_L=8,
+                 action_depth_embed=False):
         super().__init__()
         self.dim = dim; self.num_depths = num_depths; self.S = img_size; self.grid = img_size // patch
         self.num_edges = num_edges
@@ -81,6 +83,10 @@ class EdgeCrossAttn(nn.Module):
         # sigmoid logit to a HL-Gauss classification over `value_bins` bins of [0,1] (Stop-Regressing 2403.03950
         # — classification value heads beat regression). Both default OFF -> forward is byte-identical to E2/E4.
         self.budget_cond = budget_cond; self.value_bins = value_bins; self.max_budget = max_budget
+        self.action_motion_dim = action_motion_dim
+        self.action_motion_fourier = action_motion_fourier
+        self.action_motion_fourier_L = action_motion_fourier_L
+        self.use_action_depth_embed = action_depth_embed
         # M2d ([USER] hypothesis: reachability sharpens the encoder): per-edge contact-point-reachable
         # bit, embedded and added to each contact token. The bit = the same wavefront the robot computes
         # at deploy (and the robot_region channel renders) — handed over exactly instead of re-derived
@@ -122,7 +128,16 @@ class EdgeCrossAttn(nn.Module):
         self.edge_blocks = nn.ModuleList([CrossBlock(dim, heads, drop=dropout, self_attn=edge_self_attn)
                                           for _ in range(edge_depth)])
         self.edge_norm = nn.LayerNorm(dim)
-        head_out = num_depths * value_bins if value_bins > 0 else num_depths
+        if action_motion_dim > 0:
+            motion_in = 2 * action_motion_dim * action_motion_fourier_L \
+                if action_motion_fourier else action_motion_dim
+            self.action_motion_proj = nn.Sequential(
+                nn.Linear(motion_in, dim), nn.GELU(), nn.Linear(dim, dim))
+            if action_depth_embed:
+                self.action_depth_embed = nn.Embedding(num_depths, dim)
+            self.action_norm = nn.LayerNorm(dim)
+        head_out = (value_bins if value_bins > 0 else 1) if action_motion_dim > 0 else \
+                   (num_depths * value_bins if value_bins > 0 else num_depths)
         self.head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, head_out))
         # OPTIONAL dual-crop: a second light stem over a tight zoom crop, from which the per-edge LOCAL
         # feature is gathered (de-aliased). OFF by default -> forward is byte-identical to the single-crop
@@ -136,7 +151,8 @@ class EdgeCrossAttn(nn.Module):
             self.zoom_blocks = nn.ModuleList([SelfBlock(dim, heads, drop=dropout) for _ in range(zoom_depth)])
             self.zoom_norm = nn.LayerNorm(dim)
 
-    def forward(self, x, contact_px, x_zoom=None, contact_px_zoom=None, H=None, reach_edges=None):
+    def forward(self, x, contact_px, x_zoom=None, contact_px_zoom=None, H=None, reach_edges=None,
+                action_motion=None):
         """x: (B,5,H,W); contact_px: (B,60,2) px in the HxW (wide) frame. H: (B,) long remaining-budget (budget_cond).
         Dual-crop (use_zoom): x_zoom (B,5,Z,Z) tight object crop + contact_px_zoom (B,60,2) px in the ZZ frame —
         the LOCAL feature is gathered from the zoom map; positional id + context still use the wide frame."""
@@ -177,6 +193,17 @@ class EdgeCrossAttn(nn.Module):
         for blk in self.edge_blocks:
             e = blk(e, tok)                                        # cross-attend WIDE scene + self-attend edges
         e = self.edge_norm(e)
+        if self.action_motion_dim > 0:
+            # Keep attention at 60 contact tokens, then create one token per COMPLETE push. The shared
+            # head now scores each (contact,depth) from its contact context + exact nominal SE(2) motion.
+            motion = fourier_encode(action_motion, self.action_motion_fourier_L) \
+                if self.action_motion_fourier else action_motion
+            motion = self.action_motion_proj(motion)
+            if self.use_action_depth_embed:
+                motion = motion + self.action_depth_embed.weight.view(1, 1, self.num_depths, self.dim)
+            e = self.action_norm(e.unsqueeze(2) + motion)
+            out = self.head(e)                                     # B,60,nd,(1 | bins)
+            return out if self.value_bins > 0 else out.squeeze(-1)
         out = self.head(e)                                         # B,60,(num_depths | num_depths*value_bins)
         if self.value_bins > 0:
             out = out.view(B, self.num_edges, self.num_depths, self.value_bins)  # B,60,nd,bins (HL-Gauss logits)
