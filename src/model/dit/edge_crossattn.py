@@ -65,6 +65,22 @@ class CrossBlock(nn.Module):
         e = e + self.mlp(self.n3(e)); return e
 
 
+class DepthSelfBlock(nn.Module):
+    """Single-head self-attention among the depth variants of one contact.
+
+    Callers flatten only the batch and contact axes, so every attention group contains exactly the
+    five push depths for one edge. Different contacts never mix in this block.
+    """
+    def __init__(self, dim, drop=0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, 1, dropout=drop, batch_first=True)
+
+    def forward(self, x):
+        h = self.norm(x)
+        return x + self.attn(h, h, h, need_weights=False)[0]
+
+
 class EdgeCrossAttn(nn.Module):
     def __init__(self, img_size=64, patch=4, in_channels=5, dim=192, scene_depth=4, edge_depth=4,
                  heads=6, num_depths=5, num_edges=60, dropout=0.0,
@@ -73,7 +89,7 @@ class EdgeCrossAttn(nn.Module):
                  fine_stem=False, fine_stride=2, edge_self_attn=True,
                  budget_cond=False, max_budget=3, value_bins=0, reach_flag_input=False,
                  action_motion_dim=0, action_motion_fourier=False, action_motion_fourier_L=8,
-                 action_depth_embed=False):
+                 action_depth_embed=False, action_depth_self_attn=False):
         super().__init__()
         self.dim = dim; self.num_depths = num_depths; self.S = img_size; self.grid = img_size // patch
         self.num_edges = num_edges
@@ -87,6 +103,7 @@ class EdgeCrossAttn(nn.Module):
         self.action_motion_fourier = action_motion_fourier
         self.action_motion_fourier_L = action_motion_fourier_L
         self.use_action_depth_embed = action_depth_embed
+        self.action_depth_self_attn = action_depth_self_attn
         # M2d ([USER] hypothesis: reachability sharpens the encoder): per-edge contact-point-reachable
         # bit, embedded and added to each contact token. The bit = the same wavefront the robot computes
         # at deploy (and the robot_region channel renders) — handed over exactly instead of re-derived
@@ -135,6 +152,8 @@ class EdgeCrossAttn(nn.Module):
                 nn.Linear(motion_in, dim), nn.GELU(), nn.Linear(dim, dim))
             if action_depth_embed:
                 self.action_depth_embed = nn.Embedding(num_depths, dim)
+            if action_depth_self_attn:
+                self.action_depth_attn = DepthSelfBlock(dim, drop=dropout)
             self.action_norm = nn.LayerNorm(dim)
         head_out = (value_bins if value_bins > 0 else 1) if action_motion_dim > 0 else \
                    (num_depths * value_bins if value_bins > 0 else num_depths)
@@ -201,7 +220,12 @@ class EdgeCrossAttn(nn.Module):
             motion = self.action_motion_proj(motion)
             if self.use_action_depth_embed:
                 motion = motion + self.action_depth_embed.weight.view(1, 1, self.num_depths, self.dim)
-            e = self.action_norm(e.unsqueeze(2) + motion)
+            e = e.unsqueeze(2) + motion                            # B,60,nd,D complete-push tokens
+            if self.action_depth_self_attn:
+                e = e.reshape(B * self.num_edges, self.num_depths, self.dim)
+                e = self.action_depth_attn(e)                      # only five sibling depths mix
+                e = e.reshape(B, self.num_edges, self.num_depths, self.dim)
+            e = self.action_norm(e)
             out = self.head(e)                                     # B,60,nd,(1 | bins)
             return out if self.value_bins > 0 else out.squeeze(-1)
         out = self.head(e)                                         # B,60,(num_depths | num_depths*value_bins)
