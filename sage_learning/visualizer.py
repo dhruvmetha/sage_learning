@@ -1494,7 +1494,7 @@ class NAMODataVisualizer:
 
         # === Create global masks (resize full highres to output size) ===
         global_masks = {}
-        if not fast_scorer:  # render_ctx discards globals; skip the 11 full-canvas resizes
+        if not fast_scorer:  # [render-speedup] render_ctx discards globals; skip the 11x full-canvas cv2.resize
             for name, hr_mask in highres.items():
                 resized = cv2.resize(hr_mask, (global_output_size, global_output_size),
                                     interpolation=cv2.INTER_AREA)
@@ -1502,12 +1502,21 @@ class NAMODataVisualizer:
 
         # === Sampling helpers (hoisted so the dual-crop loop reuses them) ===
         def circle_fully_within_region(px, py, radius_px, region_mask):
-            """Check if a circle at (px, py) is fully contained within the region mask."""
+            """Check if a circle at (px, py) is fully contained within the region mask.
+            [render-speedup 2026-06-29] window the rasterization to the circle's bbox instead of allocating a full
+            h×w (1024²) array per call — this is ~3000 calls/render and was the dominant render cost (cProfile).
+            Output-identical: same clipped circle pixels checked against the same region cells. Verified by
+            test_render_equiv.py (bit-compare)."""
             h, w = region_mask.shape
-            temp = np.zeros((h, w), dtype=np.float32)
-            cv2.circle(temp, (px, py), max(1, radius_px), 1.0, -1)
+            r = max(1, radius_px)
+            y0, y1 = max(0, py - r), min(h, py + r + 1)
+            x0, x1 = max(0, px - r), min(w, px + r + 1)
+            if y1 <= y0 or x1 <= x0:
+                return True   # circle fully off-grid -> matches the original np.all(empty) == True
+            temp = np.zeros((y1 - y0, x1 - x0), dtype=np.float32)
+            cv2.circle(temp, (px - x0, py - y0), r, 1.0, -1)
             circle_pixels = temp > 0
-            return np.all(region_mask[circle_pixels] > 0.5)
+            return np.all(region_mask[y0:y1, x0:x1][circle_pixels] > 0.5)
 
         def sample_from_region_in_crop(region_mask, crop_y1, crop_y2, crop_x1, crop_x2,
                                        n_samples=1, radius_px=0, max_attempts=500):
@@ -1659,7 +1668,7 @@ class NAMODataVisualizer:
         local_tight_metadata = None
 
         if obj_x is not None and obj_y is not None:
-            if not fast_scorer:  # render_ctx uses only local_tight; skip the discarded wide crop and rewind
+            if not fast_scorer:  # [render-speedup] render_ctx uses only local_tight; skip the discarded wide crop + rewind
                 # Wide crop first (canonical: includes goal masks for supervision)
                 local_wide, local_wide_metadata = extract_local_crop(
                     wide_crop_size_meters, 'local_wide', include_goal_masks=True)
