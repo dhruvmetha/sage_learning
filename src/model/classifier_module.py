@@ -150,7 +150,12 @@ class ClassifierModule(pl.LightningModule):
         #     2403.03950). Inference value = E[bin]; rankings unchanged under the monotone map.
         # Ranking metrics are head-agnostic: softmax is monotone in logits, so eval_scorer's
         # argmax/top-k read the same either way.
-        assert head_mode in ("sigmoid_bce", "softmax_ce", "hl_gauss"), head_mode
+        #   raw_scalar            — RANK-PURE (namo EXP-2026-08-09 crossboard): (B,60,D) unactivated
+        #     logits consumed DIRECTLY as unbounded sort keys by ranking losses. No squash, no BCE,
+        #     no bins; this module's own loss paths must not be reached (the namo rank-pure modules
+        #     override them all) — the mode exists so the head's contract is named honestly instead
+        #     of borrowing sigmoid_bce's shape while ignoring its semantics.
+        assert head_mode in ("sigmoid_bce", "softmax_ce", "hl_gauss", "raw_scalar"), head_mode
         self.head_mode = head_mode
         self._hl_gauss: Optional[HLGauss] = None   # built lazily from the head's bin count
         # HL-Gauss value range. Default [0,1] = gamma-discounted targets (all registered horizon-Q models).
