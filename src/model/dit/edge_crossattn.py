@@ -89,10 +89,11 @@ class EdgeCrossAttn(nn.Module):
                  fine_stem=False, fine_stride=2, edge_self_attn=True,
                  budget_cond=False, max_budget=3, value_bins=0, reach_flag_input=False,
                  action_motion_dim=0, action_motion_fourier=False, action_motion_fourier_L=8,
-                 action_depth_embed=False, action_depth_self_attn=False):
+                 action_depth_embed=False, action_depth_self_attn=False, global_readout=False):
         super().__init__()
         self.dim = dim; self.num_depths = num_depths; self.S = img_size; self.grid = img_size // patch
         self.num_edges = num_edges
+        self.global_readout = global_readout
         # BUDGET-CONDITIONED HORIZON-Q (horizon_q_build_journal.md): the same map answers Q(s,a,H) for a
         # remaining push budget H. budget_cond=True adds an H embedding to every edge token (UVFA/Decision-
         # Transformer-style conditioning). value_bins>0 switches the per-(edge,depth) head from a single
@@ -114,6 +115,14 @@ class EdgeCrossAttn(nn.Module):
         self.scene_pos = nn.Parameter(torch.randn(1, npatch, dim) * 0.02)
         self.scene_blocks = nn.ModuleList([SelfBlock(dim, heads, drop=dropout) for _ in range(scene_depth)])
         self.scene_norm = nn.LayerNorm(dim)
+        self.use_zoom = use_zoom; self.zoom_size = zoom_size
+        if global_readout:
+            self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+            cell_out = value_bins if value_bins > 0 else 1
+            self.global_head = nn.Sequential(
+                nn.Linear(dim, dim), nn.GELU(),
+                nn.Linear(dim, num_edges * num_depths * cell_out))
+            return
         # SHARP-ID (lit: NeRF/Tancik Fourier features + ViT-style per-element embedding) — fixes the
         # raw-coord MLP spectral bias that can't separate nearby edges, and the per-edge embedding gives
         # each of the 60 edges a guaranteed-distinct identity (fixes the 4 coincident corners).
@@ -162,7 +171,6 @@ class EdgeCrossAttn(nn.Module):
         # feature is gathered (de-aliased). OFF by default -> forward is byte-identical to the single-crop
         # model, so E2/E4 reproduce exactly. Context (cross-attn to the wide scene tokens) is unchanged;
         # the positional id stays in the WIDE frame (the shared coordinate that glues zoom-local to wide-context).
-        self.use_zoom = use_zoom; self.zoom_size = zoom_size
         if use_zoom:
             self.zgrid = zoom_size // zoom_patch
             self.zoom_patch = PatchEmbed(in_channels, zoom_patch, dim)
@@ -177,9 +185,16 @@ class EdgeCrossAttn(nn.Module):
         the LOCAL feature is gathered from the zoom map; positional id + context still use the wide frame."""
         B = x.size(0)
         tok = self.patch(x) + self.scene_pos                       # B, Np, D
+        if self.global_readout:
+            tok = torch.cat((self.cls_token.expand(B, -1, -1), tok), dim=1)
         for blk in self.scene_blocks:
             tok = blk(tok)
         tok = self.scene_norm(tok)                                 # scene tokens (context)
+        if self.global_readout:
+            out = self.global_head(tok[:, 0])
+            if self.value_bins > 0:
+                return out.view(B, self.num_edges, self.num_depths, self.value_bins)
+            return out.view(B, self.num_edges, self.num_depths)
         grid = (contact_px / self.S) * 2 - 1                       # B,60,2 in [-1,1] (WIDE frame; the shared pos)
         # positional id: Fourier(coord) if sharp, else raw coord; + per-edge embedding if enabled
         pf = fourier_encode(grid, self.fourier_L) if self.pos_fourier else grid
